@@ -49,6 +49,12 @@ pub trait MediaSource: Send {
     fn uri(&self) -> &str;
     fn len(&mut self) -> Result<Option<u64>>;
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>>;
+
+    /// Release cached read-ahead data and any in-flight prefetch. Sources
+    /// without an internal buffer are a no-op. Called on the demux stop path so
+    /// playback stop returns large buffers to the allocator even when the
+    /// session (and its demuxer) outlives the stop.
+    fn release_buffer(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -561,6 +567,12 @@ impl PendingHttpFetch {
     }
 }
 
+impl Drop for PendingHttpFetch {
+    fn drop(&mut self) {
+        let _ = self.handle.join();
+    }
+}
+
 fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(10)))
@@ -925,6 +937,13 @@ impl std::fmt::Debug for HttpRangeSource {
 impl MediaSource for HttpRangeSource {
     fn uri(&self) -> &str {
         &self.uri
+    }
+
+    fn release_buffer(&mut self) {
+        self.cache_bytes = Vec::new();
+        self.cache_start = 0;
+        // Drop the prefetch (joins the thread via PendingHttpFetch::Drop).
+        self.prefetch = None;
     }
 
     fn len(&mut self) -> Result<Option<u64>> {

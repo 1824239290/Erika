@@ -3132,6 +3132,20 @@ impl PresenterRuntime {
     }
 }
 
+impl Drop for PresenterRuntime {
+    fn drop(&mut self) {
+        // Ensure the playback worker is shut down and its demux thread joined
+        // (AsyncDemuxer now joins on drop) even when close() was never called
+        // explicitly. Best-effort: visual cleanup may fail on an already-closed
+        // player, so fall through to the player close regardless.
+        let _ = self.quiesce_frame_output("drop");
+        self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
+        self.latest_video_decoder = None;
+        let _ = self.player.close();
+        self.drain_pending_player_frames();
+    }
+}
+
 fn normalize_playback_rate(rate: f64) -> f64 {
     if rate.is_finite() && rate > 0.0 {
         rate

@@ -189,6 +189,7 @@ impl PlaybackPumpDemand {
 struct AsyncDemuxer {
     packets: Receiver<DemuxMessage>,
     commands: Sender<DemuxCommand>,
+    worker: Option<thread::JoinHandle<()>>,
     generation: u64,
     active: bool,
 }
@@ -197,13 +198,14 @@ impl AsyncDemuxer {
     fn spawn(demuxer: Demuxer) -> Self {
         let (packet_sender, packets) = bounded(DEMUX_PACKET_QUEUE_LIMIT);
         let (commands, command_receiver) = unbounded();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("erika-demux".to_string())
             .spawn(move || run_demux_worker(demuxer, packet_sender, command_receiver))
             .expect("spawn erika demux worker");
         Self {
             packets,
             commands,
+            worker: Some(worker),
             generation: 1,
             active: false,
         }
@@ -283,11 +285,26 @@ impl AsyncDemuxer {
 impl Drop for AsyncDemuxer {
     fn drop(&mut self) {
         let _ = self.commands.send(DemuxCommand::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
 fn run_demux_worker(
     mut demuxer: Demuxer,
+    packets: Sender<DemuxMessage>,
+    commands: Receiver<DemuxCommand>,
+) {
+    run_demux_loop(&mut demuxer, packets, commands);
+    // Every exit from the loop (Stop command, disconnected channel) lands here:
+    // drop the read-ahead cache and join any in-flight prefetch while the
+    // session teardown is still waiting on this thread's join.
+    demuxer.release_buffer();
+}
+
+fn run_demux_loop(
+    demuxer: &mut Demuxer,
     packets: Sender<DemuxMessage>,
     commands: Receiver<DemuxCommand>,
 ) {
@@ -298,7 +315,7 @@ fn run_demux_worker(
     loop {
         while let Ok(command) = commands.try_recv() {
             if !handle_demux_command(
-                &mut demuxer,
+                demuxer,
                 &packets,
                 command,
                 &mut generation,
@@ -314,7 +331,7 @@ fn run_demux_worker(
             match commands.recv() {
                 Ok(command) => {
                     if !handle_demux_command(
-                        &mut demuxer,
+                        demuxer,
                         &packets,
                         command,
                         &mut generation,
@@ -371,7 +388,7 @@ fn run_demux_worker(
             }
         };
         if !send_demux_message(
-            &mut demuxer,
+            demuxer,
             &packets,
             &commands,
             message,
@@ -487,7 +504,9 @@ fn handle_demux_command(
                 *generation = seek_generation;
                 *eof = false;
                 if let Err(error) = demuxer.seek(position) {
-                    let _ = packets.send(DemuxMessage::Error {
+                    // try_send: a full queue must never block the demux worker
+                    // (a blocked send would deadlock AsyncDemuxer::drop's join).
+                    let _ = packets.try_send(DemuxMessage::Error {
                         generation: *generation,
                         message: error.to_string(),
                     });
@@ -524,7 +543,7 @@ fn handle_demux_command(
                 *seek_generation = next_generation;
             }
             if let Err(error) = demuxer.set_stream_selection(selection) {
-                let _ = packets.send(DemuxMessage::Error {
+                let _ = packets.try_send(DemuxMessage::Error {
                     generation: *generation,
                     message: error.to_string(),
                 });
