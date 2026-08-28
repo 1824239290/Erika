@@ -354,7 +354,7 @@ pub struct HttpRangeSource {
 
 struct PendingHttpFetch {
     range: ByteRange,
-    handle: JoinHandle<Result<HttpRangeResponse>>,
+    handle: Option<JoinHandle<Result<HttpRangeResponse>>>,
 }
 
 /// Bytes fetched for one HTTP range request plus the resource total reported
@@ -484,11 +484,13 @@ impl HttpRangeSource {
             ));
         }
 
-        let pending = self.prefetch.take()?;
+        let mut pending = self.prefetch.take()?;
         let join_started = Instant::now();
         let start = pending.range.start;
         let result = pending
             .handle
+            .take()
+            .expect("prefetch handle present until join")
             .join()
             .map_err(|_| SourceError::Http("http prefetch thread panicked".to_string()))
             .and_then(|response| response);
@@ -559,17 +561,24 @@ impl PendingHttpFetch {
             let agent = http_agent();
             fetch_http_range(&agent, &uri, &http_headers, range, "http_prefetch_range")
         });
-        Self { range, handle }
+        Self {
+            range,
+            handle: Some(handle),
+        }
     }
 
     fn is_finished(&self) -> bool {
-        self.handle.is_finished()
+        self.handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
     }
 }
 
 impl Drop for PendingHttpFetch {
     fn drop(&mut self) {
-        let _ = self.handle.join();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
