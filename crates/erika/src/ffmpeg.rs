@@ -298,6 +298,12 @@ impl Demuxer {
         })
     }
 
+    /// Ask the underlying media source to drop cached read-ahead data. Called on
+    /// the demux stop path so a stopped session releases its largest buffers.
+    pub fn release_buffer(&mut self) {
+        self.context.release_source_buffer();
+    }
+
     pub fn open_source(source: Box<dyn MediaSource>) -> Result<Self> {
         let uri = source.uri().to_string();
         let mut context = open_source_format_context(source)?;
@@ -3395,6 +3401,13 @@ impl FormatContext {
             ptr,
             avio: Some(avio),
         })
+    }
+
+    /// Forward `MediaSource::release_buffer` to the custom I/O source, if any.
+    fn release_source_buffer(&mut self) {
+        if let Some(avio) = &mut self.avio {
+            avio.source.release_buffer();
+        }
     }
 
     fn as_ptr(&self) -> *const sys::AVFormatContext {

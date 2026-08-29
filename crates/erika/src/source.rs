@@ -49,6 +49,12 @@ pub trait MediaSource: Send {
     fn uri(&self) -> &str;
     fn len(&mut self) -> Result<Option<u64>>;
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>>;
+
+    /// Release cached read-ahead data and any in-flight prefetch. Sources
+    /// without an internal buffer are a no-op. Called on the demux stop path so
+    /// playback stop returns large buffers to the allocator even when the
+    /// session (and its demuxer) outlives the stop.
+    fn release_buffer(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -348,7 +354,7 @@ pub struct HttpRangeSource {
 
 struct PendingHttpFetch {
     range: ByteRange,
-    handle: JoinHandle<Result<HttpRangeResponse>>,
+    handle: Option<JoinHandle<Result<HttpRangeResponse>>>,
 }
 
 /// Bytes fetched for one HTTP range request plus the resource total reported
@@ -478,11 +484,13 @@ impl HttpRangeSource {
             ));
         }
 
-        let pending = self.prefetch.take()?;
+        let mut pending = self.prefetch.take()?;
         let join_started = Instant::now();
         let start = pending.range.start;
         let result = pending
             .handle
+            .take()
+            .expect("prefetch handle present until join")
             .join()
             .map_err(|_| SourceError::Http("http prefetch thread panicked".to_string()))
             .and_then(|response| response);
@@ -553,11 +561,24 @@ impl PendingHttpFetch {
             let agent = http_agent();
             fetch_http_range(&agent, &uri, &http_headers, range, "http_prefetch_range")
         });
-        Self { range, handle }
+        Self {
+            range,
+            handle: Some(handle),
+        }
     }
 
     fn is_finished(&self) -> bool {
-        self.handle.is_finished()
+        self.handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+    }
+}
+
+impl Drop for PendingHttpFetch {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -925,6 +946,13 @@ impl std::fmt::Debug for HttpRangeSource {
 impl MediaSource for HttpRangeSource {
     fn uri(&self) -> &str {
         &self.uri
+    }
+
+    fn release_buffer(&mut self) {
+        self.cache_bytes = Vec::new();
+        self.cache_start = 0;
+        // Drop the prefetch (joins the thread via PendingHttpFetch::Drop).
+        self.prefetch = None;
     }
 
     fn len(&mut self) -> Result<Option<u64>> {
