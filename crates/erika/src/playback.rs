@@ -8540,7 +8540,7 @@ mod tests {
         };
         let (config, reason) = dolby_vision_decode_fallback(Some(5), hardware_config);
 
-        assert_eq!(config.backend, DecoderBackend::AvCodec);
+        assert_eq!(config.backend, DecoderBackend::Software);
         assert!(reason.is_some());
         assert!(reason.unwrap().contains("profile 5"));
     }
@@ -8562,7 +8562,7 @@ mod tests {
         let software_config = DecoderConfig::software();
         let (config, reason) = dolby_vision_decode_fallback(Some(5), software_config);
 
-        assert_eq!(config.backend, DecoderBackend::AvCodec);
+        assert_eq!(config.backend, DecoderBackend::Software);
         assert_eq!(reason, None);
     }
 }
