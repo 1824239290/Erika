@@ -381,10 +381,14 @@ impl MetalRendererImpl {
     /// The *potential* value is used deliberately: it reports what the display
     /// can do regardless of the current brightness setting, so playback does
     /// not flip between SDR and EDR while the brightness slider moves. Falls
-    /// back to 1.0 (no EDR) when AppKit cannot answer. Resolved through
-    /// mainScreen rather than the layer's window because CALayer exposes no
-    /// safe screen accessor; multi-display hosts that move a window between
-    /// screens of differing capability re-query per source anyway.
+    /// back to 1.0 (no EDR) when AppKit cannot answer. Resolved through the
+    /// layer's hosting window: `NSScreen.mainScreen` tracks the systemwide
+    /// key window, which belongs to a *different* app whenever this one is
+    /// inactive — negotiating from it then enables PQ passthrough while the
+    /// layer sits on an SDR display, rendering washed-out colors. AppKit
+    /// makes the hosting NSView the delegate of a view-assigned backing
+    /// layer, so prefer delegate→window→screen and fall back to mainScreen
+    /// when that chain is unavailable (e.g. detached layers).
     #[cfg(target_os = "macos")]
     fn display_edr_headroom(&self) -> f32 {
         use objc2::msg_send;
@@ -392,20 +396,36 @@ impl MetalRendererImpl {
         use objc2::sel;
 
         unsafe {
-            let Some(class) = AnyClass::get(c"NSScreen") else {
-                return 1.0;
-            };
-            let main: Option<Retained<AnyObject>> = msg_send![class, mainScreen];
-            let Some(screen) = main else {
+            let screen: Option<Retained<AnyObject>> = self
+                .layer
+                .as_ref()
+                .and_then(|layer| {
+                    let delegate: Option<Retained<AnyObject>> = msg_send![layer, delegate];
+                    let delegate = delegate?;
+                    let view_class = AnyClass::get(c"NSView")?;
+                    let is_view: bool = msg_send![&delegate, isKindOfClass: view_class];
+                    if !is_view {
+                        return None;
+                    }
+                    let window: Option<Retained<AnyObject>> = msg_send![&delegate, window];
+                    let window = window?;
+                    let screen: Option<Retained<AnyObject>> = msg_send![&window, screen];
+                    screen
+                })
+                .or_else(|| {
+                    let class = AnyClass::get(c"NSScreen")?;
+                    msg_send![class, mainScreen]
+                });
+            let Some(screen) = screen else {
                 return 1.0;
             };
             let selector = sel!(maximumPotentialExtendedDynamicRangeColorComponentValue);
-            let responds: bool = msg_send![&*screen, respondsToSelector: selector];
+            let responds: bool = msg_send![&screen, respondsToSelector: selector];
             if !responds {
                 return 1.0;
             }
             let potential: f64 = msg_send![
-                &*screen,
+                &screen,
                 maximumPotentialExtendedDynamicRangeColorComponentValue
             ];
             if potential.is_finite() && potential > 0.0 {
