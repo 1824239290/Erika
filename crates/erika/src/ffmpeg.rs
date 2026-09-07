@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::core::{ColorPrimaries, FrameRate, TrackInfo, TrackKind, TransferFunction, VideoParams};
 use crate::renderer::pipeline::{
-    Chromaticity, ColorRange, ContentLightMetadata, DoviComponentCurve, DoviSourceMetadata,
-    HdrMetadata, MasteringDisplayMetadata, MatrixCoefficients, RgbMatrix,
+    Chromaticity, ColorRange, ContentLightMetadata, DoviComponentCurve, DoviFramePq,
+    DoviSourceMetadata, HdrMetadata, MasteringDisplayMetadata, MatrixCoefficients, RgbMatrix,
 };
 use crate::renderer::pipeline::{DOVI_MAX_MMR_ORDER, DOVI_MAX_PIECES};
 use crate::source::{ByteRange, MediaSource};
@@ -4673,6 +4673,13 @@ unsafe fn frame_dovi_metadata_result(
         return Err(DoviRejectReason::InvalidColorMetadata);
     }
 
+    // Level 1 per-frame brightness metadata lives in the DM extension blocks
+    // that the RPU decoder appends right after the color structure. `av_dovi_find_level`
+    // is exported by FFmpeg but performs an unchecked pointer walk, so validate
+    // the block region here like the sub-structures above. L1 is optional
+    // signal quality metadata: an invalid or absent block never rejects the RPU.
+    let l1 = frame_dovi_level1(data, &metadata, size);
+
     Ok(DoviSourceMetadata {
         reshaping,
         nonlinear_matrix: RgbMatrix::new(nonlinear_matrix),
@@ -4680,7 +4687,51 @@ unsafe fn frame_dovi_metadata_result(
         rgb_to_lms: RgbMatrix::new(rgb_to_lms),
         source_min_pq: color.source_min_pq,
         source_max_pq: color.source_max_pq,
+        l1,
     })
+}
+
+/// Reads the dynamic DM level 1 block (per-frame min/max/avg luminance in
+/// 12-bit PQ codes) from the validated ext-block region, matching
+/// `av_dovi_get_ext`'s pointer arithmetic.
+unsafe fn frame_dovi_level1(
+    data: *const u8,
+    metadata: &sys::AVDOVIMetadata,
+    size: usize,
+) -> Option<DoviFramePq> {
+    let count = usize::try_from(metadata.num_ext_blocks).ok()?;
+    if count == 0 {
+        return None;
+    }
+    let block_size = metadata.ext_block_size;
+    if block_size < mem::size_of::<sys::AVDOVIDmData>() {
+        return None;
+    }
+    let total = block_size.checked_mul(count)?;
+    let end = metadata.ext_block_offset.checked_add(total)?;
+    if end > size {
+        return None;
+    }
+    if (metadata.ext_block_offset as usize) % mem::align_of::<sys::AVDOVIDmData>() != 0 {
+        return None;
+    }
+    let ext = unsafe { data.add(metadata.ext_block_offset) };
+    for index in 0..count {
+        let block = unsafe { &*ext.add(block_size * index).cast::<sys::AVDOVIDmData>() };
+        if block.level != 1 {
+            continue;
+        }
+        let l1 = unsafe { block.__bindgen_anon_1.l1 };
+        if l1.max_pq == 0 || (l1.min_pq != 0 && l1.min_pq > l1.max_pq) {
+            return None;
+        }
+        return Some(DoviFramePq {
+            min_pq: l1.min_pq,
+            max_pq: l1.max_pq,
+            avg_pq: l1.avg_pq,
+        });
+    }
+    None
 }
 
 unsafe fn mastering_display_metadata(
@@ -5956,6 +6007,80 @@ mod tests {
                 .cast::<sys::AVDOVIColorMetadata>());
             mutate(header, mapping, color);
         }
+    }
+
+    /// Writes a single dynamic DM level 1 ext block into the side data.
+    /// `av_dovi_metadata_alloc` reserves the full ext block array inside the
+    /// same allocation, so the first block lands at `ext_block_offset`.
+    unsafe fn with_dovi_l1(frame: &Frame, min_pq: u16, max_pq: u16, avg_pq: u16) {
+        unsafe {
+            let side_data = sys::av_frame_get_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+            );
+            assert!(!side_data.is_null());
+            let metadata = &mut *(*side_data).data.cast::<sys::AVDOVIMetadata>();
+            let block = &mut *((*side_data)
+                .data
+                .add(metadata.ext_block_offset)
+                .cast::<sys::AVDOVIDmData>());
+            block.level = 1;
+            block.__bindgen_anon_1.l1 = sys::AVDOVIDmLevel1 {
+                min_pq,
+                max_pq,
+                avg_pq,
+            };
+            metadata.num_ext_blocks = 1;
+        }
+    }
+
+    #[test]
+    fn dovi_l1_brightness_metadata_is_parsed() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe { attach_valid_dovi_rpu(&frame) };
+        assert_eq!(frame.dovi_metadata().unwrap().l1, None);
+
+        unsafe { with_dovi_l1(&frame, 62, 2200, 1500) };
+        let l1 = frame
+            .dovi_metadata()
+            .unwrap()
+            .l1
+            .expect("level 1 block should be parsed");
+        assert_eq!(
+            l1,
+            DoviFramePq {
+                min_pq: 62,
+                max_pq: 2200,
+                avg_pq: 1500
+            }
+        );
+
+        // Inverted min/max and an all-zero block are treated as absent.
+        unsafe { with_dovi_l1(&frame, 2200, 100, 1500) };
+        assert_eq!(frame.dovi_metadata().unwrap().l1, None);
+        unsafe { with_dovi_l1(&frame, 0, 0, 0) };
+        assert_eq!(frame.dovi_metadata().unwrap().l1, None);
+    }
+
+    #[test]
+    fn dovi_malformed_ext_region_skips_l1_but_keeps_rpu() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe {
+            attach_valid_dovi_rpu(&frame);
+            let side_data = sys::av_frame_get_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+            );
+            assert!(!side_data.is_null());
+            let metadata = &mut *(*side_data).data.cast::<sys::AVDOVIMetadata>();
+            metadata.ext_block_offset = usize::MAX;
+            metadata.ext_block_size = mem::size_of::<sys::AVDOVIDmData>();
+            metadata.num_ext_blocks = 5;
+        }
+        let dovi = frame
+            .dovi_metadata()
+            .expect("RPU must remain usable when the ext region is malformed");
+        assert_eq!(dovi.l1, None);
     }
 
     #[test]

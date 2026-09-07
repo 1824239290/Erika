@@ -102,6 +102,18 @@ impl Default for DoviComponentCurve {
     }
 }
 
+/// Per-frame Dolby Vision dynamic metadata level 1: 12-bit PQ codes of the
+/// frame's black, peak, and average luminance. The frame peak replaces the
+/// static mastering peak (`source_max_pq`) in the tone map, matching
+/// libplacebo's handling of the RPU's CIE-Y metadata (`pl_map_dovi_metadata` /
+/// `pl_hdr_metadata_from_dovi_rpu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoviFramePq {
+    pub min_pq: u16,
+    pub max_pq: u16,
+    pub avg_pq: u16,
+}
+
 /// Per-frame Dolby Vision RPU payload copied out of the decoder's
 /// `AV_FRAME_DATA_DOVI_METADATA` side data before the frame is retired.
 ///
@@ -122,6 +134,9 @@ pub struct DoviSourceMetadata {
     pub source_min_pq: u16,
     /// 12-bit PQ code of the mastering display's peak level (typically 2000-4000 nits).
     pub source_max_pq: u16,
+    /// Per-frame level 1 brightness metadata (dynamic DM block), or `None`
+    /// when the RPU carries no usable L1 block.
+    pub l1: Option<DoviFramePq>,
 }
 
 /// Decodes a 12-bit PQ code value into absolute nits, matching the PQ EOTF
@@ -649,8 +664,12 @@ impl SourceColorState {
     /// and transfer are forced to BT.2020/PQ (matching libplacebo's
     /// `pl_map_avdovi_metadata`). The RPU's `source_min_pq`/`source_max_pq`
     /// replace static mastering luminance when present, while ordinary display
-    /// primaries and content-light metadata are retained. Forcing the transfer
-    /// also repairs streams whose VUI tags are missing entirely.
+    /// primaries and content-light metadata are retained. When the frame's
+    /// dynamic L1 block is present its frame peak replaces `source_max_pq`
+    /// for tone mapping (libplacebo uses the RPU's CIE-Y metadata the same
+    /// way); the static mastering display peak stays on the L0 value so
+    /// output-mode negotiation never reacts to per-frame brightness. Forcing
+    /// the transfer also repairs streams whose VUI tags are missing entirely.
     pub fn dovi(mut self, metadata: Option<DoviSourceMetadata>) -> Self {
         if let Some(dovi) = metadata {
             self.primaries = ColorPrimaries::Bt2020;
@@ -659,7 +678,12 @@ impl SourceColorState {
             let min_luminance = (dovi.source_min_pq != 0)
                 .then(|| pq_code_to_nits(dovi.source_min_pq))
                 .filter(|value| value.is_finite() && *value >= 0.0);
-            let peak = pq_code_to_nits(dovi.source_max_pq);
+            let frame_peak = dovi
+                .l1
+                .filter(|l1| l1.max_pq != 0)
+                .map(|l1| pq_code_to_nits(l1.max_pq));
+            let mastering_peak = pq_code_to_nits(dovi.source_max_pq);
+            let peak = frame_peak.unwrap_or(mastering_peak);
             if peak > 0.0 {
                 self.nominal_peak_nits = peak.max(1.0);
             } else if self.nominal_peak_nits <= self.reference_white_nits {
@@ -668,6 +692,9 @@ impl SourceColorState {
             // Keep ordinary mastering primaries/content-light metadata, but
             // prefer the RPU's source luminance bounds when present. This lets
             // native HDR10 outputs carry Dolby Vision black-level metadata too.
+            // The mastering peak stays on the static L0 value (never the
+            // per-frame L1 peak), so output-mode negotiation does not react
+            // to frame-by-frame brightness.
             if min_luminance.is_some()
                 || (peak.is_finite() && peak > 0.0)
                 || self.hdr_metadata.is_some()
@@ -684,8 +711,8 @@ impl SourceColorState {
                 if let Some(min_luminance) = min_luminance {
                     mastering.min_luminance_nits = Some(min_luminance);
                 }
-                if peak.is_finite() && peak > 0.0 {
-                    mastering.max_luminance_nits = Some(peak);
+                if mastering_peak.is_finite() && mastering_peak > 0.0 {
+                    mastering.max_luminance_nits = Some(mastering_peak);
                 }
                 hdr.mastering_display = Some(mastering);
                 self.hdr_metadata = Some(hdr);
@@ -1676,7 +1703,49 @@ mod tests {
             ]),
             source_min_pq: 62,
             source_max_pq: 3079,
+            l1: None,
         }
+    }
+
+    #[test]
+    fn dovi_source_uses_per_frame_l1_peak_when_present() {
+        let mut source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+        source = source.dovi(Some(sample_dovi_metadata_with_l1(1500, 2200, 1800)));
+
+        assert_eq!(
+            source.nominal_peak_nits,
+            pq_code_to_nits(2200).max(1.0),
+            "per-frame L1 peak must replace the static RPU peak for tone mapping"
+        );
+        // The static mastering display metadata keeps the L0 peak so
+        // output-mode negotiation stays stable frame to frame.
+        let mastering = source.hdr_metadata.unwrap().mastering_display.unwrap();
+        assert_eq!(mastering.max_luminance_nits, Some(pq_code_to_nits(3079)));
+    }
+
+    #[test]
+    fn dovi_source_falls_back_to_static_peak_when_l1_is_absent() {
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+            .dovi(Some(sample_dovi_metadata_with_l1(0, 0, 0)));
+        assert_eq!(
+            source.nominal_peak_nits,
+            pq_code_to_nits(3079).max(1.0),
+            "an all-zero L1 block must not replace the static RPU peak"
+        );
+
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+            .dovi(Some(sample_dovi_metadata()));
+        assert_eq!(source.nominal_peak_nits, pq_code_to_nits(3079).max(1.0));
+    }
+
+    fn sample_dovi_metadata_with_l1(min_pq: u16, max_pq: u16, avg_pq: u16) -> DoviSourceMetadata {
+        let mut metadata = sample_dovi_metadata();
+        metadata.l1 = Some(DoviFramePq {
+            min_pq,
+            max_pq,
+            avg_pq,
+        });
+        metadata
     }
 
     #[test]
