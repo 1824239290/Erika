@@ -74,6 +74,15 @@ This document summarizes the improvements made to the Dolby Vision RPU mapping i
    - Added comments instead of introducing new dependencies
    - Error cases are rare (malformed streams) and return `None` cleanly
 
+### 5. Per-Frame L1 Brightness Metadata
+
+- **File**: `crates/erika/src/ffmpeg.rs` (`frame_dovi_level1`), `crates/erika/src/renderer/pipeline.rs` (`SourceColorState::dovi`)
+- Parses the RPU's dynamic DM **level 1** block (per-frame `min/max/avg` luminance in 12-bit PQ codes) from the validated ext-block region of `AV_FRAME_DATA_DOVI_METADATA`.
+- The frame's `max_pq` replaces the static mastering peak as the tone map source peak (`VideoUniforms.nits[0]`, no uniform/shader layout change), matching libplacebo's CIE-Y handling. The static mastering display peak is deliberately left untouched so output-mode negotiation never reacts to per-frame brightness.
+- Fallback: an absent, all-zero, or inverted L1 block falls back to the static `source_max_pq`; L1 never rejects the RPU.
+- Tests: `dovi_l1_brightness_metadata_is_parsed`, `dovi_malformed_ext_region_skips_l1_but_keeps_rpu`, `dovi_source_uses_per_frame_l1_peak_when_present`, `dovi_source_falls_back_to_static_peak_when_l1_is_absent`.
+- Verified against Dolby's official `CM4_L3L8` test vectors (Profile 5 and Profile 8.1): 300/300 frames carry L1; measured L1 peak ≈ 1847 nits vs the static 4022-nit mastering peak.
+
 ## Testing Instructions
 
 ### Running New Tests

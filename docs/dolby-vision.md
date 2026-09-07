@@ -103,6 +103,24 @@ After reshaping, the signal goes through:
 4. **LMS to RGB**: `(HPE⁻¹ × rgb_to_lms) × linearized`
 5. **Gamut/tone mapping**: Standard HDR pipeline continues
 
+## Per-Frame L1 Brightness Metadata
+
+The RPU's dynamic DM extension blocks carry **level 1** per-frame brightness
+metadata: `min_pq` / `max_pq` / `avg_pq` in 12-bit PQ codes. FFmpeg's RPU
+decoder copies these blocks into the frame side data (`AVDOVIMetadata`
+`ext_block_offset` region); `frame_dovi_level1` validates that region and
+extracts the level 1 block.
+
+The frame's `max_pq` replaces the static mastering peak (`source_max_pq`) as
+the tone map's source peak, matching libplacebo's handling of the RPU's CIE-Y
+metadata. This makes the BT.2390 curve scene-adaptive: a dark scene is not
+compressed against a 4000-nit mastering peak, so its highlights stay
+distinct. The **static mastering display peak is untouched** — output-mode
+negotiation (SDR/EDR per display) must never react to per-frame brightness.
+
+An absent, all-zero, or inverted level 1 block falls back to the static
+`source_max_pq`; the RPU itself is never rejected over L1.
+
 ## Forced BT.2020/PQ
 
 Dolby Vision Profile 5/8 VUI tags are **unreliable**. The implementation forces:
@@ -123,6 +141,8 @@ See `SourceColorState::dovi()` in `pipeline.rs:624`.
 - `frame_reads_dovi_side_data`: Verifies FFmpeg side data parsing
 - `dovi_uniforms_pack_pivots_poly_and_mmr`: Validates uniform packing
 - `dovi_source_forces_pq_when_stream_tags_are_missing`: Confirms PQ forcing
+- `dovi_l1_brightness_metadata_is_parsed`: Verifies level 1 ext-block parsing and invalid-L1 fallback
+- `dovi_source_uses_per_frame_l1_peak_when_present`: Confirms L1 max_pq replaces the static peak while mastering metadata stays static
 - `dolby_vision_profile_5_stays_on_hardware_for_videotoolbox_and_d3d11va`: Verifies desktop hardware decoders stay on hardware for Profile 5
 - `dolby_vision_profile_5_falls_back_to_software_on_mobile_backends`: Verifies mobile backends fall back to software decode for Profile 5
 - `dolby_vision_profile_8_stays_on_hardware_decode`: Profile 8 hardware decode preservation
