@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.9
+
+- Published the ArkTS/OHPM package with the matching v0.1.9 native runtime.
+- Added `videoAlphaMode` propagation through the ArkTS wrapper and N-API
+  bridge while preserving opaque playback as the default.
+- Synchronized the OpenHarmony wrapper header with the C API and validated
+  HAR installation and consumer HAP builds.
+
 ## 0.1.8
 
 - Updated the native runtime with audio-clock recovery after render stalls,

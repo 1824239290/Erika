@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.9
+
+- Published the Flutter package with the matching v0.1.9 native artifacts.
+- Fixed OpenHarmony packed-alpha playback by forwarding `videoAlphaMode`
+  through the Dart, ArkTS, and N-API layers.
+- Kept the C API, platform bindings, and prebuilt runtime checksums aligned
+  across Android, Apple platforms, Windows, and OpenHarmony.
+
 ## 0.1.8
 
 - Fixed persistent audio/video drift after rendering stalls and overlapping
