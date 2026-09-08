@@ -323,6 +323,18 @@ impl ImportedVideoFrame {
                 .dovi(dovi_metadata),
         );
     }
+
+    /// Attach a presenter-measured scene-average luminance so the tone map's
+    /// pivot follows the content like Dolby Vision L1 would. Only meaningful
+    /// when the source carries no dynamic L1 metadata of its own.
+    pub fn set_measured_scene_avg(&mut self, scene_avg_nits: Option<f32>) {
+        if scene_avg_nits.is_none() {
+            return;
+        }
+        let mut source = self.source_color();
+        source = source.measured_scene_avg_nits(scene_avg_nits);
+        self.set_source_color(source);
+    }
 }
 
 pub struct VideoRenderFrame<'a> {
@@ -863,7 +875,8 @@ impl RendererBackend for MetalRenderer {
                 "Metal renderer received a non-VideoToolbox hardware payload".to_string(),
             )
         })?;
-        let imported = self.import_player_frame(decoded)?;
+        let mut imported = self.import_player_frame(decoded)?;
+        imported.set_measured_scene_avg(frame.scene_avg_nits);
         if !decoded.is_videotoolbox() {
             self.software_upload_counter = self.software_upload_counter.wrapping_add(1);
         }

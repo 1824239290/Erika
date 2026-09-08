@@ -3690,6 +3690,7 @@ fn source_color_for_frame(frame: &PlayerVideoFrame) -> SourceColorState {
     .matrix(frame.frame.matrix_coefficients())
     .hdr_metadata(frame.frame.hdr_metadata())
     .dovi(frame.frame.dovi_metadata())
+    .measured_scene_avg_nits(frame.scene_avg_nits)
 }
 
 fn constants_for_frame(

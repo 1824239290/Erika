@@ -686,6 +686,10 @@ pub struct SourceColorState {
     pub range: ColorRange,
     pub hdr_metadata: Option<HdrMetadata>,
     pub dovi: Option<DoviSourceMetadata>,
+    /// Measured per-frame scene-average luminance (nits) from CPU frame
+    /// statistics (HDR10 without Dolby Vision L1). Precedes the L1 average
+    /// when driving the tone-map pivot.
+    pub measured_scene_avg_nits: Option<f32>,
     pub nominal_peak_nits: f32,
     pub reference_white_nits: f32,
 }
@@ -699,6 +703,7 @@ impl SourceColorState {
             range: ColorRange::default(),
             hdr_metadata: None,
             dovi: None,
+            measured_scene_avg_nits: None,
             nominal_peak_nits: nominal_peak_for_transfer(transfer),
             reference_white_nits: reference_white_for_transfer(transfer),
         }
@@ -789,6 +794,20 @@ impl SourceColorState {
         } else {
             self.dovi = None;
         }
+        self
+    }
+
+    /// Attach a measured scene-average luminance from frame statistics. Only
+    /// meaningful for HDR10 (PQ) sources without Dolby Vision L1 metadata;
+    /// the value drives the tone-map pivot exactly like L1's avg would.
+    pub fn measured_scene_avg_nits(mut self, scene_avg_nits: Option<f32>) -> Self {
+        if let Some(value) = scene_avg_nits {
+            if value.is_finite() && value > 0.0 {
+                self.measured_scene_avg_nits = Some(value);
+                return self;
+            }
+        }
+        self.measured_scene_avg_nits = None;
         self
     }
 
@@ -1079,9 +1098,8 @@ impl VideoRenderPipeline {
         [
             self.tone_map.effective_curve_param(),
             self.source
-                .dovi
-                .as_ref()
-                .and_then(doni_frame_average_nits)
+                .measured_scene_avg_nits
+                .or_else(|| self.source.dovi.as_ref().and_then(doni_frame_average_nits))
                 .unwrap_or(0.0),
             // Black-point compensation only applies when the tone map is
             // actually active; applying it to SDR->SDR would crush near-black
@@ -2021,6 +2039,22 @@ mod tests {
             // map, so the old separate matrix call is gone.
             assert!(!shader.contains("rgb = apply_gamut_map(rgb)"));
         }
+    }
+
+    #[test]
+    fn measured_scene_avg_precedes_dovi_l1_and_drives_the_pivot() {
+        let mut source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+        // HDR10 without L1: attach a measured average, tone_map_extra.y follows.
+        source = source.measured_scene_avg_nits(Some(120.0));
+        let target = TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt709);
+        let pipeline = VideoRenderPipeline::new(source, target);
+        let extra = pipeline.tone_map_extra();
+        assert!((extra[1] - 120.0).abs() < 1e-3, "scene avg {}", extra[1]);
+        // A non-finite / zero value clears the channel.
+        let cleared_source = source.measured_scene_avg_nits(Some(0.0));
+        assert_eq!(cleared_source.measured_scene_avg_nits, None);
+        let cleared = VideoRenderPipeline::new(cleared_source, target);
+        assert_eq!(cleared.tone_map_extra()[1], 0.0);
     }
 
     #[test]
