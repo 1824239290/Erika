@@ -444,7 +444,7 @@ impl RgbMatrix {
         ]
     }
 
-    fn mul(self, rhs: Self) -> Self {
+    pub(crate) fn mul(self, rhs: Self) -> Self {
         let mut rows = [[0.0; 3]; 3];
         for (row_index, row) in rows.iter_mut().enumerate() {
             for (col_index, value) in row.iter_mut().enumerate() {
@@ -456,7 +456,7 @@ impl RgbMatrix {
         Self::new(rows)
     }
 
-    fn mul_vec(self, value: [f32; 3]) -> [f32; 3] {
+    pub(crate) fn mul_vec(self, value: [f32; 3]) -> [f32; 3] {
         [
             self.rows[0][0] * value[0] + self.rows[0][1] * value[1] + self.rows[0][2] * value[2],
             self.rows[1][0] * value[0] + self.rows[1][1] * value[1] + self.rows[1][2] * value[2],
@@ -464,7 +464,7 @@ impl RgbMatrix {
         ]
     }
 
-    fn inverse(self) -> Self {
+    pub(crate) fn inverse(self) -> Self {
         let m = self.rows;
         let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
             - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
@@ -582,6 +582,29 @@ fn resolve_primaries(primaries: ColorPrimaries) -> ColorPrimaries {
         ColorPrimaries::Unknown => ColorPrimaries::Bt709,
         _ => primaries,
     }
+}
+
+fn primaries_code(primaries: ColorPrimaries) -> u32 {
+    match resolve_primaries(primaries) {
+        ColorPrimaries::Bt709 => 0,
+        ColorPrimaries::Bt2020 => 1,
+        ColorPrimaries::DisplayP3 => 2,
+        ColorPrimaries::Unknown => 0,
+    }
+}
+
+pub(crate) fn code_to_primaries(code: u32) -> ColorPrimaries {
+    match code {
+        1 => ColorPrimaries::Bt2020,
+        2 => ColorPrimaries::DisplayP3,
+        _ => ColorPrimaries::Bt709,
+    }
+}
+
+/// Source and target primaries (resolved) for the perceptual gamut LUT key,
+/// packed into the uniforms' reserved word.
+pub(crate) fn gamut_primaries_code(source: ColorPrimaries, target: ColorPrimaries) -> u32 {
+    (primaries_code(source) << 8) | primaries_code(target)
 }
 
 fn xy_to_xyz(value: Chromaticity) -> [f32; 3] {
@@ -1074,8 +1097,22 @@ impl VideoRenderPipeline {
 
     /// SMPTE ST 2094-10 coefficients for the shaders' `tone_map_coeffs`
     /// uniform; zeros when the operator is inactive.
+    /// Packed (source << 8 | target) resolved-primaries codes used to key
+    /// the perceptual gamut LUT cache and stored in `_gamut_reserved`.
+    pub fn gamut_primaries_code(&self) -> u32 {
+        gamut_primaries_code(self.source.primaries, self.target.primaries)
+    }
+
     pub fn tone_map_coeffs(&self) -> [f32; 4] {
         st2094_10_coefficients_for(self)
+    }
+
+    /// Whether the perceptual gamut-mapping LUT is needed: HDR sources
+    /// tone-mapped to a smaller gamut get the LUT; SDR passthrough and
+    /// same-gamut rendering keep the fast path (gamut_compress only).
+    pub fn gamut_lut_active(&self) -> bool {
+        requires_tone_mapping(self.source, self.target)
+            && resolve_primaries(self.source.primaries) != resolve_primaries(self.target.primaries)
     }
 }
 
@@ -1126,6 +1163,14 @@ pub struct VideoUniforms {
     /// SMPTE ST 2094-10 tone-map coefficients (c1, c2, c3) solved per frame
     /// on the CPU; zero unless the ST2094-10 operator is active.
     pub tone_map_coeffs: [f32; 4],
+    /// 1 when the perceptual gamut-mapping 3D LUT is bound and the shader
+    /// must sample it after tone mapping; 0 keeps the fast gamut_compress.
+    pub gamut_lut_enabled: u32,
+    /// Packed (source << 8 | target) resolved primaries for the LUT cache.
+    pub _gamut_primaries: u32,
+    /// Reserved for future per-LUT scaling; keeps the structure padded.
+    pub _gamut_reserved0: u32,
+    pub _gamut_reserved1: u32,
     /// Dolby Vision reshaping payload; inert unless `flags[0]` is set.
     pub dovi: DoviUniforms,
 }
@@ -1153,6 +1198,13 @@ impl VideoUniforms {
             ipt_matrix_rows: pipeline.ipt_matrix_rows(),
             tone_map_extra: pipeline.tone_map_extra(),
             tone_map_coeffs: pipeline.tone_map_coeffs(),
+            gamut_lut_enabled: u32::from(pipeline.gamut_lut_active()),
+            _gamut_primaries: gamut_primaries_code(
+                pipeline.source.primaries,
+                pipeline.target.primaries,
+            ),
+            _gamut_reserved0: 0,
+            _gamut_reserved1: 0,
             dovi: DoviUniforms::of_for_representation(&pipeline.source, is_p010),
         }
     }
@@ -1968,6 +2020,63 @@ mod tests {
             // The IPT path applies the primaries conversion inside the tone
             // map, so the old separate matrix call is gone.
             assert!(!shader.contains("rgb = apply_gamut_map(rgb)"));
+        }
+    }
+
+    #[test]
+    fn gamut_lut_active_only_for_tone_mapped_wide_gamut_sources() {
+        // BT.2020 PQ -> BT.709 SDR needs the perceptual LUT.
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+        let target = TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt709);
+        let pipeline = VideoRenderPipeline::new(source, target);
+        assert!(pipeline.gamut_lut_active());
+        assert_eq!(
+            VideoUniforms::from_pipeline(&pipeline, false, false).gamut_lut_enabled,
+            1
+        );
+        // Same-gamut HDR tone map keeps the fast path.
+        let same = VideoRenderPipeline::new(
+            source,
+            TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt2020),
+        );
+        assert!(!same.gamut_lut_active());
+        // SDR -> SDR passthrough never maps.
+        let sdr = VideoRenderPipeline::new(
+            SourceColorState::new(ColorPrimaries::Bt709, TransferFunction::Srgb),
+            TargetColorState::sdr(ColorPrimaries::Bt709),
+        );
+        assert!(!sdr.gamut_lut_active());
+        // HDR10 native output (PQ target, display does the mapping) needs no
+        // gamut LUT either.
+        let hdr10 =
+            VideoRenderPipeline::new(source, TargetColorState::hdr10(ColorPrimaries::Bt2020));
+        assert!(!hdr10.gamut_lut_active());
+    }
+
+    #[test]
+    fn gamut_lut_primaries_code_round_trips() {
+        let code = gamut_primaries_code(ColorPrimaries::Bt2020, ColorPrimaries::Bt709);
+        assert_eq!(code >> 8, 1);
+        assert_eq!(code & 0xff, 0);
+        let p3 = gamut_primaries_code(ColorPrimaries::Bt709, ColorPrimaries::DisplayP3);
+        assert_eq!(p3 >> 8, 0);
+        assert_eq!(p3 & 0xff, 2);
+    }
+
+    #[test]
+    fn gamut_lut_sampling_is_present_across_video_shaders() {
+        let shaders = [
+            include_str!("wgpu_video.wgsl"),
+            include_str!("metal/apple.rs"),
+            include_str!("d3d11.rs"),
+        ];
+        for shader in shaders {
+            assert!(shader.contains("gamut_lut_enabled"));
+            assert!(shader.contains("0.5 + 0.5 * atan2"));
+            assert!(shader.contains("ipt_matrix_rows[3].xyz"));
+            assert!(shader.contains("sampled.y - 0.5"));
+            // The LUT path replaces the fast gamut_compress.
+            assert!(shader.contains("gamut_compress"));
         }
     }
 

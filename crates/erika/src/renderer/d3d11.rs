@@ -19,9 +19,9 @@ use ::windows::Win32::Graphics::Direct3D11::{
     D3D11_RENDER_TARGET_BLEND_DESC, D3D11_RESOURCE_MISC_SHARED, D3D11_SAMPLER_DESC,
     D3D11_SDK_VERSION, D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0,
     D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_ARRAY_SRV, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer,
-    ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout, ID3D11Multithread, ID3D11PixelShader,
-    ID3D11Query, ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState,
+    D3D11_TEXTURE3D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11BlendState,
+    ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout, ID3D11Multithread,
+    ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState,
     ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::{
@@ -52,6 +52,7 @@ use crate::danmaku::{
 use crate::ffmpeg::{Frame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
 use crate::renderer::d3d11_artcnn::D3d11ArtCnn;
+use crate::renderer::gamut::{GamutLut, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I};
 use crate::renderer::metal::{MetalRendererConfig, VideoAlphaMode};
 use crate::renderer::output::{
     ActiveOutputEncoding, OutputFallbackReason, OutputRuntimeStatus, OutputSurfaceFormat,
@@ -102,6 +103,10 @@ cbuffer VideoConstants : register(b0) {
     float4 ipt_matrix_rows[6];
     float4 tone_map_extra;
     float4 tone_map_coeffs;
+    uint gamut_lut_enabled;
+    uint gamut_primaries;
+    uint gamut_reserved0;
+    uint gamut_reserved1;
     DoviUniforms dovi;
     // xy scales native/packed luma coordinates; zw scales native chroma.
     // D3D11VA textures can be allocation-aligned beyond the visible frame.
@@ -110,6 +115,7 @@ cbuffer VideoConstants : register(b0) {
 
 Texture2D lumaTex : register(t0);
 Texture2D chromaTex : register(t1);
+Texture3D gamutLut : register(t2);
 SamplerState videoSampler : register(s0);
 
 float source_peak_nits() {
@@ -682,7 +688,51 @@ float4 ps_main(VsOut input) : SV_Target {
     rgb = source_reference_to_nits(rgb);
     rgb = tone_map_nits(rgb);
     rgb = target_nits_to_reference_linear(rgb);
-    rgb = gamut_compress(rgb);
+    if (gamut_lut_enabled != 0u) {
+        // Perceptual gamut mapping: sample the IPT-space 3D LUT generated on
+        // the CPU (renderer::gamut). The LUT's I axis spans the target
+        // display range in PQ and C/h map to the texel's cylindrical
+        // coordinates, exactly like libplacebo's shader lookup.
+        float3 nits_rgb = max(rgb, float3(0.0, 0.0, 0.0)) * target_reference_white_nits();
+        float3 lms = float3(
+            dot(ipt_matrix_rows[0].xyz, nits_rgb),
+            dot(ipt_matrix_rows[1].xyz, nits_rgb),
+            dot(ipt_matrix_rows[2].xyz, nits_rgb)
+        );
+        float3 lmspq = float3(pq_code(lms.r), pq_code(lms.g), pq_code(lms.b));
+        float3 ipt = float3(
+            dot(float3(0.4, 0.4, 0.2), lmspq),
+            dot(float3(4.455, -4.851, 0.396), lmspq),
+            dot(float3(0.8056, 0.3572, -1.1628), lmspq)
+        );
+        // The LUT's I axis covers [min_luma, max_luma] = [0, target peak PQ].
+        float lut_peak = max(pq_code(target_peak_nits()), 0.000001);
+        float3 idx = float3(
+            clamp(ipt.x / lut_peak, 0.0, 1.0),
+            2.0 * length(ipt.yz),
+            0.5 + 0.5 * atan2(ipt.z, ipt.y) / 3.14159265
+        );
+        float3 sampled = gamutLut.Sample(videoSampler, idx).xyz;
+        // Sampled texels carry (I, P + 0.5, T + 0.5); rebuild the offset.
+        float3 mapped = float3(sampled.x, sampled.y - 0.5, sampled.z - 0.5);
+        float3 lmspq_out = float3(
+            dot(float3(1.0, 0.0975689, 0.205226), mapped),
+            dot(float3(1.0, -0.113876, 0.133217), mapped),
+            dot(float3(1.0, 0.0326151, -0.676887), mapped)
+        );
+        float3 lms_out = float3(
+            nits_from_pq(lmspq_out.r),
+            nits_from_pq(lmspq_out.g),
+            nits_from_pq(lmspq_out.b)
+        );
+        rgb = float3(
+            dot(ipt_matrix_rows[3].xyz, lms_out),
+            dot(ipt_matrix_rows[4].xyz, lms_out),
+            dot(ipt_matrix_rows[5].xyz, lms_out)
+        ) / target_reference_white_nits();
+    } else {
+        rgb = gamut_compress(rgb);
+    }
     rgb = target_reference_linear_to_output(rgb);
     float alpha = 1.0;
     if (packed_alpha) {
@@ -1178,6 +1228,9 @@ pub struct D3d11Renderer {
     upscaler: D3d11ArtCnn,
     next_frame_token: u64,
     hdr10_output_unavailable: bool,
+    /// Cached perceptual gamut LUT (3D RGBA16F SRV), keyed the same way as
+    /// the wgpu/Metal caches.
+    gamut_lut: Option<(u32, u32, u32, ID3D11ShaderResourceView)>,
     stats: D3d11RendererStats,
 }
 
@@ -1199,6 +1252,7 @@ impl D3d11Renderer {
             upscaler: D3d11ArtCnn::default(),
             next_frame_token: 0,
             hdr10_output_unavailable: false,
+            gamut_lut: None,
             stats: D3d11RendererStats::default(),
         })
     }
@@ -2546,6 +2600,83 @@ impl D3d11DeviceState {
         })
     }
 
+    /// Return a cached (or freshly generated) perceptual gamut LUT SRV for
+    /// the given uniforms, or `None` on the fast path.
+    /// Return a cached (or freshly generated) perceptual gamut LUT SRV for
+    /// the given uniforms, or `None` on the fast path. The LUT is a 2D array
+    /// texture (I x C planes, one per hue slice) sampled as RGB16F, matching
+    /// the RGBA16F layouts of the other backends.
+    fn gamut_lut_view(
+        &mut self,
+        uniforms: &VideoUniforms,
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
+        if uniforms.gamut_lut_enabled == 0 {
+            return Ok(None);
+        }
+        let packed = uniforms._gamut_primaries;
+        let source = packed >> 8;
+        let target = packed & 0xff;
+        let peak_pq = ((uniforms.nits[1] / 10000.0).clamp(0.0, 1.0) * 65535.0) as u32;
+        if let Some((s, t, p, srv)) = &self.gamut_lut {
+            if *s == source && *t == target && *p == peak_pq {
+                return Ok(Some(srv.clone()));
+            }
+        }
+        let state = self.state.as_ref().expect("device ensured for gamut lut");
+        let lut = GamutLut::generate(GamutLutParams {
+            source: d3d_code_to_primaries(source),
+            target: d3d_code_to_primaries(target),
+            min_luma: 0.0,
+            max_luma: d3d_pq_code_for_lut(uniforms.nits[1]),
+        });
+        // Pack (I, P+0.5, T+0.5) into RGBA16F texels laid out as
+        // I x C x H (the same lattice order as the CPU generation).
+        let mut texels = Vec::with_capacity(lut.texels.len() * 4);
+        for texel in &lut.texels {
+            texels.extend_from_slice(texel);
+            texels.push(1.0);
+        }
+        let slice_pitch = LUT_SIZE_I * LUT_SIZE_C * 4 * 2;
+        let initial = [D3D11_SUBRESOURCE_DATA {
+            pSysMem: texels.as_ptr() as *const c_void,
+            SysMemPitch: LUT_SIZE_I * 4 * 2,
+            SysMemSlicePitch: slice_pitch,
+        }];
+        let desc = D3D11_TEXTURE3D_DESC {
+            Width: LUT_SIZE_I as u32,
+            Height: LUT_SIZE_C as u32,
+            Depth: LUT_SIZE_H as u32,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe {
+            state
+                .device
+                .CreateTexture3D(&desc, Some(&initial), Some(&mut texture))
+                .map_err(|error| d3d_error("ID3D11Device::CreateTexture3D(gamut lut)", error))?;
+        }
+        let resource = texture
+            .expect("gamut lut texture created")
+            .cast::<ID3D11Resource>();
+        let mut srv = None;
+        unsafe {
+            state
+                .device
+                .CreateShaderResourceView(&resource, None, Some(&mut srv))
+                .map_err(|error| {
+                    d3d_error("ID3D11Device::CreateShaderResourceView(gamut lut)", error)
+                })?;
+        }
+        let srv = srv.expect("gamut lut srv created");
+        self.gamut_lut = Some((source, target, peak_pq, srv.clone()));
+        Ok(Some(srv))
+    }
+
     fn draw_video(
         &self,
         video: &ImportedVideoFrame,
@@ -2617,20 +2748,25 @@ impl D3d11DeviceState {
             self.context.PSSetShader(&self.pixel_shader, None);
             self.context
                 .PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
-            self.context.PSSetShaderResources(
-                0,
-                Some(&[
-                    Some(upscaled_luma.cloned().unwrap_or_else(|| video.luma.clone())),
-                    Some(video.chroma.clone()),
-                ]),
-            );
+            let mut srvs = vec![
+                Some(upscaled_luma.cloned().unwrap_or_else(|| video.luma.clone())),
+                Some(video.chroma.clone()),
+            ];
+            // Perceptual gamut LUT lives on texture slot 2.
+            if let Some(lut) = self.gamut_lut_view(&video.constants)? {
+                srvs.push(Some(lut));
+            } else {
+                srvs.push(None);
+            }
+            self.context.PSSetShaderResources(0, Some(&srvs));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context
                 .OMSetRenderTargets(Some(&[Some(render_target.clone())]), None);
             self.context.OMSetBlendState(None, None, u32::MAX);
             self.context.Draw(6, 0);
-            self.context.PSSetShaderResources(0, Some(&[None, None]));
+            self.context
+                .PSSetShaderResources(0, Some(&[None, None, None]));
         }
         Ok(())
     }
@@ -2825,6 +2961,24 @@ fn aspect_fit_rect(
         y: rect.y,
         width: rect.width,
         height: rect.height,
+    }
+}
+
+fn d3d_pq_code_for_lut(nits: f32) -> f32 {
+    let m1 = 0.1593017578125_f32;
+    let m2 = 78.84375_f32;
+    let c1 = 0.8359375_f32;
+    let c2 = 18.8515625_f32;
+    let c3 = 18.6875_f32;
+    let p = (nits / 10000.0).clamp(0.0, 1.0).powf(m1);
+    ((c1 + c2 * p) / (1.0 + c3 * p).max(0.000_001)).powf(m2)
+}
+
+fn d3d_code_to_primaries(code: u32) -> ColorPrimaries {
+    match code {
+        1 => ColorPrimaries::Bt2020,
+        2 => ColorPrimaries::DisplayP3,
+        _ => ColorPrimaries::Bt709,
     }
 }
 

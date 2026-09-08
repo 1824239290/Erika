@@ -17,6 +17,10 @@ struct VideoUniforms {
     ipt_matrix_rows: array<vec4<f32>, 6>,
     tone_map_extra: vec4<f32>,
     tone_map_coeffs: vec4<f32>,
+    gamut_lut_enabled: u32,
+    _gamut_primaries: u32,
+    _gamut_reserved0: u32,
+    _gamut_reserved1: u32,
     dovi_flags: vec4<f32>,
     dovi_pivots: array<vec4<f32>, 6>,
     dovi_bounds: array<vec4<f32>, 3>,
@@ -31,6 +35,7 @@ struct VideoUniforms {
 @group(0) @binding(1) var luma_texture: texture_2d<f32>;
 @group(0) @binding(2) var chroma_texture: texture_2d<f32>;
 @group(0) @binding(3) var video_sampler: sampler;
+@group(0) @binding(4) var gamut_lut: texture_3d<f32>;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -633,7 +638,51 @@ fn erika_video_fragment(in: VertexOut) -> @location(0) vec4<f32> {
     rgb = source_reference_to_nits(rgb);
     rgb = tone_map_nits(rgb);
     rgb = target_nits_to_reference_linear(rgb);
-    rgb = gamut_compress(rgb);
+    if (uniforms.gamut_lut_enabled != 0u) {
+        // Perceptual gamut mapping: sample the IPT-space 3D LUT generated on
+        // the CPU (renderer::gamut). The LUT's I axis spans the target
+        // display range in PQ and C/h map to the texel's cylindrical
+        // coordinates, exactly like libplacebo's shader lookup.
+        let nits = max(rgb, vec3<f32>(0.0)) * target_reference_white_nits();
+        let lms = vec3<f32>(
+            dot(uniforms.ipt_matrix_rows[0].xyz, nits),
+            dot(uniforms.ipt_matrix_rows[1].xyz, nits),
+            dot(uniforms.ipt_matrix_rows[2].xyz, nits)
+        );
+        let lmspq = vec3<f32>(pq_code(lms.r), pq_code(lms.g), pq_code(lms.b));
+        let ipt = vec3<f32>(
+            dot(vec3<f32>(0.4, 0.4, 0.2), lmspq),
+            dot(vec3<f32>(4.455, -4.851, 0.396), lmspq),
+            dot(vec3<f32>(0.8056, 0.3572, -1.1628), lmspq)
+        );
+        // The LUT's I axis covers [min_luma, max_luma] = [0, target peak PQ].
+        let lut_peak = max(pq_code(target_peak_nits()), 0.000001);
+        let idx = vec3<f32>(
+            clamp(ipt.x / lut_peak, 0.0, 1.0),
+            2.0 * length(ipt.yz),
+            0.5 + 0.5 * atan2(ipt.z, ipt.y) / 3.14159265
+        );
+        let sampled = textureSample(gamut_lut, video_sampler, idx).xyz;
+        // Sampled texels carry (I, P + 0.5, T + 0.5); rebuild the offset.
+        let mapped = vec3<f32>(sampled.x, sampled.y - 0.5, sampled.z - 0.5);
+        let lmspq_out = vec3<f32>(
+            dot(vec3<f32>(1.0, 0.0975689, 0.205226), mapped),
+            dot(vec3<f32>(1.0, -0.113876, 0.133217), mapped),
+            dot(vec3<f32>(1.0, 0.0326151, -0.676887), mapped)
+        );
+        let lms_out = vec3<f32>(
+            nits_from_pq(lmspq_out.r),
+            nits_from_pq(lmspq_out.g),
+            nits_from_pq(lmspq_out.b)
+        );
+        rgb = vec3<f32>(
+            dot(uniforms.ipt_matrix_rows[3].xyz, lms_out),
+            dot(uniforms.ipt_matrix_rows[4].xyz, lms_out),
+            dot(uniforms.ipt_matrix_rows[5].xyz, lms_out)
+        ) / target_reference_white_nits();
+    } else {
+        rgb = gamut_compress(rgb);
+    }
     rgb = target_reference_linear_to_output(rgb);
     var alpha = 1.0;
     if (packed_alpha) {

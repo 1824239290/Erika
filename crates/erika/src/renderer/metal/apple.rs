@@ -32,7 +32,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLClearColor, MTLCreateSystemDefaultDevice, MTLLoadAction,
     MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTextureDescriptor, MTLTextureUsage,
+    MTLStoreAction, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
@@ -49,6 +49,7 @@ use objc2_quartz_core::{kCAContentsFormatRGBA8Uint, kCAContentsFormatRGBA16Float
 
 use crate::core::{ColorPrimaries, RendererResourceStats, SurfaceMetrics, TransferFunction};
 use crate::danmaku::{DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuRenderPlan};
+use crate::renderer::gamut::{GamutLut, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I};
 use crate::renderer::metal::upscaler::LumaUpscaler;
 use crate::renderer::metal::{
     ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
@@ -115,6 +116,15 @@ pub struct ImportedVideoFrameResult {
     pub textures: ImportedVideoFrameTextures,
 }
 
+/// Cache of the generated perceptual gamut LUT, keyed by source/target
+/// primaries and the PQ-encoded target peak (which sets the LUT I range).
+struct GamutLutCache {
+    source: u32,
+    target: u32,
+    target_peak_pq: u32,
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+}
+
 pub struct MetalRendererImpl {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -140,6 +150,9 @@ pub struct MetalRendererImpl {
     pending_gpu_timing: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     stats: MetalRendererStats,
     layer_color_space_label: &'static str,
+    /// Perceptual gamut LUT (3D RGBA16Float) cached per (source, target,
+    /// peak) key; `None` when the fast path is in use.
+    gamut_lut: Option<GamutLutCache>,
     logged_first_video_frame: bool,
 }
 
@@ -153,6 +166,24 @@ fn hdr_debug_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn pq_code_for_lut(nits: f32) -> f32 {
+    let m1 = 0.1593017578125_f32;
+    let m2 = 78.84375_f32;
+    let c1 = 0.8359375_f32;
+    let c2 = 18.8515625_f32;
+    let c3 = 18.6875_f32;
+    let p = (nits / 10000.0).clamp(0.0, 1.0).powf(m1);
+    ((c1 + c2 * p) / (1.0 + c3 * p).max(0.000_001)).powf(m2)
+}
+
+fn code_to_primaries(code: u32) -> ColorPrimaries {
+    match code {
+        1 => ColorPrimaries::Bt2020,
+        2 => ColorPrimaries::DisplayP3,
+        _ => ColorPrimaries::Bt709,
+    }
 }
 
 impl MetalRendererImpl {
@@ -193,6 +224,7 @@ impl MetalRendererImpl {
             pending_gpu_timing: None,
             stats: MetalRendererStats::default(),
             layer_color_space_label: "unconfigured",
+            gamut_lut: None,
             logged_first_video_frame: false,
         })
     }
@@ -666,6 +698,95 @@ impl MetalRendererImpl {
         Ok(())
     }
 
+    /// Return a cached (or freshly generated) perceptual gamut LUT texture
+    /// for the frame's color pipeline, or `None` when the fast path is used.
+    fn gamut_lut_texture(
+        &mut self,
+        frame: &VideoRenderFrame<'_>,
+    ) -> Result<Option<Retained<ProtocolObject<dyn MTLTexture>>>> {
+        if !frame.pipeline.gamut_lut_active() {
+            return Ok(None);
+        }
+        let packed = frame.pipeline.gamut_primaries_code();
+        let source = packed >> 8;
+        let target = packed & 0xff;
+        let peak_pq =
+            ((frame.pipeline.target.peak_nits / 10000.0).clamp(0.0, 1.0) * 65535.0) as u32;
+        if let Some(cached) = &self.gamut_lut {
+            if cached.source == source
+                && cached.target == target
+                && cached.target_peak_pq == peak_pq
+            {
+                return Ok(Some(cached.texture.clone()));
+            }
+        }
+        let lut = GamutLut::generate(GamutLutParams {
+            source: code_to_primaries(source),
+            target: code_to_primaries(target),
+            min_luma: 0.0,
+            max_luma: pq_code_for_lut(frame.pipeline.target.peak_nits),
+        });
+        // Metal lacks a 3D convenience constructor in this binding; build the
+        // descriptor from the 2D factory and switch the type/depth.
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA16Float,
+                LUT_SIZE_I,
+                LUT_SIZE_C,
+                false,
+            )
+        };
+        descriptor.setTextureType(MTLTextureType::Type3D);
+        unsafe {
+            descriptor.setDepth(LUT_SIZE_H);
+        }
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+        let texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .ok_or_else(|| {
+                PlayerError::Renderer(
+                    "newTextureWithDescriptor (gamut LUT) returned nil".to_string(),
+                )
+            })?;
+        // Pack RGB (I, P+0.5, T+0.5) into RGBA16F texels.
+        let mut rgba16 = Vec::with_capacity(lut.texels.len() * 4);
+        for texel in &lut.texels {
+            rgba16.push(texel[0]);
+            rgba16.push(texel[1]);
+            rgba16.push(texel[2]);
+            rgba16.push(1.0);
+        }
+        let region = MTLRegion {
+            origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: objc2_metal::MTLSize {
+                width: LUT_SIZE_I,
+                height: LUT_SIZE_C,
+                depth: LUT_SIZE_H,
+            },
+        };
+        let bytes_per_row = LUT_SIZE_I * 4 * 2; // RGBA16F = 8 bytes/texel
+        unsafe {
+            texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                region,
+                0,
+                0,
+                NonNull::new(rgba16.as_ptr().cast::<c_void>().cast_mut())
+                    .expect("gamut lut pointer is non-null"),
+                bytes_per_row,
+                LUT_SIZE_I * bytes_per_row,
+            );
+        }
+        self.gamut_lut = Some(GamutLutCache {
+            source,
+            target,
+            target_peak_pq: peak_pq,
+            texture: texture.clone(),
+        });
+        Ok(Some(texture))
+    }
+
     pub fn render_video_frame(&mut self, frame: VideoRenderFrame<'_>) -> Result<()> {
         self.render_video_frame_inner(frame, None, None)
     }
@@ -957,6 +1078,10 @@ impl MetalRendererImpl {
                 ipt_matrix_rows: frame.pipeline.ipt_matrix_rows(),
                 tone_map_extra: frame.pipeline.tone_map_extra(),
                 tone_map_coeffs: frame.pipeline.tone_map_coeffs(),
+                gamut_lut_enabled: frame.pipeline.gamut_lut_active() as u32,
+                gamut_primaries: frame.pipeline.gamut_primaries_code(),
+                gamut_reserved0: 0,
+                gamut_reserved1: 0,
                 dovi: DoviUniforms::of_for_representation(
                     &frame.pipeline.source,
                     matches!(frame.frame.info.format, ImportedVideoFormat::P010),
@@ -965,6 +1090,10 @@ impl MetalRendererImpl {
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentTexture_atIndex(Some(luma), 0);
             encoder.setFragmentTexture_atIndex(Some(chroma), 1);
+            let gamut_lut = self.gamut_lut_texture(&frame)?;
+            if let Some(lut) = &gamut_lut {
+                encoder.setFragmentTexture_atIndex(Some(lut), 2);
+            }
             encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
             encoder.setVertexBytes_length_atIndex(
                 NonNull::new(
@@ -1161,6 +1290,10 @@ impl MetalRendererImpl {
                 ipt_matrix_rows: frame.pipeline.ipt_matrix_rows(),
                 tone_map_extra: frame.pipeline.tone_map_extra(),
                 tone_map_coeffs: frame.pipeline.tone_map_coeffs(),
+                gamut_lut_enabled: frame.pipeline.gamut_lut_active() as u32,
+                gamut_primaries: frame.pipeline.gamut_primaries_code(),
+                gamut_reserved0: 0,
+                gamut_reserved1: 0,
                 dovi: DoviUniforms::of_for_representation(
                     &frame.pipeline.source,
                     matches!(frame.frame.info.format, ImportedVideoFormat::P010),
@@ -1169,6 +1302,10 @@ impl MetalRendererImpl {
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentTexture_atIndex(Some(luma), 0);
             encoder.setFragmentTexture_atIndex(Some(chroma), 1);
+            let gamut_lut = self.gamut_lut_texture(&frame)?;
+            if let Some(lut) = &gamut_lut {
+                encoder.setFragmentTexture_atIndex(Some(lut), 2);
+            }
             encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
             encoder.setVertexBytes_length_atIndex(
                 NonNull::new(
@@ -2257,6 +2394,10 @@ struct VideoUniforms {
     ipt_matrix_rows: [[f32; 4]; 6],
     tone_map_extra: [f32; 4],
     tone_map_coeffs: [f32; 4],
+    gamut_lut_enabled: u32,
+    gamut_primaries: u32,
+    gamut_reserved0: u32,
+    gamut_reserved1: u32,
     dovi: DoviUniforms,
 }
 
@@ -2897,6 +3038,10 @@ struct VideoUniforms {
     float4 ipt_matrix_rows[6];
     float4 tone_map_extra;
     float4 tone_map_coeffs;
+    uint gamut_lut_enabled;
+    uint gamut_primaries;
+    uint gamut_reserved0;
+    uint gamut_reserved1;
     float4 dovi_flags;
     float4 dovi_pivots[6];
     float4 dovi_bounds[3];
@@ -3429,6 +3574,7 @@ fragment float4 erika_video_fragment(
     VertexOut in [[stage_in]],
     texture2d<float, access::sample> luma_texture [[texture(0)]],
     texture2d<float, access::sample> chroma_texture [[texture(1)]],
+    texture3d<float, access::sample> gamut_lut [[texture(2)]],
     sampler video_sampler [[sampler(0)]],
     constant VideoUniforms& uniforms [[buffer(0)]]) {
     bool packed_alpha = uniforms.video_alpha_mode == 1;
@@ -3468,7 +3614,51 @@ fragment float4 erika_video_fragment(
     rgb = source_reference_to_nits(rgb, uniforms);
     rgb = tone_map_nits(rgb, uniforms);
     rgb = target_nits_to_reference_linear(rgb, uniforms);
-    rgb = gamut_compress(rgb);
+    if (uniforms.gamut_lut_enabled != 0) {
+        // Perceptual gamut mapping: sample the IPT-space 3D LUT generated on
+        // the CPU (renderer::gamut). The LUT's I axis spans the target
+        // display range in PQ and C/h map to the texel's cylindrical
+        // coordinates, exactly like libplacebo's shader lookup.
+        float3 nits = max(rgb, float3(0.0)) * target_reference_white_nits(uniforms);
+        float3 lms = float3(
+            dot(uniforms.ipt_matrix_rows[0].xyz, nits),
+            dot(uniforms.ipt_matrix_rows[1].xyz, nits),
+            dot(uniforms.ipt_matrix_rows[2].xyz, nits)
+        );
+        float3 lmspq = float3(pq_code(lms.r), pq_code(lms.g), pq_code(lms.b));
+        float3 ipt = float3(
+            dot(float3(0.4, 0.4, 0.2), lmspq),
+            dot(float3(4.455, -4.851, 0.396), lmspq),
+            dot(float3(0.8056, 0.3572, -1.1628), lmspq)
+        );
+        // The LUT's I axis covers [min_luma, max_luma] = [0, target peak PQ].
+        float lut_peak = max(pq_code(target_peak_nits(uniforms)), 0.000001);
+        float3 idx = float3(
+            clamp(ipt.x / lut_peak, 0.0, 1.0),
+            2.0 * length(ipt.yz),
+            0.5 + 0.5 * atan2(ipt.z, ipt.y) / 3.14159265
+        );
+        float3 sampled = gamut_lut.sample(video_sampler, idx).xyz;
+        // Sampled texels carry (I, P + 0.5, T + 0.5); rebuild the offset.
+        float3 mapped = float3(sampled.x, sampled.y - 0.5, sampled.z - 0.5);
+        float3 lmspq_out = float3(
+            dot(float3(1.0, 0.0975689, 0.205226), mapped),
+            dot(float3(1.0, -0.113876, 0.133217), mapped),
+            dot(float3(1.0, 0.0326151, -0.676887), mapped)
+        );
+        float3 lms_out = float3(
+            nits_from_pq(lmspq_out.r),
+            nits_from_pq(lmspq_out.g),
+            nits_from_pq(lmspq_out.b)
+        );
+        rgb = float3(
+            dot(uniforms.ipt_matrix_rows[3].xyz, lms_out),
+            dot(uniforms.ipt_matrix_rows[4].xyz, lms_out),
+            dot(uniforms.ipt_matrix_rows[5].xyz, lms_out)
+        ) / target_reference_white_nits(uniforms);
+    } else {
+        rgb = gamut_compress(rgb);
+    }
     rgb = target_reference_linear_to_output(rgb, uniforms);
     float alpha = 1.0;
     if (packed_alpha) {
@@ -4062,7 +4252,7 @@ mod tests {
 
     #[test]
     fn video_uniforms_keep_float4_fields_aligned() {
-        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 3232);
+        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 3248);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, edr_output), 20);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, rect), 32);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, viewport), 48);
@@ -4087,7 +4277,11 @@ mod tests {
             std::mem::offset_of!(super::VideoUniforms, tone_map_coeffs),
             256
         );
-        assert_eq!(std::mem::offset_of!(super::VideoUniforms, dovi), 272);
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, gamut_lut_enabled),
+            272
+        );
+        assert_eq!(std::mem::offset_of!(super::VideoUniforms, dovi), 288);
     }
 
     #[test]
