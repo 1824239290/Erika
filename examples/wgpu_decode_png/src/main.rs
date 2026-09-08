@@ -102,6 +102,7 @@ fn render_frame(renderer: &mut WgpuRenderer, frame: Frame, out: &str) {
         media_time: pts.unwrap_or_default(),
         late_by: None,
         generation: 1,
+        scene_avg_nits: None,
     };
     renderer
         .upload_player_frame(&player_frame)
