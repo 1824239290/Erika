@@ -5003,6 +5003,7 @@ fn retain_player_video_frame(frame: &PlayerVideoFrame) -> Result<PlayerVideoFram
         media_time: frame.media_time,
         late_by: frame.late_by,
         generation: frame.generation,
+        scene_avg_nits: frame.scene_avg_nits,
     })
 }
 
