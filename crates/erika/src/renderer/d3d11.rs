@@ -1966,6 +1966,77 @@ impl D3d11Renderer {
         Ok(())
     }
 
+    /// Return a cached (or freshly generated) perceptual gamut LUT SRV for
+    /// the given uniforms, or `None` on the fast path.
+    fn gamut_lut_view(
+        &mut self,
+        uniforms: &VideoUniforms,
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
+        if uniforms.gamut_lut_enabled == 0 {
+            return Ok(None);
+        }
+        let packed = uniforms._gamut_primaries;
+        let source = packed >> 8;
+        let target = packed & 0xff;
+        let peak_pq = ((uniforms.nits[1] / 10000.0).clamp(0.0, 1.0) * 65535.0) as u32;
+        if let Some((s, t, p, srv)) = &self.gamut_lut {
+            if *s == source && *t == target && *p == peak_pq {
+                return Ok(Some(srv.clone()));
+            }
+        }
+        let state = self.state.as_ref().expect("device ensured for gamut lut");
+        let lut = GamutLut::generate(GamutLutParams {
+            source: d3d_code_to_primaries(source),
+            target: d3d_code_to_primaries(target),
+            min_luma: 0.0,
+            max_luma: d3d_pq_code_for_lut(uniforms.nits[1]),
+        });
+        // Pack (I, P+0.5, T+0.5) into RGBA16F texels laid out I x C x H.
+        let mut texels = Vec::with_capacity(lut.texels.len() * 4);
+        for texel in &lut.texels {
+            texels.extend_from_slice(texel);
+            texels.push(1.0);
+        }
+        let initial = [D3D11_SUBRESOURCE_DATA {
+            pSysMem: texels.as_ptr() as *const c_void,
+            SysMemPitch: LUT_SIZE_I * 4 * 2,
+            SysMemSlicePitch: LUT_SIZE_I * LUT_SIZE_C * 4 * 2,
+        }];
+        let desc = D3D11_TEXTURE3D_DESC {
+            Width: LUT_SIZE_I as u32,
+            Height: LUT_SIZE_C as u32,
+            Depth: LUT_SIZE_H as u32,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe {
+            state
+                .device
+                .CreateTexture3D(&desc, Some(&initial), Some(&mut texture))
+                .map_err(|error| d3d_error("ID3D11Device::CreateTexture3D(gamut lut)", error))?;
+        }
+        let resource = texture
+            .expect("gamut lut texture created")
+            .cast::<ID3D11Resource>();
+        let mut srv = None;
+        unsafe {
+            state
+                .device
+                .CreateShaderResourceView(&resource, None, Some(&mut srv))
+                .map_err(|error| {
+                    d3d_error("ID3D11Device::CreateShaderResourceView(gamut lut)", error)
+                })?;
+        }
+        let srv = srv.expect("gamut lut srv created");
+        self.gamut_lut = Some((source, target, peak_pq, srv.clone()));
+        Ok(Some(srv))
+    }
+
     fn render_video(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         if self.current_video.is_none() {
             return Ok(false);
@@ -2043,6 +2114,7 @@ impl D3d11Renderer {
             None
         };
         let video = self.current_video.as_ref().expect("video checked");
+        let video_constants = video.constants;
         let state = self.state.as_ref().expect("device ensured");
         let surface = self.surface.as_ref().expect("surface ensured");
         let rtv = surface
@@ -2077,7 +2149,14 @@ impl D3d11Renderer {
                 ],
             );
         }
-        state.draw_video(video, upscaled_luma.as_ref(), scene_rtv, target_rect)?;
+        let gamut_lut = self.gamut_lut_view(&video_constants)?;
+        state.draw_video(
+            video,
+            upscaled_luma.as_ref(),
+            gamut_lut.as_ref(),
+            scene_rtv,
+            target_rect,
+        )?;
         if !overlay_draws.is_empty() {
             // Subtitle coordinates are produced in the video-frame viewport.
             // Composite them through the same aspect-fit viewport as the video
@@ -2606,81 +2685,11 @@ impl D3d11DeviceState {
     /// the given uniforms, or `None` on the fast path. The LUT is a 2D array
     /// texture (I x C planes, one per hue slice) sampled as RGB16F, matching
     /// the RGBA16F layouts of the other backends.
-    fn gamut_lut_view(
-        &mut self,
-        uniforms: &VideoUniforms,
-    ) -> Result<Option<ID3D11ShaderResourceView>> {
-        if uniforms.gamut_lut_enabled == 0 {
-            return Ok(None);
-        }
-        let packed = uniforms._gamut_primaries;
-        let source = packed >> 8;
-        let target = packed & 0xff;
-        let peak_pq = ((uniforms.nits[1] / 10000.0).clamp(0.0, 1.0) * 65535.0) as u32;
-        if let Some((s, t, p, srv)) = &self.gamut_lut {
-            if *s == source && *t == target && *p == peak_pq {
-                return Ok(Some(srv.clone()));
-            }
-        }
-        let state = self.state.as_ref().expect("device ensured for gamut lut");
-        let lut = GamutLut::generate(GamutLutParams {
-            source: d3d_code_to_primaries(source),
-            target: d3d_code_to_primaries(target),
-            min_luma: 0.0,
-            max_luma: d3d_pq_code_for_lut(uniforms.nits[1]),
-        });
-        // Pack (I, P+0.5, T+0.5) into RGBA16F texels laid out as
-        // I x C x H (the same lattice order as the CPU generation).
-        let mut texels = Vec::with_capacity(lut.texels.len() * 4);
-        for texel in &lut.texels {
-            texels.extend_from_slice(texel);
-            texels.push(1.0);
-        }
-        let slice_pitch = LUT_SIZE_I * LUT_SIZE_C * 4 * 2;
-        let initial = [D3D11_SUBRESOURCE_DATA {
-            pSysMem: texels.as_ptr() as *const c_void,
-            SysMemPitch: LUT_SIZE_I * 4 * 2,
-            SysMemSlicePitch: slice_pitch,
-        }];
-        let desc = D3D11_TEXTURE3D_DESC {
-            Width: LUT_SIZE_I as u32,
-            Height: LUT_SIZE_C as u32,
-            Depth: LUT_SIZE_H as u32,
-            MipLevels: 1,
-            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let mut texture = None;
-        unsafe {
-            state
-                .device
-                .CreateTexture3D(&desc, Some(&initial), Some(&mut texture))
-                .map_err(|error| d3d_error("ID3D11Device::CreateTexture3D(gamut lut)", error))?;
-        }
-        let resource = texture
-            .expect("gamut lut texture created")
-            .cast::<ID3D11Resource>();
-        let mut srv = None;
-        unsafe {
-            state
-                .device
-                .CreateShaderResourceView(&resource, None, Some(&mut srv))
-                .map_err(|error| {
-                    d3d_error("ID3D11Device::CreateShaderResourceView(gamut lut)", error)
-                })?;
-        }
-        let srv = srv.expect("gamut lut srv created");
-        self.gamut_lut = Some((source, target, peak_pq, srv.clone()));
-        Ok(Some(srv))
-    }
-
     fn draw_video(
         &self,
         video: &ImportedVideoFrame,
         upscaled_luma: Option<&ID3D11ShaderResourceView>,
+        gamut_lut: Option<&ID3D11ShaderResourceView>,
         render_target: &ID3D11RenderTargetView,
         target: D3d11DrawRect,
     ) -> Result<()> {
@@ -2748,16 +2757,11 @@ impl D3d11DeviceState {
             self.context.PSSetShader(&self.pixel_shader, None);
             self.context
                 .PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
-            let mut srvs = vec![
+            let srvs = [
                 Some(upscaled_luma.cloned().unwrap_or_else(|| video.luma.clone())),
                 Some(video.chroma.clone()),
+                gamut_lut.cloned(),
             ];
-            // Perceptual gamut LUT lives on texture slot 2.
-            if let Some(lut) = self.gamut_lut_view(&video.constants)? {
-                srvs.push(Some(lut));
-            } else {
-                srvs.push(None);
-            }
             self.context.PSSetShaderResources(0, Some(&srvs));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
