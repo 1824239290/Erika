@@ -52,7 +52,9 @@ use crate::danmaku::{
 use crate::ffmpeg::{Frame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
 use crate::renderer::d3d11_artcnn::D3d11ArtCnn;
-use crate::renderer::gamut::{GamutLut, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I};
+use crate::renderer::gamut::{
+    GamutLut, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
+};
 use crate::renderer::metal::{MetalRendererConfig, VideoAlphaMode};
 use crate::renderer::output::{
     ActiveOutputEncoding, OutputFallbackReason, OutputRuntimeStatus, OutputSurfaceFormat,
@@ -1991,12 +1993,8 @@ impl D3d11Renderer {
             min_luma: 0.0,
             max_luma: d3d_pq_code_for_lut(uniforms.nits[1]),
         });
-        // Pack (I, P+0.5, T+0.5) into RGBA16F texels laid out I x C x H.
-        let mut texels = Vec::with_capacity(lut.texels.len() * 4);
-        for texel in &lut.texels {
-            texels.extend_from_slice(texel);
-            texels.push(1.0);
-        }
+        // Pack (I, P+0.5, T+0.5) into RGBA16F bytes laid out I x C x H.
+        let texels = pack_rgba16f(&lut.texels, 1.0);
         let initial = [D3D11_SUBRESOURCE_DATA {
             pSysMem: texels.as_ptr() as *const c_void,
             SysMemPitch: (LUT_SIZE_I * 4 * 2) as u32,

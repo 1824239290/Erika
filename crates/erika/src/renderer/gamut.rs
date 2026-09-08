@@ -332,9 +332,73 @@ fn ingamut(ipt: [f32; 3], gamut: &GamutState) -> bool {
         && rgb[2] <= gamut.max_rgb
 }
 
+/// Convert an f32 to IEEE-754 binary16 (round-to-nearest-even) for packing
+/// RGBA16F textures. The gamut LUT texels carry values in [-0.5, 1.0], so a
+/// half-float texture is exact enough and is filterable on every backend
+/// (Rgba32Float is not filterable on wgpu).
+pub fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x7fffff;
+    if exp == 0xff {
+        return (sign | 0x7c00 | u32::from(mant != 0)) as u16;
+    }
+    let mut e = exp - 127 + 15;
+    if e >= 0x1f {
+        return (sign | 0x7c00) as u16; // overflow -> inf
+    }
+    if e <= 0 {
+        return if e <= -10 {
+            sign as u16 // underflow -> signed zero
+        } else {
+            let m = mant | 0x800000;
+            let shift = (14 - e) as u32;
+            let rounded = (m >> shift) + u32::from((m >> (shift - 1)) & 1 == 1);
+            (sign | rounded) as u16
+        };
+    }
+    let rounded = mant + 0x1000 + ((mant >> 13) & 1);
+    let mut e = e as u32;
+    if rounded & 0x800000 != 0 {
+        e += 1;
+    }
+    (sign | (e << 10) | ((rounded >> 13) & 0x3ff)) as u16
+}
+
+/// Pack the f32 texel triples into interleaved RGBA16F little-endian bytes,
+/// matching the `Rgba16Float` textures of the Metal/wgpu/D3D11 backends.
+pub fn pack_rgba16f(texels: &[[f32; 3]], alpha: f32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(texels.len() * 8);
+    for texel in texels {
+        for channel in texel.iter().copied().chain(std::iter::once(alpha)) {
+            bytes.extend_from_slice(&f32_to_f16(channel).to_le_bytes());
+        }
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f16_packing_roundtrips_and_matches_half_layout() {
+        // Known IEEE-754 binary16 bit patterns.
+        assert_eq!(f32_to_f16(0.0), 0x0000);
+        assert_eq!(f32_to_f16(1.0), 0x3c00);
+        assert_eq!(f32_to_f16(0.5), 0x3800);
+        assert_eq!(f32_to_f16(-0.5), 0xb800);
+        assert_eq!(f32_to_f16(10000.0), 0x70e2);
+        assert_eq!(f32_to_f16(-1.0), 0xbc00);
+        // Padded alpha keeps texel pitch at 8 bytes.
+        let packed = pack_rgba16f(&[[0.0, 0.5, 1.0]], 1.0);
+        assert_eq!(packed.len(), 8);
+        assert_eq!(&packed[0..2], &0x0000_u16.to_le_bytes());
+        assert_eq!(&packed[2..4], &0x3800_u16.to_le_bytes());
+        assert_eq!(&packed[4..6], &0x3c00_u16.to_le_bytes());
+        assert_eq!(&packed[6..8], &0x3c00_u16.to_le_bytes());
+    }
 
     #[test]
     fn lut_generation_is_deterministic_and_bounded() {

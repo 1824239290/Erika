@@ -49,7 +49,9 @@ use objc2_quartz_core::{kCAContentsFormatRGBA8Uint, kCAContentsFormatRGBA16Float
 
 use crate::core::{ColorPrimaries, RendererResourceStats, SurfaceMetrics, TransferFunction};
 use crate::danmaku::{DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuRenderPlan};
-use crate::renderer::gamut::{GamutLut, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I};
+use crate::renderer::gamut::{
+    GamutLut, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
+};
 use crate::renderer::metal::upscaler::LumaUpscaler;
 use crate::renderer::metal::{
     ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
@@ -750,14 +752,8 @@ impl MetalRendererImpl {
                     "newTextureWithDescriptor (gamut LUT) returned nil".to_string(),
                 )
             })?;
-        // Pack RGB (I, P+0.5, T+0.5) into RGBA16F texels.
-        let mut rgba16 = Vec::with_capacity(lut.texels.len() * 4);
-        for texel in &lut.texels {
-            rgba16.push(texel[0]);
-            rgba16.push(texel[1]);
-            rgba16.push(texel[2]);
-            rgba16.push(1.0);
-        }
+        // Pack RGB (I, P+0.5, T+0.5) into RGBA16F bytes (half floats).
+        let rgba16 = pack_rgba16f(&lut.texels, 1.0);
         let region = MTLRegion {
             origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
             size: objc2_metal::MTLSize {

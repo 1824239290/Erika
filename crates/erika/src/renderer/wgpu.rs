@@ -43,7 +43,9 @@ use crate::renderer::android_vulkan::{
     AndroidAhbConversionError, AndroidAhbCrop, AndroidAhbFrameDescription,
     AndroidAhbIntermediateFormat, AndroidVulkanInterop, retire_ahb_conversion_after_submission,
 };
-use crate::renderer::gamut::{GamutLut, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I};
+use crate::renderer::gamut::{
+    GamutLut, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
+};
 use crate::renderer::metal::{MetalRendererConfig, VideoAlphaMode};
 #[cfg(target_env = "ohos")]
 use crate::renderer::ohos_vulkan::{
@@ -2434,12 +2436,8 @@ impl WgpuRenderer {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            // The texels are packed RGB (I, P+0.5, T+0.5); pad to RGBA.
-            let mut rgba = Vec::with_capacity(lut.texels.len() * 4);
-            for texel in &lut.texels {
-                rgba.extend_from_slice(texel);
-                rgba.push(1.0);
-            }
+            // The texels are packed RGB (I, P+0.5, T+0.5); pad to RGBA16F.
+            let rgba16 = pack_rgba16f(&lut.texels, 1.0);
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -2447,10 +2445,10 @@ impl WgpuRenderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                bytemuck::cast_slice(&rgba),
+                &rgba16,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some((LUT_SIZE_I * 4 * 2) as u32),
+                    bytes_per_row: Some((LUT_SIZE_I * 8) as u32),
                     rows_per_image: Some(LUT_SIZE_I as u32),
                 },
                 size,
