@@ -545,6 +545,36 @@ pub fn source_to_target_rgb_matrix(source: ColorPrimaries, target: ColorPrimarie
     xyz_to_rgb_matrix(target).mul(rgb_to_xyz_matrix(source))
 }
 
+/// RGB (source primaries, absolute D65-referred linear) → HPE-LMS, ported
+/// from libplacebo's `pl_ipt_rgb2lms`: a 4% crosstalk mix of HPE XYZ→LMS
+/// (D65) applied to the primaries RGB→XYZ matrix. The codebase's primaries
+/// are all D65 so the chromatic-adaptation step to D65 is the identity and
+/// is omitted. Tone mapping runs in this LMS-PQ-IPT space (see the shader
+/// `tone_map_nits`), which converts primaries while mapping the intensity
+/// axis instead of running a separate gamut matrix.
+pub fn ipt_rgb2lms_matrix(primaries: ColorPrimaries) -> RgbMatrix {
+    const HPE: [[f32; 3]; 3] = [
+        [0.40024, 0.70760, -0.08081],
+        [-0.22630, 1.16532, 0.04570],
+        [0.00000, 0.00000, 0.91822],
+    ];
+    let c = 0.04_f32;
+    let crosstalk = RgbMatrix::new([
+        [1.0 - 2.0 * c, c, c],
+        [c, 1.0 - 2.0 * c, c],
+        [c, c, 1.0 - 2.0 * c],
+    ]);
+    crosstalk
+        .mul(RgbMatrix::new(HPE))
+        .mul(rgb_to_xyz_matrix(primaries))
+}
+
+/// Inverse of [`ipt_rgb2lms_matrix`] for the *target* primaries; this is
+/// what converts the tone-mapped LMS signal back to display RGB.
+pub fn ipt_lms2rgb_matrix(primaries: ColorPrimaries) -> RgbMatrix {
+    ipt_rgb2lms_matrix(primaries).inverse()
+}
+
 const D65_WHITE: Chromaticity = Chromaticity::new(0.3127, 0.3290);
 
 fn resolve_primaries(primaries: ColorPrimaries) -> ColorPrimaries {
@@ -561,17 +591,32 @@ fn xy_to_xyz(value: Chromaticity) -> [f32; 3] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToneMapOperator {
     Clip,
+    /// Reinhard curve (libplacebo `pl_tone_map_reinhard`, output-relative).
     Reinhard,
+    /// Möbius transform with a linear region below the knee (libplacebo
+    /// `pl_tone_map_mobius`; `curve_param` is the knee, default 0.3).
     Mobius,
-    /// ITU-R BT.2390 EETF evaluated in the PQ domain. The default: it keeps
-    /// midtones closer to the reference look of libplacebo/mpv than the
-    /// legacy operators, whose linear-region passthrough reads as washed out.
+    /// ITU-R BT.2390 EETF with black-point compensation (libplacebo
+    /// `pl_tone_map_bt2390`; `curve_param` is the knee offset, default 1.0).
     Bt2390,
+    /// Perceptually linear single-pivot polynomial, the default in libplacebo
+    /// and mpv's gpu-next renderer (`curve_param` is the slope contrast,
+    /// default 0.30; the pivot follows the scene average luminance).
+    Spline,
+    /// ITU-R BT.2446 method A (log-domain Weber compression), described by
+    /// mpv as the recommended curve for well-mastered content.
+    Bt2446a,
+    /// SMPTE ST 2094-10 Annex B.2, the DolbyVision dynamic-metadata curve;
+    /// coefficients are solved per frame from the scene pivot.
+    St209410,
 }
 
 impl Default for ToneMapOperator {
     fn default() -> Self {
-        Self::Bt2390
+        // Aligns with libplacebo/mpv: spline is what `--tone-mapping=auto`
+        // selects under gpu-next, and matching mpv gives us a reference
+        // implementation for A/B verification.
+        Self::Spline
     }
 }
 
@@ -817,8 +862,15 @@ impl Default for TargetColorState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ToneMapConfig {
     pub operator: ToneMapOperator,
-    pub knee_start: f32,
-    pub desaturate: f32,
+    /// Per-operator curve parameter that mirrors libplacebo's
+    /// `pl_tone_map_constants` field the operator uses: spline/st2094-10
+    /// contrast, BT.2390 knee offset, Mobius knee, Reinhard contrast. A value
+    /// of 0 selects the operator's default (see `default_curve_param`).
+    pub curve_param: f32,
+    /// Target display contrast used for black-point compensation
+    /// (`--target-contrast` in mpv). 0 selects the automatic value: 1000:1 for
+    /// SDR targets, infinite (0 black) for HDR/EDR targets.
+    pub contrast_ratio: f32,
 }
 
 impl Default for ToneMapConfig {
@@ -828,9 +880,34 @@ impl Default for ToneMapConfig {
             // actually reaches the pipeline (a hardcoded value here silently
             // overrides it).
             operator: ToneMapOperator::default(),
-            knee_start: 0.75,
-            desaturate: 0.0,
+            curve_param: 0.0,
+            contrast_ratio: 0.0,
         }
+    }
+}
+
+impl ToneMapConfig {
+    /// The effective per-operator curve parameter, substituting the operator
+    /// default for 0. Mirrors libplacebo's per-function `param_def` where
+    /// mpv overrides it (spline contrast 0.30, mobius knee 0.30).
+    pub fn effective_curve_param(self) -> f32 {
+        if self.curve_param > 0.0 {
+            self.curve_param
+        } else {
+            default_curve_param(self.operator)
+        }
+    }
+}
+
+fn default_curve_param(operator: ToneMapOperator) -> f32 {
+    match operator {
+        ToneMapOperator::Clip => 1.0,
+        ToneMapOperator::Reinhard => 0.5,
+        ToneMapOperator::Mobius => 0.3,
+        ToneMapOperator::Bt2390 => 1.0,
+        ToneMapOperator::Spline => 0.30,
+        ToneMapOperator::Bt2446a => 0.0,
+        ToneMapOperator::St209410 => 0.7,
     }
 }
 
@@ -957,6 +1034,49 @@ impl VideoRenderPipeline {
     pub fn gamut_matrix(&self) -> RgbMatrix {
         source_to_target_rgb_matrix(self.source.primaries, self.target.primaries)
     }
+
+    /// Source-primaries RGB→LMS plus target-primaries LMS→RGB for the IPT
+    /// tone map (see [`ipt_rgb2lms_matrix`]).
+    pub fn ipt_matrix_rows(&self) -> [[f32; 4]; 6] {
+        let mut rows = [[0.0; 4]; 6];
+        for (index, row) in ipt_rgb2lms_matrix(self.source.primaries)
+            .rows()
+            .iter()
+            .chain(ipt_lms2rgb_matrix(self.target.primaries).rows().iter())
+            .enumerate()
+        {
+            rows[index] = [row[0], row[1], row[2], 0.0];
+        }
+        rows
+    }
+
+    /// [curve parameter, scene average nits, target black nits, 0] for the
+    /// shaders' `tone_map_extra` uniform.
+    pub fn tone_map_extra(&self) -> [f32; 4] {
+        [
+            self.tone_map.effective_curve_param(),
+            self.source
+                .dovi
+                .as_ref()
+                .and_then(doni_frame_average_nits)
+                .unwrap_or(0.0),
+            // Black-point compensation only applies when the tone map is
+            // actually active; applying it to SDR->SDR would crush near-black
+            // content (mpv skips BPC when `pl_tone_map_params_noop`).
+            if requires_tone_mapping(self.source, self.target) {
+                target_black_nits(self.target, self.tone_map.contrast_ratio)
+            } else {
+                0.0
+            },
+            0.0,
+        ]
+    }
+
+    /// SMPTE ST 2094-10 coefficients for the shaders' `tone_map_coeffs`
+    /// uniform; zeros when the operator is inactive.
+    pub fn tone_map_coeffs(&self) -> [f32; 4] {
+        st2094_10_coefficients_for(self)
+    }
 }
 
 impl Default for VideoRenderPipeline {
@@ -993,6 +1113,19 @@ pub struct VideoUniforms {
     pub nits: [f32; 4],
     pub luma_coefficients: [f32; 4],
     pub gamut_matrix_rows: [[f32; 4]; 3],
+    /// Rows 0-2: source-primaries RGB → HPE-LMS; rows 3-5: target-primaries
+    /// LMS → RGB (see [`ipt_rgb2lms_matrix`]/[`ipt_lms2rgb_matrix`]). The
+    /// shader runs tone mapping in LMS-PQ-IPT space so primaries convert as
+    /// part of the map instead of a separate gamut matrix.
+    pub ipt_matrix_rows: [[f32; 4]; 6],
+    /// x: per-operator curve parameter (see `ToneMapConfig::curve_param`);
+    /// y: per-frame scene average luminance in nits (Dolby Vision L1 avg,
+    /// 0 = unknown); z: target black point in nits
+    /// (`ToneMapConfig::contrast_ratio`); w: reserved.
+    pub tone_map_extra: [f32; 4],
+    /// SMPTE ST 2094-10 tone-map coefficients (c1, c2, c3) solved per frame
+    /// on the CPU; zero unless the ST2094-10 operator is active.
+    pub tone_map_coeffs: [f32; 4],
     /// Dolby Vision reshaping payload; inert unless `flags[0]` is set.
     pub dovi: DoviUniforms,
 }
@@ -1017,10 +1150,142 @@ impl VideoUniforms {
             ],
             luma_coefficients: [luma.kr, luma.kg, luma.kb, 0.0],
             gamut_matrix_rows: pipeline.gamut_matrix().row4s(),
+            ipt_matrix_rows: pipeline.ipt_matrix_rows(),
+            tone_map_extra: pipeline.tone_map_extra(),
+            tone_map_coeffs: pipeline.tone_map_coeffs(),
             dovi: DoviUniforms::of_for_representation(&pipeline.source, is_p010),
         }
     }
+}
 
+/// Per-frame average luminance from the Dolby Vision L1 block in nits; 0 when
+/// absent (libplacebo then falls back to the default knee fraction).
+fn doni_frame_average_nits(dovi: &DoviSourceMetadata) -> Option<f32> {
+    let l1 = dovi.l1?;
+    if l1.avg_pq == 0 {
+        return None;
+    }
+    let nits = pq_code_to_nits(l1.avg_pq);
+    (nits.is_finite() && nits > 0.0).then_some(nits)
+}
+
+/// Target black point for black-point compensation: mpv's `--target-contrast`
+/// auto value is 1000:1 for SDR targets and infinite (0 black) for HDR/EDR
+/// targets, which the encode stage maps back onto code 0.
+fn target_black_nits(target: TargetColorState, contrast_ratio: f32) -> f32 {
+    if target.edr_headroom > 1.0 || target.transfer == TransferFunction::Pq {
+        return 0.0;
+    }
+    let ratio = if contrast_ratio > 0.0 {
+        contrast_ratio
+    } else {
+        1000.0
+    };
+    target.peak_nits / ratio
+}
+
+/// Per-frame ST 2094-10 coefficients for the current source/target
+/// luminance envelope, following libplacebo's `pl_tone_map_st2094_10`: the
+/// rational Möbius curve passes through (input min, output min), the scene
+/// knee and (input max, output max), all in absolute nits.
+fn st2094_10_coefficients_for(pipeline: &VideoRenderPipeline) -> [f32; 4] {
+    if pipeline.tone_map.operator != ToneMapOperator::St209410 {
+        return [0.0; 4];
+    }
+    let input_avg = pipeline
+        .source
+        .dovi
+        .as_ref()
+        .and_then(doni_frame_average_nits)
+        .unwrap_or(0.0);
+    let output_min = target_black_nits(pipeline.target, pipeline.tone_map.contrast_ratio);
+    let (src_knee, dst_knee) = st2094_pick_knee(
+        0.0,
+        pipeline.source.nominal_peak_nits,
+        input_avg,
+        output_min,
+        pipeline.target.peak_nits,
+    );
+    solve_st2094_10(
+        0.0,
+        src_knee,
+        pipeline.source.nominal_peak_nits,
+        output_min,
+        dst_knee,
+        pipeline.target.peak_nits,
+    )
+}
+
+/// The exact libplacebo `st2094_pick_knee` (constants: knee_adaptation 0.4,
+/// knee_min 0.1, knee_max 0.8, knee_default 0.4), used with absolute nits.
+/// Returns the source pivot and the adapted destination pivot.
+pub fn st2094_pick_knee(
+    input_min: f32,
+    input_max: f32,
+    input_avg: f32,
+    output_min: f32,
+    output_max: f32,
+) -> (f32, f32) {
+    const KNEE_ADAPTATION: f32 = 0.4;
+    const KNEE_MIN: f32 = 0.1;
+    const KNEE_MAX: f32 = 0.8;
+    const KNEE_DEFAULT: f32 = 0.4;
+    let mix = |a: f32, b: f32, x: f32| x * b + (1.0 - x) * a;
+    let src_knee_min = mix(input_min, input_max, KNEE_MIN);
+    let src_knee_max = mix(input_min, input_max, KNEE_MAX);
+    let dst_knee_min = mix(output_min, output_max, KNEE_MIN);
+    let dst_knee_max = mix(output_min, output_max, KNEE_MAX);
+    let fallback = mix(input_min, input_max, KNEE_DEFAULT);
+    let src_knee =
+        if input_avg > 0.0 { input_avg } else { fallback }.clamp(src_knee_min, src_knee_max);
+    let target = (src_knee - input_min) / (input_max - input_min).max(1e-6);
+    let adapted = mix(output_min, output_max, target);
+    let smooth = |edge0: f32, edge1: f32, x: f32| {
+        let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let tuning =
+        1.0 - smooth(KNEE_MAX, KNEE_DEFAULT, target) * smooth(KNEE_MIN, KNEE_DEFAULT, target);
+    let adaptation = mix(KNEE_ADAPTATION, 1.0, tuning);
+    let dst_knee = mix(src_knee, adapted, adaptation).clamp(dst_knee_min, dst_knee_max);
+    (src_knee, dst_knee)
+}
+
+/// Solve the ST 2094-10 rational curve y = (c1 + c2 x) / (1 + c3 x) through
+/// (x1,y1), (x2,y2) and (x3,y3) with Cramer's rule on the linear system
+/// `c1 + xi*c2 - yi*xi*c3 = yi`.
+fn solve_st2094_10(x1: f32, x2: f32, x3: f32, y1: f32, y2: f32, y3: f32) -> [f32; 4] {
+    let base = [
+        [1.0, x1, -y1 * x1],
+        [1.0, x2, -y2 * x2],
+        [1.0, x3, -y3 * x3],
+    ];
+    let det = |a: [[f32; 3]; 3]| {
+        a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
+    };
+    let with_column = |column: usize, replacement: [f32; 3]| {
+        let mut m = base;
+        for row in 0..3 {
+            m[row][column] = replacement[row];
+        }
+        m
+    };
+    let den = det(base);
+    if den.abs() < 1e-12 {
+        return [0.0; 4];
+    }
+    let rhs = [y1, y2, y3];
+    [
+        det(with_column(0, rhs)) / den,
+        det(with_column(1, rhs)) / den,
+        det(with_column(2, rhs)) / den,
+        0.0,
+    ]
+}
+
+impl VideoUniforms {
     pub fn rgb_texture_input(mut self) -> Self {
         self.input_mode = (self.input_mode & !VIDEO_INPUT_MODE_MASK) | 1;
         self
@@ -1089,6 +1354,9 @@ fn tone_map_code(operator: ToneMapOperator) -> u32 {
         ToneMapOperator::Reinhard => 1,
         ToneMapOperator::Mobius => 2,
         ToneMapOperator::Bt2390 => 3,
+        ToneMapOperator::Spline => 4,
+        ToneMapOperator::Bt2446a => 5,
+        ToneMapOperator::St209410 => 6,
     }
 }
 
@@ -1296,136 +1564,484 @@ mod tests {
         }
     }
 
-    /// Reference implementation of the shaders' `bt2390_eetf` (tone_map code
-    /// 3): the ITU-R BT.2390 EETF evaluated in the PQ domain, ported from
-    /// libplacebo's `pl_tone_map_bt2390` with the default knee offset (1.0)
-    /// and a 0 target black level.
-    fn bt2390_eetf(nits: f32, source_peak_nits: f32, target_peak_nits: f32) -> f32 {
-        let pq_inverse_eotf = |normalized_nits: f32| -> f32 {
-            let m1 = 0.1593017578125_f32;
-            let m2 = 78.84375_f32;
-            let c1 = 0.8359375_f32;
-            let c2 = 18.8515625_f32;
-            let c3 = 18.6875_f32;
-            let p = normalized_nits.clamp(0.0, 1.0).powf(m1);
-            ((c1 + c2 * p) / (1.0 + c3 * p).max(0.000_001)).powf(m2)
+    /// PQ-code helpers matching the shaders; see `wgpu_video.wgsl`.
+    fn pq_code(nits: f32) -> f32 {
+        let m1 = 0.1593017578125_f32;
+        let m2 = 78.84375_f32;
+        let c1 = 0.8359375_f32;
+        let c2 = 18.8515625_f32;
+        let c3 = 18.6875_f32;
+        let p = (nits / 10000.0).clamp(0.0, 1.0).powf(m1);
+        ((c1 + c2 * p) / (1.0 + c3 * p).max(0.000_001)).powf(m2)
+    }
+
+    fn nits_from_pq(code: f32) -> f32 {
+        let m1 = 0.1593017578125_f32;
+        let m2 = 78.84375_f32;
+        let c1 = 0.8359375_f32;
+        let c2 = 18.8515625_f32;
+        let c3 = 18.6875_f32;
+        let p = code.clamp(0.0, 1.0).powf(1.0 / m2);
+        let num = (p - c1).max(0.0);
+        let den = (c2 - c3 * p).max(0.000_001);
+        10000.0 * (num / den).powf(1.0 / m1)
+    }
+
+    /// Reference implementation of the shaders' `tone_map_curve_pq` spline
+    /// branch (tone_map code 4): the single-pivot polynomial from libplacebo's
+    /// `pl_tone_map_spline`, where the pivot follows the scene average.
+    fn spline_pq(
+        x: f32,
+        src_peak_nits: f32,
+        src_avg_nits: f32,
+        dst_peak_nits: f32,
+        dst_black_nits: f32,
+        contrast: f32,
+    ) -> f32 {
+        let in_min = 0.0;
+        let in_max = pq_code(src_peak_nits).max(0.000_001);
+        let out_min = pq_code(dst_black_nits);
+        let out_max = pq_code(dst_peak_nits).max(0.000_001);
+        let (src_pivot, dst_pivot) = st2094_pick_knee(
+            in_min,
+            in_max,
+            if src_avg_nits > 0.0 {
+                pq_code(src_avg_nits)
+            } else {
+                0.0
+            },
+            out_min,
+            out_max,
+        );
+        let slope0 = (dst_pivot - out_min) / (src_pivot - in_min).max(0.000_001);
+        let ratio = (1.5 * (in_max / out_max - 1.0)).clamp(0.2, 1.2);
+        let slope = slope0.powf((1.0 - contrast) * ratio);
+        let (in_min0, in_max0) = (in_min - src_pivot, in_max - src_pivot);
+        let (out_min0, out_max0) = (out_min - dst_pivot, out_max - dst_pivot);
+        let pa = (out_min0 - slope * in_min0) / (in_min0 * in_min0);
+        let qa = (slope * in_max0 - out_max0) / (2.0 * in_max0 * in_max0 * in_max0);
+        let qb = -3.0 * (slope * in_max0 - out_max0) / (2.0 * in_max0 * in_max0);
+        let xr = x.clamp(in_min, in_max) - src_pivot;
+        let mapped = if xr > 0.0 {
+            ((qa * xr + qb) * xr + slope) * xr
+        } else {
+            (pa * xr + slope) * xr
         };
-        let pq_eotf = |encoded: f32| -> f32 {
-            let m1 = 0.1593017578125_f32;
-            let m2 = 78.84375_f32;
-            let c1 = 0.8359375_f32;
-            let c2 = 18.8515625_f32;
-            let c3 = 18.6875_f32;
-            let p = encoded.max(0.0).powf(1.0 / m2);
-            let num = (p - c1).max(0.0);
-            let den = (c2 - c3 * p).max(0.000_001);
-            (num / den).powf(1.0 / m1)
-        };
-        let src_peak_pq = pq_inverse_eotf(source_peak_nits / 10000.0).max(0.000_001);
-        let dst_peak_pq = pq_inverse_eotf(target_peak_nits / 10000.0).max(0.000_001);
-        let max_lum = (dst_peak_pq / src_peak_pq).clamp(0.0, 1.0);
-        let x = (pq_inverse_eotf(nits.clamp(0.0, 10000.0) / 10000.0) / src_peak_pq).clamp(0.0, 1.0);
-        let ks = 2.0 * max_lum - 1.0;
-        let mut u = x;
-        if ks < 1.0 && x > ks {
-            let tb = (x - ks) / (1.0 - ks);
+        mapped + dst_pivot
+    }
+
+    #[test]
+    fn spline_curve_anchors_and_monotonicity() {
+        let (src_peak, dst_peak, black) = (1000.0_f32, 100.0_f32, 0.0_f32);
+        let contrast = 0.3_f32;
+        // Endpoints are exact by construction: the quadratic anchors the lower
+        // endpoint, the cubic anchors the source peak on the target peak.
+        let lo = spline_pq(0.0, src_peak, 0.0, dst_peak, black, contrast);
+        assert!(nits_from_pq(lo).abs() < 1e-3, "black maps to {lo} PQ");
+        let hi = spline_pq(pq_code(src_peak), src_peak, 0.0, dst_peak, black, contrast);
+        assert!(nits_from_pq(hi).abs() - dst_peak < 0.05, "peak = {hi} PQ");
+        // Monotonic and bounded.
+        let mut previous = -1.0_f32;
+        for step in 0..=100 {
+            let x = pq_code(src_peak) * step as f32 / 100.0;
+            let mapped = spline_pq(x, src_peak, 0.0, dst_peak, black, contrast);
+            assert!(mapped >= previous, "not monotonic at {step}");
+            assert!(mapped <= pq_code(dst_peak) + 1e-3);
+            previous = mapped;
+        }
+        // 10:1 compression puts 100-nit diffuse white below half of the
+        // mastered value (the pivot moves the curve down).
+        let diffuse = spline_pq(pq_code(100.0), src_peak, 0.0, dst_peak, black, contrast);
+        let diffuse_nits = nits_from_pq(diffuse);
+        assert!(
+            diffuse_nits > 30.0 && diffuse_nits < 60.0,
+            "diffuse = {diffuse_nits}"
+        );
+    }
+
+    #[test]
+    fn spline_knee_follows_scene_average_brightness() {
+        // With a known scene average the pivot tracks the content, so a dark
+        // scene gets a lower source knee than a bright one (both stay within
+        // the [10%, 80%] of range clamp).
+        let (src_peak, dst_peak, black) = (1000.0_f32, 100.0_f32, 0.0_f32);
+        let dark_avg = 100.0_f32;
+        let bright_avg = 400.0_f32;
+        let dark_pivot = st2094_pick_knee(
+            0.0,
+            pq_code(src_peak),
+            pq_code(dark_avg),
+            pq_code(black),
+            pq_code(dst_peak),
+        )
+        .0;
+        let bright_pivot = st2094_pick_knee(
+            0.0,
+            pq_code(src_peak),
+            pq_code(bright_avg),
+            pq_code(black),
+            pq_code(dst_peak),
+        )
+        .0;
+        assert!(
+            dark_pivot < bright_pivot,
+            "dark {dark_pivot} vs bright {bright_pivot}"
+        );
+        // Without metadata the pivot is the 40% default mix.
+        let default_pivot = st2094_pick_knee(
+            0.0,
+            pq_code(src_peak),
+            0.0,
+            pq_code(black),
+            pq_code(dst_peak),
+        )
+        .0;
+        assert!((default_pivot - pq_code(src_peak) * 0.4).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pick_knee_clamps_stay_inside_the_fraction_range() {
+        // The pivot selection happens in the space the curve operates in
+        // (PQ for the shaders' spline, nits for ST 2094-10), so a mid-average
+        // input never escapes the [10%, 80%] of range clamp.
+        let (src_pq, dst_pq) = st2094_pick_knee(
+            0.0,
+            pq_code(1000.0),
+            pq_code(500.0),
+            pq_code(0.0),
+            pq_code(100.0),
+        );
+        assert!(src_pq >= pq_code(1000.0) * 0.1 - 1e-4);
+        assert!(src_pq <= pq_code(1000.0) * 0.8 + 1e-4);
+        assert!(dst_pq >= pq_code(100.0) * 0.1 - 1e-4);
+        assert!(dst_pq <= pq_code(100.0) * 0.8 + 1e-4);
+        // An out-of-range average clamps to the same fraction window.
+        let clamped = st2094_pick_knee(
+            0.0,
+            pq_code(1000.0),
+            pq_code(9999.0),
+            pq_code(0.0),
+            pq_code(100.0),
+        );
+        assert!((clamped.0 - pq_code(1000.0) * 0.8).abs() < 1e-4);
+    }
+
+    /// Reference implementation of the shaders' BT.2390 branch with the
+    /// libplacebo black-point compensation (tone_map code 3).
+    fn bt2390_pq(
+        x: f32,
+        src_peak_nits: f32,
+        dst_peak_nits: f32,
+        dst_black_nits: f32,
+        knee_offset: f32,
+    ) -> f32 {
+        let in_max = pq_code(src_peak_nits).max(0.000_001);
+        let out_min = pq_code(dst_black_nits);
+        let out_max = pq_code(dst_peak_nits).max(0.000_001);
+        let max_lum = (out_max / in_max).clamp(0.0, 1.0);
+        let min_lum = out_min / in_max;
+        let ks = (1.0 + knee_offset) * max_lum - knee_offset;
+        let bp = (1.0 / min_lum.max(0.000_001)).min(4.0);
+        let mut u = x.clamp(0.0, in_max) / in_max;
+        if ks < 1.0 && u > ks {
+            let tb = (u - ks) / (1.0 - ks);
             let tb2 = tb * tb;
             let tb3 = tb2 * tb;
             u = (2.0 * tb3 - 3.0 * tb2 + 1.0) * ks
                 + (tb3 - 2.0 * tb2 + tb) * (1.0 - ks)
                 + (-2.0 * tb3 + 3.0 * tb2) * max_lum;
         }
-        10000.0 * pq_eotf(u * src_peak_pq)
+        if u < 1.0 {
+            u = u + min_lum * (1.0 - u).powf(bp);
+            let gain = if max_lum < 1.0 {
+                1.0 / (1.0 + min_lum / max_lum * (1.0 - max_lum).powf(bp))
+            } else {
+                1.0
+            };
+            u = gain * (u - min_lum) + min_lum;
+        }
+        u * in_max
     }
 
     #[test]
-    fn bt2390_eetf_anchors_and_monotonicity() {
-        let (source_peak, target_peak) = (1000.0_f32, 100.0_f32);
-
-        // Black stays black; the source peak maps exactly onto the target
-        // peak (the spline's endpoint is maxLum by construction).
-        assert!(bt2390_eetf(0.0, source_peak, target_peak).abs() < 1e-3);
-        let peak = bt2390_eetf(source_peak, source_peak, target_peak);
-        assert!((peak - target_peak).abs() < 0.05, "peak = {peak}");
-
-        // Monotonically increasing and bounded by the target peak.
+    fn bt2390_curve_anchors_and_monotonicity() {
+        let (source_peak, target_peak, black) = (1000.0_f32, 100.0_f32, 0.203_f32);
+        // Black maps to the compensated target black (0.203 nit), which the
+        // encode stage maps back onto code 0.
+        let black_mapped = nits_from_pq(bt2390_pq(0.0, source_peak, target_peak, black, 1.0));
+        assert!(
+            (black_mapped - black).abs() < 0.05,
+            "black = {black_mapped}"
+        );
+        let peak = nits_from_pq(bt2390_pq(
+            pq_code(source_peak),
+            source_peak,
+            target_peak,
+            black,
+            1.0,
+        ));
+        // Black-point compensation perturbs the exact peak slightly; the
+        // endpoint stays within half a nit of the target.
+        assert!((peak - target_peak).abs() < 0.5, "peak = {peak}");
         let mut previous = -1.0_f32;
         for step in 0..=100 {
-            let nits = source_peak * step as f32 / 100.0;
-            let mapped = bt2390_eetf(nits, source_peak, target_peak);
+            let x = pq_code(source_peak) * step as f32 / 100.0;
+            let mapped = nits_from_pq(bt2390_pq(x, source_peak, target_peak, black, 1.0));
             assert!(mapped >= previous);
-            assert!(mapped <= target_peak + 1e-3);
             previous = mapped;
         }
+        // BPC compensates: for a target with 0 black the curve would be
+        // unchanged, with 0.203 it lifts dark steps slightly.
+        let with_bpc = bt2390_pq(pq_code(1.0), source_peak, target_peak, 0.203, 1.0);
+        let without_bpc = bt2390_pq(pq_code(1.0), source_peak, target_peak, 0.0, 1.0);
+        assert!(with_bpc > without_bpc);
+    }
 
-        // 10:1 compression: the PQ-domain spline lands 100-nit diffuse white
-        // at roughly half its mastered level while compressing the source
-        // peak onto the target — the reference BT.2390 E+ response.
-        let diffuse = bt2390_eetf(100.0, source_peak, target_peak);
-        assert!(diffuse > 45.0 && diffuse < 65.0, "diffuse = {diffuse}");
+    /// Reference implementation of the shaders' BT.2446 method A branch
+    /// (tone_map code 5), evaluated in nits.
+    fn bt2446a_nits(
+        x_nits: f32,
+        src_peak_nits: f32,
+        dst_peak_nits: f32,
+        dst_black_nits: f32,
+    ) -> f32 {
+        let phdr = 1.0 + 32.0 * (src_peak_nits / 10000.0).powf(1.0 / 2.4);
+        let psdr = 1.0 + 32.0 * (dst_peak_nits / 10000.0).powf(1.0 / 2.4);
+        let mut t = (x_nits.clamp(0.0, src_peak_nits) / src_peak_nits).powf(1.0 / 2.4);
+        t = (1.0 + (phdr - 1.0) * t).ln() / phdr.ln();
+        t = if t <= 0.7399 {
+            1.0770 * t
+        } else if t < 0.9909 {
+            (-1.1510 * t + 2.7811) * t - 0.6302
+        } else {
+            0.5 * t + 0.5
+        };
+        t = (psdr.powf(t) - 1.0) / (psdr - 1.0);
+        let lb = dst_black_nits.max(0.0).powf(1.0 / 2.4);
+        let lw = dst_peak_nits.max(0.0).powf(1.0 / 2.4);
+        ((lw - lb) * t + lb).powf(2.4)
     }
 
     #[test]
-    fn bt2390_formula_is_present_across_video_shaders() {
+    fn bt2446a_curve_anchors_and_monotonicity() {
+        let (src_peak, dst_peak, black) = (1000.0_f32, 100.0_f32, 0.203_f32);
+        let lo = bt2446a_nits(0.0, src_peak, dst_peak, black);
+        assert!((lo - black).abs() < 0.05, "black = {lo}");
+        let hi = bt2446a_nits(src_peak, src_peak, dst_peak, black);
+        assert!((hi - dst_peak).abs() < 0.05, "peak = {hi}");
+        let mut previous = -1.0_f32;
+        for step in 0..=100 {
+            let mapped = bt2446a_nits(src_peak * step as f32 / 100.0, src_peak, dst_peak, black);
+            assert!(mapped >= previous);
+            previous = mapped;
+        }
+    }
+
+    #[test]
+    fn st2094_10_coefficients_interpolate_the_three_anchors() {
+        let (src_peak, dst_peak, black) = (1000.0_f32, 100.0_f32, 0.203_f32);
+        let (src_knee, dst_knee) = st2094_pick_knee(0.0, src_peak, 250.0, black, dst_peak);
+        let [c1, c2, c3, _] = solve_st2094_10(0.0, src_knee, src_peak, black, dst_knee, dst_peak);
+        let eval = |x_nits: f32| (c1 + c2 * x_nits) / (1.0 + c3 * x_nits);
+        assert!((eval(0.0) - black).abs() < 1e-3);
+        assert!((eval(src_knee) - dst_knee).abs() < 1e-2);
+        assert!((eval(src_peak) - dst_peak).abs() < 1e-2);
+        let mut previous = -1.0_f32;
+        for step in 0..=100 {
+            let mapped = eval(src_peak * step as f32 / 100.0);
+            assert!(mapped >= previous);
+            previous = mapped;
+        }
+    }
+
+    #[test]
+    fn tone_map_operator_defaults_and_codes() {
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+            .reference_white_nits(203.0);
+        let target = TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt709);
+        let pipeline = VideoRenderPipeline::new(source, target);
+        assert_eq!(pipeline.tone_map.operator, ToneMapOperator::Spline);
+        assert_eq!(tone_map_code(pipeline.tone_map.operator), 4);
+        // The curve parameter 0 resolves to the operator default.
+        assert!((pipeline.tone_map.effective_curve_param() - 0.30).abs() < 1e-6);
+        // Default contrast is 1000:1 for SDR targets -> 203 / 1000 black.
+        let extra = pipeline.tone_map_extra();
+        assert!((extra[2] - 0.203).abs() < 1e-4, "black = {}", extra[2]);
+        assert_eq!(extra[0], 0.30);
+    }
+
+    #[test]
+    fn hdr_output_target_black_is_zero() {
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+        let target = TargetColorState::hdr10(ColorPrimaries::Bt2020);
+        let extra = VideoRenderPipeline::new(source, target).tone_map_extra();
+        assert_eq!(extra[2], 0.0);
+        let edr = VideoRenderPipeline::new(
+            source,
+            TargetColorState::apple_edr(ColorPrimaries::Bt2020, 2.0),
+        )
+        .tone_map_extra();
+        assert_eq!(edr[2], 0.0);
+        // An explicit contrast ratio overrides the automatic default.
+        let target = TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt709);
+        let mut config = ToneMapConfig::default();
+        config.contrast_ratio = 500.0;
+        let pipeline = VideoRenderPipeline::new(source, target);
+        let custom = VideoRenderPipeline {
+            tone_map: config,
+            ..pipeline
+        };
+        assert!((custom.tone_map_extra()[2] - 203.0 / 500.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn sdr_to_sdr_black_point_is_zero() {
+        // Black-point compensation must never run on SDR->SDR (near-black
+        // content would crush); the tone-map-only guard zeroes the black.
+        let source = SourceColorState::new(ColorPrimaries::Bt709, TransferFunction::Srgb);
+        let target = TargetColorState::sdr(ColorPrimaries::Bt709);
+        let pipeline = VideoRenderPipeline::new(source, target);
+        assert!(!pipeline.requires_tone_mapping());
+        assert_eq!(pipeline.tone_map_extra()[2], 0.0);
+        // An explicit contrast ratio is still ignored on the inactive path.
+        let mut config = ToneMapConfig::default();
+        config.contrast_ratio = 500.0;
+        let custom = VideoRenderPipeline {
+            tone_map: config,
+            ..pipeline
+        };
+        assert_eq!(custom.tone_map_extra()[2], 0.0);
+    }
+
+    #[test]
+    fn ipt_matrices_match_libplacebo_values_and_white_is_invariant() {
+        // Values computed independently from libplacebo's pl_ipt_rgb2lms
+        // (4% crosstalk mix of HPE XYZ->LMS times the primaries RGB->XYZ).
+        let bt709 = ipt_rgb2lms_matrix(ColorPrimaries::Bt709);
+        let expected709 = [
+            [0.2957641, 0.6230725, 0.0811667],
+            [0.1561920, 0.7272516, 0.1165579],
+            [0.0351023, 0.1565899, 0.8083030],
+        ];
+        for (row, expected) in bt709.rows().iter().zip(expected709) {
+            for (value, expected) in row.iter().zip(expected) {
+                assert!((value - expected).abs() < 1e-5, "{value} != {expected}");
+            }
+        }
+        // D65 white maps to equal LMS across primaries and inverts back.
+        for primaries in [
+            ColorPrimaries::Bt709,
+            ColorPrimaries::Bt2020,
+            ColorPrimaries::DisplayP3,
+        ] {
+            let matrix = ipt_rgb2lms_matrix(primaries);
+            let lms = matrix.mul_vec([1.0, 1.0, 1.0]);
+            for value in lms {
+                assert!((value - 1.0).abs() < 1e-3, "white -> {lms:?}");
+            }
+            let inverse = ipt_lms2rgb_matrix(primaries);
+            let back = inverse.mul_vec(lms);
+            for value in back {
+                assert!((value - 1.0).abs() < 1e-3, "roundtrip -> {back:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tone_map_pipeline_is_present_across_video_shaders() {
         let shaders = [
             include_str!("wgpu_video.wgsl"),
             include_str!("metal/apple.rs"),
             include_str!("d3d11.rs"),
         ];
         for shader in shaders {
-            assert!(shader.contains("bt2390_eetf"));
-            assert!(shader.contains("2.0 * max_lum - 1.0"));
-            assert!(shader.contains("tone_map == 3"));
+            assert!(shader.contains("st2094_pick_knee"));
+            assert!(shader.contains("tone_map_curve_pq"));
+            assert!(shader.contains("ipt_matrix_rows"));
+            assert!(shader.contains("tone_map_extra"));
+            assert!(shader.contains("tone_map_coeffs"));
+            assert!(shader.contains("0.0975689"));
+            assert!(shader.contains("tone_map == 4"));
+            assert!(shader.contains("tone_map == 5"));
+            assert!(shader.contains("SMPTE ST 2094-10"));
+            assert!(shader.contains("0.7399"));
+            // The IPT path applies the primaries conversion inside the tone
+            // map, so the old separate matrix call is gone.
+            assert!(!shader.contains("rgb = apply_gamut_map(rgb)"));
         }
     }
 
-    /// Reference implementation of the shaders' `gamut_desaturate`: out-of-gamut
-    /// (negative) components after the linear gamut matrix are blended towards
-    /// their BT.709 luma just enough to fit the gamut, preserving hue where
-    /// hard-clipping would shift it.
-    fn gamut_desaturate(rgb: [f32; 3]) -> [f32; 3] {
-        let minc = rgb[0].min(rgb[1]).min(rgb[2]);
-        if minc >= 0.0 {
-            return rgb;
-        }
-        let luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
-        let t = (minc / (minc - luma)).clamp(0.0, 1.0);
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgsl_video_shader_parses_with_naga() {
+        // The wgpu backend compiles the WGSL only at render time; parse it
+        // here so syntax regressions fail in tests instead of on-device.
+        let source = include_str!("wgpu_video.wgsl");
+        wgpu::naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|error| panic!("invalid WGSL: {error}"));
+    }
+
+    /// Reference implementation of the shaders' `gamut_compress`: colors the
+    /// linear gamut matrix pushes out of the target gamut are blended
+    /// towards their naively-clipped version by an out-of-gamut smoothstep.
+    /// Slightly-out colors stay nearly intact; strongly-out BT.2020
+    /// primaries land on the pure target primary with their hue intact —
+    /// luma blending would instead pull primary red towards grey and turn
+    /// it pink. Matches mpv's perceptual gamut mapping behavior.
+    fn gamut_compress(rgb: [f32; 3]) -> [f32; 3] {
+        let lo = rgb[0].min(rgb[1]).min(rgb[2]);
+        let outness = (-lo).max(0.0);
+        let x = (outness / 1.0).clamp(0.0, 1.0);
+        let k = x * x * (3.0 - 2.0 * x);
+        let mix = |a: f32, b: f32| a + (b - a) * k;
         [
-            rgb[0] + (luma - rgb[0]) * t,
-            rgb[1] + (luma - rgb[1]) * t,
-            rgb[2] + (luma - rgb[2]) * t,
+            mix(rgb[0], rgb[0].clamp(0.0, 1.0)),
+            mix(rgb[1], rgb[1].clamp(0.0, 1.0)),
+            mix(rgb[2], rgb[2].clamp(0.0, 1.0)),
         ]
     }
 
     #[test]
-    fn gamut_desaturate_keeps_hue_where_clipping_shifts_it() {
+    fn gamut_compress_preserves_hue_of_out_of_gamut_primaries() {
         // In-gamut colors pass through untouched.
-        assert_eq!(gamut_desaturate([0.2, 0.7, 0.3]), [0.2, 0.7, 0.3]);
+        assert_eq!(gamut_compress([0.2, 0.7, 0.3]), [0.2, 0.7, 0.3]);
         // A saturated BT.2020 teal-green that the gamut matrix pushes out of
-        // gamut (negative red/blue): after desaturation no component is
-        // negative and the channel ordering (hue) is preserved — hard
-        // clipping would have zeroed red/blue and turned it neon.
+        // gamut: the compression never pushes a channel further out, and the
+        // channel ordering (hue) is preserved — hard clipping would have
+        // zeroed red/blue and turned it neon. (Residual negative components
+        // are clamped at encode time, as libplacebo clamps to its gamut
+        // floor.)
         let out_of_gamut = [-0.08_f32, 0.9, -0.04];
-        let mapped = gamut_desaturate(out_of_gamut);
-        assert!(mapped[0] >= 0.0 && mapped[2] >= 0.0);
+        let mapped = gamut_compress(out_of_gamut);
+        assert!(mapped[0] > out_of_gamut[0] && mapped[2] > out_of_gamut[2]);
         assert!(mapped[1] > mapped[2] && mapped[2] > mapped[0]);
-        // The blend only ever reduces saturation, never brightness below the
-        // original luma.
-        let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-        assert!((luma(mapped) - luma(out_of_gamut)).abs() < 1e-4);
+        // A strongly-out primary red (negative green and blue) maps to a
+        // hue-pure red: green and blue are compressed to ~0 together, and
+        // crucially blue is not lifted towards the luma grey — that is what
+        // turned wide-gamut red pink under luma blending.
+        let primary_red = [1.1_f32, -0.22, -0.07];
+        let red = gamut_compress(primary_red);
+        assert!(red[1] < 0.01 && red[2] < 0.01, "red = {red:?}");
+        assert!(red[0] > 0.9, "red = {red:?}");
+        // Compression is monotonic: an out-of-gamut excursion of 1.0 maps fully
+        // onto the clip (k = 1), while mild excursions keep most of their
+        // range.
+        assert_eq!(gamut_compress([-1.0_f32, 0.9, -0.5]), [0.0, 0.9, 0.0]);
+        let mild = gamut_compress([-0.1_f32, 0.9, -0.05]);
+        assert!(mild[0] > -0.1 && mild[2] > -0.05);
     }
 
     #[test]
-    fn gamut_desaturate_formula_is_present_across_video_shaders() {
+    fn gamut_compress_formula_is_present_across_video_shaders() {
         let shaders = [
             include_str!("wgpu_video.wgsl"),
             include_str!("metal/apple.rs"),
             include_str!("d3d11.rs"),
         ];
         for shader in shaders {
-            assert!(shader.contains("gamut_desaturate"));
-            assert!(shader.contains("0.2126, 0.7152, 0.0722"));
-            assert!(shader.contains("rgb = gamut_desaturate(rgb)"));
+            assert!(shader.contains("gamut_compress"));
+            assert!(shader.contains("smoothstep(0.0, 1.0, outness)"));
+            assert!(shader.contains("rgb = gamut_compress(rgb)"));
         }
     }
 

@@ -954,6 +954,9 @@ impl MetalRendererImpl {
                 ],
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
                 gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
+                ipt_matrix_rows: frame.pipeline.ipt_matrix_rows(),
+                tone_map_extra: frame.pipeline.tone_map_extra(),
+                tone_map_coeffs: frame.pipeline.tone_map_coeffs(),
                 dovi: DoviUniforms::of_for_representation(
                     &frame.pipeline.source,
                     matches!(frame.frame.info.format, ImportedVideoFormat::P010),
@@ -1155,6 +1158,9 @@ impl MetalRendererImpl {
                 ],
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
                 gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
+                ipt_matrix_rows: frame.pipeline.ipt_matrix_rows(),
+                tone_map_extra: frame.pipeline.tone_map_extra(),
+                tone_map_coeffs: frame.pipeline.tone_map_coeffs(),
                 dovi: DoviUniforms::of_for_representation(
                     &frame.pipeline.source,
                     matches!(frame.frame.info.format, ImportedVideoFormat::P010),
@@ -2248,6 +2254,9 @@ struct VideoUniforms {
     nits: [f32; 4],
     luma_coefficients: [f32; 4],
     gamut_matrix_rows: [[f32; 4]; 3],
+    ipt_matrix_rows: [[f32; 4]; 6],
+    tone_map_extra: [f32; 4],
+    tone_map_coeffs: [f32; 4],
     dovi: DoviUniforms,
 }
 
@@ -2359,6 +2368,9 @@ fn tone_map_code(operator: ToneMapOperator) -> u32 {
         ToneMapOperator::Reinhard => 1,
         ToneMapOperator::Mobius => 2,
         ToneMapOperator::Bt2390 => 3,
+        ToneMapOperator::Spline => 4,
+        ToneMapOperator::Bt2446a => 5,
+        ToneMapOperator::St209410 => 6,
     }
 }
 
@@ -2882,6 +2894,9 @@ struct VideoUniforms {
     float4 nits;
     float4 luma_coefficients;
     float4 gamut_matrix_rows[3];
+    float4 ipt_matrix_rows[6];
+    float4 tone_map_extra;
+    float4 tone_map_coeffs;
     float4 dovi_flags;
     float4 dovi_pivots[6];
     float4 dovi_bounds[3];
@@ -2979,68 +2994,16 @@ float3 source_reference_to_nits(float3 rgb, constant VideoUniforms& uniforms) {
     return max(rgb, float3(0.0)) * source_reference_white_nits(uniforms);
 }
 
-// ITU-R BT.2390 EETF evaluated in the PQ domain, ported from libplacebo's
-// pl_tone_map_bt2390 with the default knee offset (1.0) and a 0 target black
-// level (which makes the black-point adaptation stage a no-op). Mirrors the
-// Rust reference implementation in `renderer/pipeline.rs` tests
-// (`bt2390_eetf`) and the WGSL/HLSL copies.
-float bt2390_eetf(float nits, constant VideoUniforms& uniforms) {
-    float src_peak_pq = max(pq_inverse_eotf(source_peak_nits(uniforms) / 10000.0), 0.000001);
-    float dst_peak_pq = max(pq_inverse_eotf(target_peak_nits(uniforms) / 10000.0), 0.000001);
-    float max_lum = clamp(dst_peak_pq / src_peak_pq, 0.0, 1.0);
-    float x = clamp(pq_inverse_eotf(clamp(nits, 0.0, 10000.0) / 10000.0) / src_peak_pq, 0.0, 1.0);
-    float ks = 2.0 * max_lum - 1.0;
-    float u = x;
-    if (ks < 1.0 && x > ks) {
-        float tb = (x - ks) / (1.0 - ks);
-        float tb2 = tb * tb;
-        float tb3 = tb2 * tb;
-        float pb = (2.0 * tb3 - 3.0 * tb2 + 1.0) * ks
-                 + (tb3 - 2.0 * tb2 + tb) * (1.0 - ks)
-                 + (-2.0 * tb3 + 3.0 * tb2) * max_lum;
-        u = pb;
-    }
-    return 10000.0 * pq_eotf(u * src_peak_pq);
+float pq_code(float nits) {
+    return pq_inverse_eotf(clamp(nits, 0.0, 10000.0) / 10000.0);
 }
 
-float3 tone_map_nits(float3 nits, constant VideoUniforms& uniforms) {
-    if (uniforms.target_transfer == 3) {
-        return clamp(nits, 0.0, 10000.0);
-    }
-    float source_peak = source_peak_nits(uniforms);
-    float target_peak = target_peak_nits(uniforms);
-    float3 x = max(nits, float3(0.0)) / target_peak;
-    float white = max(source_peak / target_peak, 1.0);
-    if (uniforms.tone_map == 1) {
-        float white2 = white * white;
-        return target_peak * clamp((x * (float3(1.0) + x / white2)) / (float3(1.0) + x), 0.0, 1.0);
-    }
-    if (uniforms.tone_map == 2) {
-        constexpr float knee = 0.75;
-        float denom = max(white - knee, 0.0001);
-        float3 t = clamp((x - float3(knee)) / denom, 0.0, 1.0);
-        float3 shoulder = knee + (1.0 - knee) * (float3(1.0) - pow(float3(1.0) - t, float3(2.0)));
-        return target_peak * mix(x, shoulder, step(float3(knee), x));
-    }
-    if (uniforms.tone_map == 3) {
-        // Luma-preserving BT.2390: map the pixel's BT.709 luma through the
-        // EETF and scale RGB uniformly, so hue and saturation survive the
-        // 10:1 compression (per-channel mapping washes saturated colors).
-        float luma_nits = dot(nits, float3(0.2126, 0.7152, 0.0722));
-        float mapped = bt2390_eetf(luma_nits, uniforms);
-        float scale = mapped / max(luma_nits, 0.0001);
-        float3 out_nits = max(nits, float3(0.0)) * scale;
-        float maxc = max(out_nits.r, max(out_nits.g, out_nits.b));
-        if (maxc > target_peak) {
-            float l2 = dot(out_nits, float3(0.2126, 0.7152, 0.0722));
-            float t = clamp((maxc - target_peak) / (maxc - l2), 0.0, 1.0);
-            out_nits = mix(out_nits, float3(l2), t);
-        }
-        return out_nits;
-    }
-    return target_peak * clamp(x, 0.0, 1.0);
+float nits_from_pq(float code) {
+    return 10000.0 * pq_eotf(clamp(code, 0.0, 1.0));
 }
 
+// Simple primaries conversion (HDR10 output path); the tone-mapped path
+// converts primaries inside the IPT roundtrip instead.
 float3 apply_gamut_map(float3 rgb, constant VideoUniforms& uniforms) {
     return float3(
         dot(uniforms.gamut_matrix_rows[0].xyz, rgb),
@@ -3049,22 +3012,236 @@ float3 apply_gamut_map(float3 rgb, constant VideoUniforms& uniforms) {
     );
 }
 
-// Gamut mapping: blend out-of-gamut (negative) components towards their
-// BT.709 luma — just enough to fit the gamut while preserving hue —
-// matching libplacebo's desaturate gamut mode. Mirrors the WGSL/HLSL
-// `gamut_desaturate` and the Rust reference in `renderer/pipeline.rs` tests.
-float3 gamut_desaturate(float3 rgb) {
-    float minc = min(rgb.r, min(rgb.g, rgb.b));
-    if (minc >= 0.0) {
-        return rgb;
+// libplacebo pl_smoothstep with arbitrary edge order (Metal smoothstep has
+// undefined results when edge0 >= edge1, and libplacebo's knee tuning term
+// deliberately uses reversed edges).
+float sstep(float edge0, float edge1, float x) {
+    float t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// libplacebo st2094_pick_knee evaluated on absolute PQ codes. The source
+// pivot follows the scene average luminance when known and stays within
+// [10%, 80%] of the range; the destination pivot rescales it into the output
+// range and then adapts towards the 1:1 line (knee_adaptation 0.4).
+float2 st2094_pick_knee(float src_min, float src_max, float src_avg, float dst_min, float dst_max) {
+    constexpr float knee_adaptation = 0.4;
+    constexpr float min_knee = 0.1;
+    constexpr float max_knee = 0.8;
+    constexpr float def_knee = 0.4;
+    float src_knee_min = mix(src_min, src_max, min_knee);
+    float src_knee_max = mix(src_min, src_max, max_knee);
+    float dst_knee_min = mix(dst_min, dst_max, min_knee);
+    float dst_knee_max = mix(dst_min, dst_max, max_knee);
+    float fallback = mix(src_min, src_max, def_knee);
+    float src_knee = clamp(src_avg > 0.0 ? src_avg : fallback, src_knee_min, src_knee_max);
+    float target = (src_knee - src_min) / max(src_max - src_min, 0.000001);
+    float adapted = mix(dst_min, dst_max, target);
+    float tuning = 1.0 - sstep(max_knee, def_knee, target) * sstep(min_knee, def_knee, target);
+    float adaptation = mix(knee_adaptation, 1.0, tuning);
+    float dst_knee = clamp(mix(src_knee, adapted, adaptation), dst_knee_min, dst_knee_max);
+    return float2(src_knee, dst_knee);
+}
+
+// The tone-map curve evaluated on the IPT intensity axis (PQ codes),
+// mirroring libplacebo's tone-map functions. `param` is the per-operator
+// curve parameter from ToneMapConfig::curve_param (0 = operator default).
+float tone_map_curve_pq(float x_in, float param, constant VideoUniforms& uniforms) {
+    float src_peak = source_peak_nits(uniforms);
+    float dst_peak = target_peak_nits(uniforms);
+    float src_avg = uniforms.tone_map_extra.y;
+    float dst_black = uniforms.tone_map_extra.z;
+    float in_min = 0.0;
+    float in_max = max(pq_code(src_peak), 0.000001);
+    float out_min = pq_code(dst_black);
+    float out_max = max(pq_code(dst_peak), 0.000001);
+    float out_range = max(out_max - out_min, 0.000001);
+    float x = clamp(x_in, in_min, in_max);
+    if (uniforms.tone_map == 0) {
+        // Clip: values within the source range pass through untouched.
+        return x;
     }
-    float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
-    float t = clamp(minc / (minc - luma), 0.0, 1.0);
-    return mix(rgb, float3(luma), t);
+    if (uniforms.tone_map == 1) {
+        // Reinhard (output-relative, libplacebo pl_tone_map_reinhard).
+        float peak = in_max / out_range;
+        float contrast = param > 0.0 ? param : 0.5;
+        float offset = (1.0 - contrast) / max(contrast, 0.000001);
+        float scale = (peak + offset) / peak;
+        float t = x / out_range;
+        float mapped = t / (t + offset) * scale;
+        return mapped * out_range + out_min;
+    }
+    if (uniforms.tone_map == 2) {
+        // Mobius: Mobius transform with a 1:1 linear region below the knee.
+        float peak = in_max / out_range;
+        float j = param > 0.0 ? param : 0.3;
+        float a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
+        float b = (j * j - 2.0 * j * peak + peak) / max(peak - 1.0, 0.000001);
+        float scale = (b * b + 2.0 * b * j + j * j) / (b - a);
+        float t = x / out_range;
+        float mapped = t > j ? scale * (t + a) / (t + b) : t;
+        return mapped * out_range + out_min;
+    }
+    if (uniforms.tone_map == 3) {
+        // ITU-R BT.2390 EETF with black-point compensation (the libplacebo
+        // version also compensates target black; the earlier port skipped it).
+        float knee_offset = param > 0.0 ? param : 1.0;
+        float max_lum = clamp(out_max / in_max, 0.0, 1.0);
+        float min_lum = out_min / in_max;
+        float ks = (1.0 + knee_offset) * max_lum - knee_offset;
+        float bp = min(max(1.0 / max(min_lum, 0.000001), 0.0), 4.0);
+        float u = x / in_max;
+        if (ks < 1.0 && u > ks) {
+            float tb = (u - ks) / (1.0 - ks);
+            float tb2 = tb * tb;
+            float tb3 = tb2 * tb;
+            u = (2.0 * tb3 - 3.0 * tb2 + 1.0) * ks
+               + (tb3 - 2.0 * tb2 + tb) * (1.0 - ks)
+               + (-2.0 * tb3 + 3.0 * tb2) * max_lum;
+        }
+        if (u < 1.0) {
+            u = u + min_lum * pow(1.0 - u, bp);
+            float gain = max_lum < 1.0
+                ? 1.0 / (1.0 + min_lum / max_lum * pow(1.0 - max_lum, bp))
+                : 1.0;
+            u = gain * (u - min_lum) + min_lum;
+        }
+        return u * in_max;
+    }
+    if (uniforms.tone_map == 4) {
+        // Spline: perceptually linear single-pivot polynomial, the default
+        // tone map of libplacebo and mpv's gpu-next renderer.
+        float contrast = param > 0.0 ? param : 0.3;
+        float2 knee = st2094_pick_knee(
+            in_min,
+            in_max,
+            src_avg > 0.0 ? pq_code(src_avg) : 0.0,
+            out_min,
+            out_max
+        );
+        float src_pivot = knee.x;
+        float dst_pivot = knee.y;
+        float slope0 = (dst_pivot - out_min) / max(src_pivot - in_min, 0.000001);
+        float ratio = clamp(1.5 * (in_max / out_max - 1.0), 0.2, 1.2);
+        float slope = pow(slope0, (1.0 - contrast) * ratio);
+        float in_min0 = in_min - src_pivot;
+        float in_max0 = in_max - src_pivot;
+        float out_min0 = out_min - dst_pivot;
+        float out_max0 = out_max - dst_pivot;
+        float pa = (out_min0 - slope * in_min0) / (in_min0 * in_min0);
+        float qa = (slope * in_max0 - out_max0) / (2.0 * in_max0 * in_max0 * in_max0);
+        float qb = -3.0 * (slope * in_max0 - out_max0) / (2.0 * in_max0 * in_max0);
+        float xr = x - src_pivot;
+        float mapped = xr > 0.0
+            ? ((qa * xr + qb) * xr + slope) * xr
+            : (pa * xr + slope) * xr;
+        return mapped + dst_pivot;
+    }
+    if (uniforms.tone_map == 5) {
+        // ITU-R BT.2446 method A: Weber-law log compression from the source
+        // peak envelope and a standardized S-curve (mpv's recommended curve
+        // for well-mastered content).
+        float phdr = 1.0 + 32.0 * pow(src_peak / 10000.0, 1.0 / 2.4);
+        float psdr = 1.0 + 32.0 * pow(dst_peak / 10000.0, 1.0 / 2.4);
+        float t = pow(nits_from_pq(x) / max(src_peak, 0.000001), 1.0 / 2.4);
+        t = log(1.0 + (phdr - 1.0) * t) / log(phdr);
+        if (t <= 0.7399) {
+            t = 1.0770 * t;
+        } else if (t < 0.9909) {
+            t = (-1.1510 * t + 2.7811) * t - 0.6302;
+        } else {
+            t = 0.5 * t + 0.5;
+        }
+        t = (pow(psdr, t) - 1.0) / (psdr - 1.0);
+        // BT.1886 EOTF from the target black point and peak.
+        float lb = pow(max(dst_black, 0.0), 1.0 / 2.4);
+        float lw = pow(max(dst_peak, 0.0), 1.0 / 2.4);
+        return pq_code(pow((lw - lb) * t + lb, 2.4));
+    }
+    // SMPTE ST 2094-10 (DolbyVision's dynamic-metadata curve): rational
+    // Mobius interpolation in absolute nits; coefficients are solved per
+    // frame on the CPU from the same scene pivot.
+    float c1 = uniforms.tone_map_coeffs.x;
+    float c2 = uniforms.tone_map_coeffs.y;
+    float c3 = uniforms.tone_map_coeffs.z;
+    float x_nits = nits_from_pq(x);
+    float y_nits = (c1 + c2 * x_nits) / max(1.0 + c3 * x_nits, 0.000001);
+    return pq_code(clamp(y_nits, 0.0, 10000.0));
+}
+
+float3 tone_map_nits(float3 input_nits, constant VideoUniforms& uniforms) {
+    if (uniforms.target_transfer == 3) {
+        // HDR10 output: convert primaries by the gamut matrix and clamp to
+        // the PQ range (no tone mapping; the display does the HDR mapping).
+        return clamp(apply_gamut_map(max(input_nits, float3(0.0)) / source_reference_white_nits(uniforms), uniforms)
+            * source_reference_white_nits(uniforms), float3(0.0), float3(10000.0));
+    }
+    // libplacebo color map: RGB in source primaries (absolute nits) to
+    // HPE-LMS, PQ-encode, IPT, map the intensity axis and apply the
+    // hue-preserving chroma rule, then decode back to RGB in the target
+    // primaries. The primaries conversion happens inside this roundtrip.
+    float3 rgb = max(input_nits, float3(0.0));
+    float3 lms = float3(
+        dot(uniforms.ipt_matrix_rows[0].xyz, rgb),
+        dot(uniforms.ipt_matrix_rows[1].xyz, rgb),
+        dot(uniforms.ipt_matrix_rows[2].xyz, rgb)
+    );
+    float3 lmspq = float3(pq_code(lms.r), pq_code(lms.g), pq_code(lms.b));
+    float3 ipt = float3(
+        dot(float3(0.4, 0.4, 0.2), lmspq),
+        dot(float3(4.455, -4.851, 0.396), lmspq),
+        dot(float3(0.8056, 0.3572, -1.1628), lmspq)
+    );
+    float i_orig = ipt.x;
+    ipt.x = tone_map_curve_pq(ipt.x, uniforms.tone_map_extra.x, uniforms);
+    // Libplacebo's chroma rule: clamp the saturation boost when brightening
+    // and desaturate (by the cubic hull term) when the mapping darkens.
+    float2 hull = float2(i_orig, ipt.x);
+    float2 hull_c = ((hull - float2(6.0)) * hull + float2(9.0)) * hull;
+    float ratio = min(i_orig / max(ipt.x, 0.000001), hull_c.y / max(hull_c.x, 0.000001));
+    ipt.yz = ipt.yz * ratio;
+    float3 lmspq_out = float3(
+        dot(float3(1.0, 0.0975689, 0.205226), ipt),
+        dot(float3(1.0, -0.113876, 0.133217), ipt),
+        dot(float3(1.0, 0.0326151, -0.676887), ipt)
+    );
+    float3 lms_out = float3(
+        nits_from_pq(lmspq_out.r),
+        nits_from_pq(lmspq_out.g),
+        nits_from_pq(lmspq_out.b)
+    );
+    return float3(
+        dot(uniforms.ipt_matrix_rows[3].xyz, lms_out),
+        dot(uniforms.ipt_matrix_rows[4].xyz, lms_out),
+        dot(uniforms.ipt_matrix_rows[5].xyz, lms_out)
+    );
+}
+
+// Hue-preserving gamut mapping: the linear gamut matrix can push highly
+// saturated wide-gamut colors outside the target gamut (negative
+// components). Blending those towards luma shifts hue — BT.2020 primary
+// red picks up blue and turns pink. Instead blend towards the naive clip
+// by an out-of-gamut smoothstep factor: slightly-out colors stay nearly
+// intact, strongly-out primaries land on the pure target primary with
+// their hue intact, matching mpv's perceptual gamut handling. Mirrors the
+// WGSL/HLSL `gamut_compress` and the Rust reference in pipeline.rs tests.
+// Brightness overshoot (> 1) is left for the tone map.
+float3 gamut_compress(float3 rgb) {
+    float lo = min(rgb.r, min(rgb.g, rgb.b));
+    float outness = max(-lo, 0.0);
+    float k = smoothstep(0.0, 1.0, outness);
+    return mix(rgb, clamp(rgb, 0.0, 1.0), k);
 }
 
 float3 target_nits_to_reference_linear(float3 nits, constant VideoUniforms& uniforms) {
-    return max(nits, float3(0.0)) / target_reference_white_nits(uniforms);
+    // libplacebo's encode maps [target black, target peak] onto [0, 1] where
+    // 1.0 is the target reference white, so the tone-map black-point
+    // compensation lands back on true black instead of lifting it.
+    float black = uniforms.tone_map_extra.z;
+    float peak = target_peak_nits(uniforms);
+    float range = max(peak - black, 0.0001);
+    return max(nits - float3(black), float3(0.0)) / range
+        * (range / target_reference_white_nits(uniforms));
 }
 
 float3 target_reference_linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
@@ -3288,11 +3465,10 @@ fragment float4 erika_video_fragment(
     if (dovi_enabled) {
         rgb = dovi_lms_to_rgb(rgb, uniforms);
     }
-    rgb = apply_gamut_map(rgb, uniforms);
-    rgb = gamut_desaturate(rgb);
     rgb = source_reference_to_nits(rgb, uniforms);
     rgb = tone_map_nits(rgb, uniforms);
     rgb = target_nits_to_reference_linear(rgb, uniforms);
+    rgb = gamut_compress(rgb);
     rgb = target_reference_linear_to_output(rgb, uniforms);
     float alpha = 1.0;
     if (packed_alpha) {
@@ -3621,7 +3797,6 @@ mod tests {
         let decode = VIDEO_SHADER_SOURCE
             .find("rgb = transfer_to_source_reference_linear")
             .unwrap();
-        let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
         let source_nits = VIDEO_SHADER_SOURCE
             .find("rgb = source_reference_to_nits")
             .unwrap();
@@ -3632,20 +3807,27 @@ mod tests {
         let output = VIDEO_SHADER_SOURCE
             .find("rgb = target_reference_linear_to_output")
             .unwrap();
-        assert!(decode < gamut);
-        assert!(gamut < source_nits);
+        assert!(decode < source_nits);
         assert!(source_nits < tone_map);
         assert!(tone_map < target_reference);
         assert!(target_reference < output);
     }
 
     #[test]
-    fn video_shader_applies_gamut_matrix_before_tone_mapping() {
+    fn video_shader_runs_the_ipt_tone_map_before_gamut_compression() {
         assert!(VIDEO_SHADER_SOURCE.contains("gamut_matrix_rows"));
         assert!(VIDEO_SHADER_SOURCE.contains("apply_gamut_map"));
-        let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
+        assert!(VIDEO_SHADER_SOURCE.contains("ipt_matrix_rows"));
+        assert!(VIDEO_SHADER_SOURCE.contains("st2094_pick_knee"));
+        assert!(VIDEO_SHADER_SOURCE.contains("tone_map_curve_pq"));
+        // The primaries conversion happens inside the tone map (IPT
+        // roundtrip), so the fragment only calls tone_map_nits then the
+        // compression pass.
         let tone_map = VIDEO_SHADER_SOURCE.find("rgb = tone_map_nits").unwrap();
-        assert!(gamut < tone_map);
+        let compress = VIDEO_SHADER_SOURCE.find("rgb = gamut_compress").unwrap();
+        assert!(tone_map < compress);
+        // The separate matrix call site from the old flow is gone.
+        assert!(!VIDEO_SHADER_SOURCE.contains("rgb = apply_gamut_map"));
     }
 
     #[test]
@@ -3880,7 +4062,7 @@ mod tests {
 
     #[test]
     fn video_uniforms_keep_float4_fields_aligned() {
-        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 3104);
+        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 3232);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, edr_output), 20);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, rect), 32);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, viewport), 48);
@@ -3893,7 +4075,19 @@ mod tests {
             std::mem::offset_of!(super::VideoUniforms, gamut_matrix_rows),
             96
         );
-        assert_eq!(std::mem::offset_of!(super::VideoUniforms, dovi), 144);
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, ipt_matrix_rows),
+            144
+        );
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, tone_map_extra),
+            240
+        );
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, tone_map_coeffs),
+            256
+        );
+        assert_eq!(std::mem::offset_of!(super::VideoUniforms, dovi), 272);
     }
 
     #[test]
