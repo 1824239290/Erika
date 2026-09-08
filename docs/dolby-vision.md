@@ -103,6 +103,34 @@ After reshaping, the signal goes through:
 4. **LMS to RGB**: `(HPE⁻¹ × rgb_to_lms) × linearized`
 5. **Gamut/tone mapping**: Standard HDR pipeline continues
 
+## Tone Mapping (libplacebo color map)
+
+The tone map mirrors libplacebo's color map (`pl_shader_color_map`, the
+engine behind mpv's `--vo=gpu-next`): RGB in source primaries (absolute
+nits) — HPE-LMS — PQ encode — IPT. The operator's curve runs on the IPT
+intensity axis, libplacebo's chroma rule (`hull` cubic on the pre/post
+intensity pair) protects saturation, and the decode back to RGB lands in
+the target primaries, so the primaries conversion happens inside the
+roundtrip instead of a separate gamut matrix.
+
+Operators (`ToneMapOperator`, default `Spline` to match mpv's
+`--tone-mapping=auto`):
+
+| code | operator | curve parameter (`ToneMapConfig::curve_param`) |
+|---|---|---|
+| 0 | Clip | — |
+| 1 | Reinhard | contrast (default 0.5) |
+| 2 | Mobius | linear knee (default 0.3) |
+| 3 | BT.2390 | knee offset (default 1.0) |
+| 4 | **Spline** (default) | slope contrast (default 0.30) |
+| 5 | BT.2446 method A | — |
+| 6 | SMPTE ST 2094-10 | knee target (coeffs solved per frame on the CPU) |
+
+Black-point compensation uses `target black = target peak / contrast`
+(`contrast_ratio`; auto 1000:1 for SDR, 0 for HDR/EDR targets) and is gated
+so SDR → SDR rendering is untouched. The encode maps `[black, peak]` onto
+`[0, 1]`, so the compensated floor lands back on code 0.
+
 ## Per-Frame L1 Brightness Metadata
 
 The RPU's dynamic DM extension blocks carry **level 1** per-frame brightness
@@ -112,14 +140,17 @@ decoder copies these blocks into the frame side data (`AVDOVIMetadata`
 extracts the level 1 block.
 
 The frame's `max_pq` replaces the static mastering peak (`source_max_pq`) as
-the tone map's source peak, matching libplacebo's handling of the RPU's CIE-Y
-metadata. This makes the BT.2390 curve scene-adaptive: a dark scene is not
-compressed against a 4000-nit mastering peak, so its highlights stay
-distinct. The **static mastering display peak is untouched** — output-mode
-negotiation (SDR/EDR per display) must never react to per-frame brightness.
+the tone map's source peak, and the frame's `avg_pq` becomes the scene
+average that drives the tone-map pivot, matching libplacebo's handling of
+the RPU's CIE-Y metadata. This makes the default spline curve
+scene-adaptive: a dark scene is not compressed against a 4000-nit mastering
+peak, so its highlights stay distinct. The **static mastering display peak
+is untouched** — output-mode negotiation (SDR/EDR per display) must never
+react to per-frame brightness.
 
 An absent, all-zero, or inverted level 1 block falls back to the static
-`source_max_pq`; the RPU itself is never rejected over L1.
+`source_max_pq` (and the fixed 40% knee when no average is known); the RPU
+itself is never rejected over L1.
 
 ## Forced BT.2020/PQ
 
