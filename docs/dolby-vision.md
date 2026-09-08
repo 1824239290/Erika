@@ -131,6 +131,24 @@ Black-point compensation uses `target black = target peak / contrast`
 so SDR → SDR rendering is untouched. The encode maps `[black, peak]` onto
 `[0, 1]`, so the compensated floor lands back on code 0.
 
+## Scene-Adaptive HDR10 (measured luma)
+
+HDR10 streams carry only static ST.2086 mastering metadata, so without
+further input the tone-map pivot would sit at the fixed 40% knee for every
+scene. `crates/erika/src/luma_stats.rs` gives HDR10 the same treatment
+Dolby Vision L1 gives Profile 5/8: for software-decoded PQ frames the
+presenter samples a sparse grid of the luma plane (NV12/P010), linearizes
+each sample, re-encodes to PQ and averages in that perceptual domain, then
+smooths the running estimate with libplacebo's IIR filter
+(`coeff = 1 - exp(-1/20)`). The smoothed scene average (nits) is attached to
+the frame (`PlayerVideoFrame::scene_avg_nits`) and folded into
+`SourceColorState.measured_scene_avg_nits`, which `tone_map_extra.y`
+prefers over the L1 average — so the spline pivot follows the content.
+
+Hardware-decoded frames (VideoToolbox/D3D11VA/MediaCodec) have no CPU luma
+plane and keep the static-metadata path. The estimator resets on generation
+changes so seeks cannot carry the previous scene's brightness forward.
+
 ## Perceptual Gamut Mapping (IPT 3D LUT)
 
 After the tone map, when an HDR source is tone-mapped into a smaller gamut
