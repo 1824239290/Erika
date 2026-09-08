@@ -131,6 +131,21 @@ Black-point compensation uses `target black = target peak / contrast`
 so SDR → SDR rendering is untouched. The encode maps `[black, peak]` onto
 `[0, 1]`, so the compensated floor lands back on code 0.
 
+## Perceptual Gamut Mapping (IPT 3D LUT)
+
+After the tone map, when an HDR source is tone-mapped into a smaller gamut
+(BT.2020 → BT.709), the renderer applies libplacebo's `pl_gamut_map_perceptual`
+instead of the fast `gamut_compress`: a CPU-generated 48 × 32 × 256 IPT-space
+LUT (`renderer::gamut`) whose texels hold the perceptually mapped
+`(I, P + 0.5, T + 0.5)` color — the I axis spans the target display PQ range
+and each texel's chroma is rolled off to the destination gamut boundary by a
+per-hue golden-section search plus a Möbius soft clip. The shaders rebuild RGB
+in the source primaries, run the LMS-PQ-IPT roundtrip, sample the LUT in ICh
+space and decode back to the target primaries; the LUT texture is cached per
+(source, target, target-peak) and bound as binding/slot 4 (WGSL), texture 2
+(Metal) or t2 (D3D11), always with a dummy 1×1×1 fallback so the fast path
+keeps a valid layout.
+
 ## Per-Frame L1 Brightness Metadata
 
 The RPU's dynamic DM extension blocks carry **level 1** per-frame brightness
