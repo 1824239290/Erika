@@ -2009,7 +2009,7 @@ impl D3d11Renderer {
             MipLevels: 1,
             Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -2017,7 +2017,7 @@ impl D3d11Renderer {
         unsafe {
             state
                 .device
-                .CreateTexture3D(&desc, Some(&initial), Some(&mut texture))
+                .CreateTexture3D(&desc, Some(initial.as_ptr()), Some(&mut texture))
                 .map_err(|error| d3d_error("ID3D11Device::CreateTexture3D(gamut lut)", error))?;
         }
         let resource = texture
