@@ -1999,8 +1999,8 @@ impl D3d11Renderer {
         }
         let initial = [D3D11_SUBRESOURCE_DATA {
             pSysMem: texels.as_ptr() as *const c_void,
-            SysMemPitch: LUT_SIZE_I * 4 * 2,
-            SysMemSlicePitch: LUT_SIZE_I * LUT_SIZE_C * 4 * 2,
+            SysMemPitch: (LUT_SIZE_I * 4 * 2) as u32,
+            SysMemSlicePitch: (LUT_SIZE_I * LUT_SIZE_C * 4 * 2) as u32,
         }];
         let desc = D3D11_TEXTURE3D_DESC {
             Width: LUT_SIZE_I as u32,
@@ -2022,7 +2022,8 @@ impl D3d11Renderer {
         }
         let resource = texture
             .expect("gamut lut texture created")
-            .cast::<ID3D11Resource>();
+            .cast::<ID3D11Resource>()
+            .map_err(|error| d3d_error("cast to ID3D11Resource", error))?;
         let mut srv = None;
         unsafe {
             state
@@ -2113,8 +2114,12 @@ impl D3d11Renderer {
         } else {
             None
         };
+        let video_constants = {
+            let video = self.current_video.as_ref().expect("video checked");
+            video.constants
+        };
+        let gamut_lut = self.gamut_lut_view(&video_constants)?;
         let video = self.current_video.as_ref().expect("video checked");
-        let video_constants = video.constants;
         let state = self.state.as_ref().expect("device ensured");
         let surface = self.surface.as_ref().expect("surface ensured");
         let rtv = surface
@@ -2149,7 +2154,6 @@ impl D3d11Renderer {
                 ],
             );
         }
-        let gamut_lut = self.gamut_lut_view(&video_constants)?;
         state.draw_video(
             video,
             upscaled_luma.as_ref(),
