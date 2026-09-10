@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.9+dolby.1 - 2026-09-10
+
+Based on v0.1.9. Adds the Dolby Vision RPU mapping and HDR tone/gamut pipeline
+(PR #136 / successor to #130). Intended as a prebuilt kernel for host apps
+(OcPlayer) until the feature lands on upstream main.
 
 ### Renderer
 
