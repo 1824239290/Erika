@@ -549,7 +549,11 @@ impl HttpRangeSource {
     /// Fold in a finished prefetch without blocking. Called before the hit
     /// checks so they see everything that has already arrived.
     fn settle_finished_prefetch(&mut self) {
-        if !self.prefetch.as_ref().is_some_and(PendingHttpFetch::is_finished) {
+        if !self
+            .prefetch
+            .as_ref()
+            .is_some_and(PendingHttpFetch::is_finished)
+        {
             return;
         }
         if let Some(pending) = self.prefetch.take() {
@@ -582,7 +586,11 @@ impl HttpRangeSource {
             .length
             .is_some_and(|length| range.start.saturating_add(length) > self.cache_end());
         if (covers || needs_this_piece) && !stale {
-            if !self.prefetch.as_ref().is_some_and(PendingHttpFetch::is_finished) {
+            if !self
+                .prefetch
+                .as_ref()
+                .is_some_and(PendingHttpFetch::is_finished)
+            {
                 // Joining is cheaper than issuing a duplicate download of bytes
                 // that are already on the wire.
                 http_trace_log(format!(
@@ -694,11 +702,10 @@ impl HttpRangeSource {
             }
             pieces += 1;
             let start = self.cache_end();
-            let Some(request_length) =
-                self.fetch_length(ByteRange {
-                    start,
-                    length: Some(end - start),
-                })?
+            let Some(request_length) = self.fetch_length(ByteRange {
+                start,
+                length: Some(end - start),
+            })?
             else {
                 break;
             };
@@ -1464,7 +1471,9 @@ impl MediaSource for HttpRangeSource {
             return Ok(Vec::new());
         };
         let copy_len = range.length.map_or(tail.len(), |length| {
-            usize::try_from(length).unwrap_or(usize::MAX).min(tail.len())
+            usize::try_from(length)
+                .unwrap_or(usize::MAX)
+                .min(tail.len())
         });
         Ok(tail[..copy_len].to_vec())
     }
@@ -1679,7 +1688,10 @@ mod tests {
         let _ = gate.begin_attempt();
         assert!(gate.fail(64).is_some());
         let _ = gate.begin_attempt();
-        assert!(gate.fail(64).is_none(), "progress does not license endless stalls");
+        assert!(
+            gate.fail(64).is_none(),
+            "progress does not license endless stalls"
+        );
     }
 
     #[test]
@@ -1836,9 +1848,7 @@ mod tests {
                     }
                     sent += count as u64;
                     if bytes_per_sec > 0 {
-                        thread::sleep(Duration::from_secs_f64(
-                            count as f64 / bytes_per_sec as f64,
-                        ));
+                        thread::sleep(Duration::from_secs_f64(count as f64 / bytes_per_sec as f64));
                     }
                 }
                 let _ = stream.flush();
@@ -2373,7 +2383,10 @@ mod tests {
             .unwrap();
         assert_eq!(bytes.len(), 4096);
         let head = recv_request_head(&requests);
-        assert!(head.contains("range: bytes=0-4194303"), "request head: {head}");
+        assert!(
+            head.contains("range: bytes=0-4194303"),
+            "request head: {head}"
+        );
     }
 
     #[test]
@@ -2556,7 +2569,10 @@ mod tests {
         // 15 s body deadline, i.e. an issue #1 failure on anything slower). It
         // must now be a capped request.
         let head = recv_request_head(&requests);
-        assert!(head.contains("range: bytes=0-4194303"), "request head: {head}");
+        assert!(
+            head.contains("range: bytes=0-4194303"),
+            "request head: {head}"
+        );
     }
 
     #[test]
