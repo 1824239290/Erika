@@ -3491,8 +3491,14 @@ impl CustomAvio {
             start: self.offset,
             length: Some(length),
         }) {
-            Ok(bytes) if bytes.is_empty() => AVERROR_EOF,
+            Ok(bytes) if bytes.is_empty() => {
+                // A source that answered is not the cause of any later failure:
+                // a sticky `last_error` would be appended to an unrelated one.
+                self.last_error = None;
+                AVERROR_EOF
+            }
             Ok(bytes) => {
+                self.last_error = None;
                 let copy_len = bytes.len().min(buffer_size as usize);
                 unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len) };
                 self.offset = self.offset.saturating_add(copy_len as u64);
@@ -3547,6 +3553,7 @@ impl CustomAvio {
             return av_error(EINVAL) as i64;
         }
         self.offset = target as u64;
+        self.last_error = None;
         self.offset.min(i64::MAX as u64) as i64
     }
 }
