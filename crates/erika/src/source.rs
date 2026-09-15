@@ -440,9 +440,12 @@ impl HttpRangeSource {
         let Some(length) = range.length else {
             return;
         };
-        let read_end = range.start.saturating_add(length);
-        let retain_start = read_end.saturating_sub(HTTP_CACHE_RETAIN_BYTES);
-        let drop = retain_start.saturating_sub(self.cache_start);
+        // Measured from the *start* of the current read, never past it: the tail
+        // is what a rewind can hit, but nothing the current read needs may be
+        // dropped (a read larger than the retention budget still has to be
+        // served from the cache it started in).
+        let retain_floor = range.start.saturating_sub(HTTP_CACHE_RETAIN_BYTES);
+        let drop = retain_floor.saturating_sub(self.cache_start);
         if drop < HTTP_CACHE_TRIM_SLACK {
             return;
         }
@@ -475,19 +478,22 @@ impl HttpRangeSource {
     }
 
     fn fetch_length(&mut self, range: ByteRange) -> Result<Option<u64>> {
-        let requested_length = range.length.unwrap_or(0);
         Ok(match range.length {
             Some(length) => {
-                // Follow the caller's request with at most one capped request of
-                // look-ahead; going deeper is the background prefetch's job.
-                let mut length = length.max(self.request_bytes);
+                // At least the caller's request with a capped piece of look-ahead,
+                // and never more than one request body may carry. A caller asking
+                // for more than the cap gets a short read (the read loops re-issue
+                // the rest), which keeps "no request body exceeds the cap" an
+                // invariant instead of a property of today's callers.
+                let mut wanted = length.max(self.request_bytes).min(HTTP_REQUEST_MAX_BYTES);
                 if let Some(total) = self.content_length.or_else(|| self.len().ok().flatten()) {
                     if range.start >= total {
                         return Ok(Some(0));
                     }
-                    length = length.min(total.saturating_sub(range.start));
+                    // Never ask past the end of the resource either.
+                    wanted = wanted.min(total.saturating_sub(range.start));
                 }
-                Some(length.max(requested_length))
+                Some(wanted)
             }
             None => None,
         })
@@ -626,7 +632,11 @@ impl HttpRangeSource {
             return;
         }
         let remaining = cache_end.saturating_sub(end);
-        if remaining > self.read_ahead_bytes / 2 {
+        // Refill towards the configured depth, not towards half of it: the knob
+        // is the cushion the reader keeps ahead, and pieces arrive one at a time
+        // now, so stopping at half of it would leave the setting unmet (a 32 MiB
+        // window used to settle around `read_ahead / 2 + one piece`).
+        if remaining >= self.read_ahead_bytes {
             return;
         }
         let length = self.request_bytes.min(total.saturating_sub(cache_end));
@@ -672,9 +682,17 @@ impl HttpRangeSource {
             // more than starting over at the read.
             return self.reanchor_window(range);
         }
-        let mut attempts = 0;
-        while self.cache_end() < end && attempts < HTTP_FETCH_MAX_RESUME_ATTEMPTS {
-            attempts += 1;
+        let mut pieces = 0;
+        while self.cache_end() < end {
+            if pieces >= HTTP_FETCH_MAX_PIECES_PER_READ {
+                // Walking away here would make the caller see a short (or empty,
+                // i.e. EOF) read for bytes that exist, so fail loudly instead.
+                return Err(SourceError::Http(format!(
+                    "origin answered {pieces} short pieces without covering bytes {}..{end}",
+                    range.start,
+                )));
+            }
+            pieces += 1;
             let start = self.cache_end();
             let Some(request_length) =
                 self.fetch_length(ByteRange {
@@ -833,6 +851,9 @@ const HTTP_FETCH_RETRY_BACKOFF: [Duration; 2] =
 /// and giving up ends playback (EIO is terminal) rather than merely stalling
 /// it. Attempts without any progress still stop after
 /// `HTTP_FETCH_MAX_ATTEMPTS`, so a broken origin fails fast.
+///
+/// The ceiling is enforced *between* attempts, so the true worst case adds one
+/// attempt's own timeouts (connect + headers + the body deadline) on top of it.
 const HTTP_FETCH_TOTAL_BUDGET: Duration = Duration::from_secs(120);
 
 /// Hard ceiling on the body of one HTTP request.
@@ -860,6 +881,11 @@ const HTTP_CACHE_TRIM_SLACK: u64 = 8 * 1024 * 1024;
 /// Matches the kernel's other sidecar ceilings; it only exists so an origin that
 /// answers full pieces forever cannot grow the cache without bound.
 const HTTP_STREAM_TO_EOF_BYTE_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Most pieces one read may pull. An origin that answers short bodies needs
+/// several pieces per read (that is normal); this only stops a pathological one,
+/// and hitting it is reported as an error rather than a silent short read.
+const HTTP_FETCH_MAX_PIECES_PER_READ: u32 = 64;
 
 /// Consecutive background-prefetch failures before the chain is parked until a
 /// synchronous fetch succeeds.
@@ -894,6 +920,18 @@ impl HttpRetryGate {
     fn begin_attempt(&mut self) -> u32 {
         self.attempts = self.attempts.saturating_add(1);
         self.attempts
+    }
+
+    /// Whether the wall-clock ceiling is already spent. Checked before an
+    /// attempt starts, because the per-request timeouts (connect + headers +
+    /// the body deadline) can add tens of seconds to whatever the budget left
+    /// over when the attempt began.
+    fn expired(&self) -> bool {
+        self.started.elapsed() >= HTTP_FETCH_TOTAL_BUDGET
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 
     /// Record a failed attempt (`received` = bytes of this logical fetch so
@@ -1060,6 +1098,22 @@ fn fetch_http_range(
     let mut gate = HttpRetryGate::new();
     loop {
         let attempt = gate.begin_attempt();
+        if gate.expired() {
+            // The ceiling is enforced between attempts; without this check the
+            // last attempt could start just under the budget and then run to its
+            // own timeouts, overshooting the stated bound by tens of seconds.
+            http_trace_log(format!(
+                "{{\"event\":\"{}_error\",\"phase\":\"budget\",\"attempt\":{},\"start\":{},\"elapsed_ms\":{:.3}}}",
+                event,
+                attempt,
+                range.start,
+                gate.elapsed().as_secs_f64() * 1000.0,
+            ));
+            return Err(SourceError::Http(format!(
+                "fetch budget of {:?} exhausted for bytes {}..",
+                HTTP_FETCH_TOTAL_BUDGET, range.start,
+            )));
+        }
         // Resume from what already arrived: earlier attempts keep their bytes
         // and the Range start advances past them.
         let received = bytes.len() as u64;
@@ -1395,9 +1449,18 @@ impl MediaSource for HttpRangeSource {
 
         // Serve whatever the cache now holds from the read position. A short
         // read is legitimate (EOF, or an origin that answered short); an empty
-        // result becomes EOF in the AVIO layer.
+        // result becomes EOF in the AVIO layer, so it is only allowed when the
+        // resource really ends before the read.
         let offset = usize::try_from(range.start.saturating_sub(self.cache_start)).unwrap_or(0);
         let Some(tail) = self.cache_bytes.get(offset..) else {
+            if let Some(total) = self.content_length
+                && range.start < total
+            {
+                return Err(SourceError::Http(format!(
+                    "no data for bytes {}.. (origin total {total})",
+                    range.start,
+                )));
+            }
             return Ok(Vec::new());
         };
         let copy_len = range.length.map_or(tail.len(), |length| {
@@ -1727,10 +1790,12 @@ mod tests {
     /// Serves up to `connections` Range requests, trickling each body at
     /// `bytes_per_sec` so the client spends real time inside the body phase --
     /// the way a slow origin does, and the only way to exercise the client's own
-    /// body deadline.
+    /// body deadline. `piece_limit` caps each answer the way a CDN that ignores
+    /// the requested length does; `bytes_per_sec == 0` means no throttling.
     fn spawn_drip_http_server(
         total: u64,
         bytes_per_sec: u64,
+        piece_limit: Option<u64>,
         connections: usize,
     ) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1751,7 +1816,10 @@ mod tests {
                     head.push_str(&line);
                 }
                 let _ = sender.send(head.clone());
-                let (start, end) = parse_range_head(&head, total);
+                let (start, mut end) = parse_range_head(&head, total);
+                if let Some(limit) = piece_limit {
+                    end = end.min(start.saturating_add(limit).saturating_sub(1));
+                }
                 let length = end.saturating_sub(start) + 1;
                 let response_head = format!(
                     "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
@@ -1767,7 +1835,11 @@ mod tests {
                         break;
                     }
                     sent += count as u64;
-                    thread::sleep(Duration::from_secs_f64(count as f64 / bytes_per_sec as f64));
+                    if bytes_per_sec > 0 {
+                        thread::sleep(Duration::from_secs_f64(
+                            count as f64 / bytes_per_sec as f64,
+                        ));
+                    }
                 }
                 let _ = stream.flush();
             }
@@ -2243,6 +2315,120 @@ mod tests {
     }
 
     #[test]
+    fn http_short_pieces_still_cover_the_read() {
+        // An origin that caps every body at 256 KiB needs many pieces to cover a
+        // gap. Walking away would hand the caller an empty read, which the AVIO
+        // layer turns into EOF: bytes that exist must never look like the end of
+        // the resource.
+        let total = 8 * 1024 * 1024u64;
+        let piece = 256 * 1024u64;
+        // A range-aware origin that caps every answer at 256 KiB.
+        let (uri, _requests) = spawn_drip_http_server(total, 0, Some(piece), 40);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+
+        // Warm the cache with the first short piece, then read just inside the
+        // 4 MiB forward-gap guard: covering it takes ~15 more pieces.
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(1024)
+                })
+                .unwrap()
+                .len(),
+            1024
+        );
+        let target = HTTP_REQUEST_MAX_BYTES;
+        let bytes = source
+            .read_range(ByteRange {
+                start: target,
+                length: Some(1024),
+            })
+            .expect("short pieces must still cover the read");
+        assert_eq!(bytes.len(), 1024, "a covered read must not look like EOF");
+    }
+
+    #[test]
+    fn http_caller_requests_are_capped_too() {
+        let total = 64 * 1024 * 1024u64;
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(0, total, &vec![b'a'; 4096]),
+        )]);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+
+        // No cache yet, so the window is anchored at the read -- and a 32 MiB
+        // caller request must not become a 32 MiB body (that is the issue #1
+        // shape). The caller sees a short read and asks again.
+        let bytes = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(32 * 1024 * 1024),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 4096);
+        let head = recv_request_head(&requests);
+        assert!(head.contains("range: bytes=0-4194303"), "request head: {head}");
+    }
+
+    #[test]
+    fn http_trim_never_drops_the_current_read_position() {
+        let mut source = HttpRangeSource::new("https://example.invalid/video.mp4");
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 25 * 1024 * 1024];
+
+        // A read starting at 0 may not have its own start trimmed away, however
+        // large it is.
+        source.trim_cache(ByteRange {
+            start: 0,
+            length: Some(20 * 1024 * 1024),
+        });
+        assert_eq!(source.cache_start, 0);
+
+        // A read near the cache end trims the head down to the retention budget.
+        source.trim_cache(ByteRange {
+            start: 25 * 1024 * 1024,
+            length: Some(1024),
+        });
+        assert_eq!(
+            source.cache_start,
+            25 * 1024 * 1024 - HTTP_CACHE_RETAIN_BYTES
+        );
+    }
+
+    #[test]
+    fn http_prefetch_refills_towards_the_configured_depth() {
+        // 20 MiB ahead with a 32 MiB window is still below the configured depth,
+        // so the chain must start another piece; the old half-window threshold
+        // would have settled there and never reached the setting.
+        let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(20 * 1024 * 1024, 64 * 1024 * 1024, &vec![b'z'; 1024]),
+        )]);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(64 * 1024 * 1024);
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 20 * 1024 * 1024];
+
+        source.maybe_start_prefetch(ByteRange {
+            start: 0,
+            length: Some(1024),
+        });
+        assert!(
+            source.prefetch.is_some(),
+            "20 MiB ahead is below a 32 MiB window"
+        );
+    }
+
+    #[test]
     fn http_deep_window_against_a_slow_origin_still_serves_the_read() {
         // The issue #1 shape: a 32 MiB window against an origin that can only
         // deliver ~900 KB/s. Before the request cap this asked for all 32 MiB in
@@ -2250,7 +2436,7 @@ mod tests {
         // (`timeout: receive response` -> EIO -> playback ended). A capped 4 MiB
         // request finishes in about five seconds.
         let total = 64 * 1024 * 1024u64;
-        let (uri, requests) = spawn_drip_http_server(total, 900 * 1024, 2);
+        let (uri, requests) = spawn_drip_http_server(total, 900 * 1024, None, 2);
         let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
             uri,
             Vec::new(),
@@ -2464,8 +2650,8 @@ mod tests {
         );
         assert_eq!(
             source.cache_start,
-            total - HTTP_CACHE_RETAIN_BYTES,
-            "the head must be trimmed to the retention budget"
+            (tail_start) - HTTP_CACHE_RETAIN_BYTES,
+            "the head must be trimmed to the retention budget, measured from the read"
         );
 
         // ...and a small rewind lands inside what is left: served locally.
