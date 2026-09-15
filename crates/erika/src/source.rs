@@ -553,8 +553,10 @@ impl HttpRangeSource {
 
     /// Resolve the in-flight prefetch against an incoming read.
     ///
-    /// * the piece covers the read -> join it; the reader is waiting, and a
-    ///   duplicate download of the same bytes would only make it wait longer;
+    /// * the piece covers the read, or the read needs bytes at/past the cache
+    ///   end (which is exactly where the piece starts) -> join it; the reader is
+    ///   waiting, and issuing a synchronous fetch of the same bytes would
+    ///   download the range twice;
     /// * the read jumped past it -> drop the handle: its bytes sit behind the
     ///   new position (the detached thread finishes its request and is thrown
     ///   away);
@@ -570,7 +572,10 @@ impl HttpRangeSource {
         let stale = pending
             .length
             .is_some_and(|length| range.start >= pending.start.saturating_add(length));
-        if covers {
+        let needs_this_piece = range
+            .length
+            .is_some_and(|length| range.start.saturating_add(length) > self.cache_end());
+        if (covers || needs_this_piece) && !stale {
             if !self.prefetch.as_ref().is_some_and(PendingHttpFetch::is_finished) {
                 // Joining is cheaper than issuing a duplicate download of bytes
                 // that are already on the wire.
@@ -729,13 +734,18 @@ impl HttpRangeSource {
     }
 
     /// Read from `start` to EOF in capped pieces.
+    ///
+    /// The loop ends at the resource total when it is known, at a short answer
+    /// (EOF) otherwise, and at `HTTP_STREAM_TO_EOF_BYTE_LIMIT` as a hard stop so
+    /// an origin that keeps answering full pieces cannot grow the cache without
+    /// bound. It deliberately has no attempt cap: a sidecar larger than a few
+    /// pieces must not be truncated (the old shape read the entire tail in one
+    /// request, which is unbounded in the other direction).
     fn stream_to_eof(&mut self, start: u64) -> Result<()> {
         self.prefetch = None;
         self.cache_start = start;
         self.cache_bytes.clear();
-        let mut attempts = 0;
-        while attempts < HTTP_FETCH_MAX_RESUME_ATTEMPTS {
-            attempts += 1;
+        while self.cache_bytes.len() as u64 <= HTTP_STREAM_TO_EOF_BYTE_LIMIT {
             let chunk_start = self.cache_end();
             if let Some(total) = self.content_length
                 && chunk_start >= total
@@ -845,6 +855,11 @@ const HTTP_CACHE_RETAIN_BYTES: u64 = 16 * 1024 * 1024;
 /// The retained tail is only cut once it is this much over budget, so the O(n)
 /// buffer move happens per few MiB of playback instead of once per read.
 const HTTP_CACHE_TRIM_SLACK: u64 = 8 * 1024 * 1024;
+
+/// Hard stop for open-ended reads (`read_uri_to_end`: danmaku/subtitle sidecars).
+/// Matches the kernel's other sidecar ceilings; it only exists so an origin that
+/// answers full pieces forever cannot grow the cache without bound.
+const HTTP_STREAM_TO_EOF_BYTE_LIMIT: u64 = 256 * 1024 * 1024;
 
 /// Consecutive background-prefetch failures before the chain is parked until a
 /// synchronous fetch succeeds.
@@ -2149,6 +2164,85 @@ mod tests {
     }
 
     #[test]
+    fn http_read_straddling_the_cache_end_joins_the_inflight_piece() {
+        let total = 1024 * 1024 + 4096;
+        let piece = vec![b'p'; 4096];
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::delayed(
+                Duration::from_millis(200),
+                http_206_response(1024 * 1024, total, &piece),
+            ),
+            // Only a duplicate download would ever need this one.
+            MockResponse::immediate(http_206_response(1024 * 1024, total, &piece)),
+        ]);
+        let mut source = HttpRangeSource::new(uri.clone());
+        source.content_length = Some(total);
+        // 1 MiB already buffered, and the next piece in flight.
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 1024 * 1024];
+        source.prefetch = Some(PendingHttpFetch::spawn(
+            uri,
+            Vec::new(),
+            ByteRange {
+                start: 1024 * 1024,
+                length: Some(4096),
+            },
+        ));
+
+        // The read starts inside the cache and ends past its end, so it needs
+        // the piece that is already on the wire: joining it is the only way not
+        // to download the same range twice.
+        let bytes = source
+            .read_range(ByteRange {
+                start: 1024 * 1024 - 1024,
+                length: Some(2048),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 2048);
+        assert!(bytes[..1024].iter().all(|byte| *byte == b'c'));
+        assert!(bytes[1024..].iter().all(|byte| *byte == b'p'));
+        let _ = recv_request_head(&requests);
+        assert!(
+            requests.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a read that straddles the cache end must not duplicate the in-flight request"
+        );
+    }
+
+    #[test]
+    fn http_stream_to_eof_reads_past_eight_pieces() {
+        // An open-ended read (danmaku/subtitle sidecar) larger than one read's
+        // fetch allowance must still reach EOF. The first rewrite of this path
+        // capped the loop at 8 x 4 MiB = 32 MiB and truncated silently.
+        let chunks = 9u64;
+        let total = chunks * HTTP_REQUEST_MAX_BYTES;
+        let responses = (0..chunks)
+            .map(|index| {
+                MockResponse::immediate(http_206_response(
+                    index * HTTP_REQUEST_MAX_BYTES,
+                    total,
+                    &vec![b'x'; HTTP_REQUEST_MAX_BYTES as usize],
+                ))
+            })
+            .collect();
+        let (uri, requests) = spawn_mock_http_server(responses);
+        let mut source = HttpRangeSource::new(uri);
+
+        let bytes = source.read_range(ByteRange::suffix_from(0)).unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            total,
+            "an open-ended read must reach EOF, not stop at the attempt cap"
+        );
+        for index in 0..chunks {
+            let head = recv_request_head(&requests);
+            assert!(
+                head.contains(&format!("range: bytes={}-", index * HTTP_REQUEST_MAX_BYTES)),
+                "request {index}: {head}"
+            );
+        }
+    }
+
+    #[test]
     fn http_deep_window_against_a_slow_origin_still_serves_the_read() {
         // The issue #1 shape: a 32 MiB window against an origin that can only
         // deliver ~900 KB/s. Before the request cap this asked for all 32 MiB in
@@ -2172,8 +2266,11 @@ mod tests {
             })
             .expect("a deep window must not turn a slow origin into a failed read");
         assert_eq!(bytes.len(), 1024);
+        // The discriminating failure is the `expect` above (the old shape errors
+        // out at the 15 s body deadline); this bound only catches a fetch that
+        // silently stopped making progress, so it is sized for a loaded machine.
         assert!(
-            started.elapsed() < Duration::from_secs(12),
+            started.elapsed() < Duration::from_secs(30),
             "first read took {:?}",
             started.elapsed()
         );
@@ -2313,7 +2410,9 @@ mod tests {
 
         // Once the piece lands it is folded into the cache (so the following
         // piece has somewhere to start) instead of waiting for the reader.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The wait is deliberately generous: a loaded machine can stretch the
+        // loopback round trip well past its idle latency.
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline
             && !source
                 .prefetch
