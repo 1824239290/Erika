@@ -1709,6 +1709,82 @@ mod tests {
             .to_lowercase()
     }
 
+    /// Serves up to `connections` Range requests, trickling each body at
+    /// `bytes_per_sec` so the client spends real time inside the body phase --
+    /// the way a slow origin does, and the only way to exercise the client's own
+    /// body deadline.
+    fn spawn_drip_http_server(
+        total: u64,
+        bytes_per_sec: u64,
+        connections: usize,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let _ = sender.send(head.clone());
+                let (start, end) = parse_range_head(&head, total);
+                let length = end.saturating_sub(start) + 1;
+                let response_head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(response_head.as_bytes()).is_err() {
+                    continue;
+                }
+                let slice = 32 * 1024u64;
+                let mut sent = 0u64;
+                while sent < length {
+                    let count = slice.min(length - sent) as usize;
+                    if stream.write_all(&vec![b'x'; count]).is_err() {
+                        break;
+                    }
+                    sent += count as u64;
+                    thread::sleep(Duration::from_secs_f64(count as f64 / bytes_per_sec as f64));
+                }
+                let _ = stream.flush();
+            }
+        });
+        (uri, receiver)
+    }
+
+    /// `Range: bytes=start-end` from a raw request head, clamped to the file.
+    fn parse_range_head(head: &str, total: u64) -> (u64, u64) {
+        let value = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_default();
+        let spec = value.strip_prefix("bytes=").unwrap_or_default();
+        let mut parts = spec.split('-');
+        let start = parts
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0);
+        let end = parts
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse::<u64>()
+            .unwrap_or_else(|_| total.saturating_sub(1));
+        (start, end.min(total.saturating_sub(1)))
+    }
+
     #[test]
     fn local_file_source_reads_ranges() {
         let path = std::env::temp_dir().join(format!("erika-source-{}.bin", std::process::id()));
@@ -2070,6 +2146,102 @@ mod tests {
             source.prefetch_failures, 0,
             "a successful synchronous fetch clears the failure latch"
         );
+    }
+
+    #[test]
+    fn http_deep_window_against_a_slow_origin_still_serves_the_read() {
+        // The issue #1 shape: a 32 MiB window against an origin that can only
+        // deliver ~900 KB/s. Before the request cap this asked for all 32 MiB in
+        // one body, which the client's 15 s body deadline killed
+        // (`timeout: receive response` -> EIO -> playback ended). A capped 4 MiB
+        // request finishes in about five seconds.
+        let total = 64 * 1024 * 1024u64;
+        let (uri, requests) = spawn_drip_http_server(total, 900 * 1024, 2);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+
+        let started = Instant::now();
+        let bytes = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(1024),
+            })
+            .expect("a deep window must not turn a slow origin into a failed read");
+        assert_eq!(bytes.len(), 1024);
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "first read took {:?}",
+            started.elapsed()
+        );
+        let head = recv_request_head(&requests);
+        assert!(
+            head.contains("range: bytes=0-4194303"),
+            "request head: {head}"
+        );
+    }
+
+    #[test]
+    fn http_resumes_more_than_three_times_while_bytes_arrive() {
+        // Four pieces, each on its own connection: three truncated bodies, then
+        // the rest. Every attempt moves the resume point, so the fetch has to
+        // keep going -- the flat three-attempt rule used to end playback here
+        // (a capped request on a slow origin legitimately spans several
+        // attempts, each cut short by the 15 s body deadline).
+        let total = 4 * 1024 * 1024u64;
+        let piece = 1024 * 1024usize;
+        let held = vec![b'a'; piece];
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_truncated_response(
+                0,
+                total,
+                4 * 1024 * 1024,
+                &held,
+            )),
+            MockResponse::immediate(http_206_truncated_response(
+                1024 * 1024,
+                total,
+                3 * 1024 * 1024,
+                &held,
+            )),
+            MockResponse::immediate(http_206_truncated_response(
+                2 * 1024 * 1024,
+                total,
+                2 * 1024 * 1024,
+                &held,
+            )),
+            MockResponse::immediate(http_206_response(3 * 1024 * 1024, total, &held)),
+        ]);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(8 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(1024)
+                })
+                .unwrap()
+                .len(),
+            1024
+        );
+        let first = recv_request_head(&requests);
+        assert!(first.contains("range: bytes=0-4194303"), "{first}");
+        let second = recv_request_head(&requests);
+        assert!(second.contains("range: bytes=1048576-4194303"), "{second}");
+        let third = recv_request_head(&requests);
+        assert!(third.contains("range: bytes=2097152-4194303"), "{third}");
+        // A fourth attempt: the old gate stopped at three, no matter how much
+        // each attempt had already delivered.
+        let fourth = recv_request_head(&requests);
+        assert!(fourth.contains("range: bytes=3145728-4194303"), "{fourth}");
     }
 
     #[test]
