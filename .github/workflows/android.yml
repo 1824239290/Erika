@@ -56,6 +56,12 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
       - uses: android-actions/setup-android@v4
+        with:
+          # Google retired the legacy `tools` package from the SDK repository
+          # (2026-09-15), and the action's default `packages` still includes it,
+          # so the default install fails with "Failed to find package 'tools'".
+          # The NDK and cmdline-tools this workflow needs do not come from it.
+          packages: platform-tools
       - name: Install Android NDK and native build tools
         run: |
           sdkmanager "ndk;$ANDROID_NDK_VERSION"
