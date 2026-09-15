@@ -400,7 +400,27 @@ impl Demuxer {
             if code == AVERROR_EOF {
                 return Ok(None);
             }
-            check(code, "av_read_frame")?;
+            if let Err(error) = check(code, "av_read_frame") {
+                // A read that failed because the media source could not deliver
+                // the bytes keeps its real reason on the AVIO (HTTP status,
+                // timeout, ...). Carry it into the terminal error: without it the
+                // error reads only "Input/output error (-5)" and the cause lives
+                // on stderr alone, which is why a report such as issue #1 needs a
+                // reproduction instead of a log line.
+                return Err(
+                    match self
+                        .context
+                        .avio
+                        .as_ref()
+                        .and_then(|avio| avio.last_error.as_deref())
+                    {
+                        Some(source_error) => {
+                            FfmpegError::Source(format!("{error}; custom AVIO: {source_error}"))
+                        }
+                        None => error,
+                    },
+                );
+            }
 
             let stream_index = packet.stream_index();
             packet.time_base = self.stream_time_base(stream_index);
