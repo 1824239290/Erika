@@ -402,7 +402,8 @@ impl HttpRangeSource {
             cache_bytes: Vec::new(),
             read_ahead_bytes: read_ahead
                 .filter(|bytes| *bytes > 0)
-                .unwrap_or_else(http_read_ahead_bytes),
+                .unwrap_or_else(http_read_ahead_bytes)
+                .min(HTTP_READ_AHEAD_MAX_BYTES),
             request_bytes: read_ahead
                 .filter(|bytes| *bytes > 0)
                 .unwrap_or_else(http_read_ahead_bytes)
@@ -437,9 +438,9 @@ impl HttpRangeSource {
     /// `HTTP_CACHE_TRIM_SLACK` over budget keeps the O(n) buffer move rare
     /// (once per few MiB of playback) instead of once per read.
     fn trim_cache(&mut self, range: ByteRange) {
-        let Some(length) = range.length else {
+        if range.length.is_none() {
             return;
-        };
+        }
         // Measured from the *start* of the current read, never past it: the tail
         // is what a rewind can hit, but nothing the current read needs may be
         // dropped (a read larger than the retention budget still has to be
@@ -717,7 +718,12 @@ impl HttpRangeSource {
                 length: Some(request_length),
             })?;
             if fetched.is_empty() {
-                // EOF, or an origin that answered with no payload.
+                // An empty answer when bytes are known to exist is not EOF.
+                if self.content_length.is_some_and(|total| start < total) {
+                    return Err(SourceError::Http(format!(
+                        "origin answered an empty body for bytes {start}.. although the resource is larger"
+                    )));
+                }
                 break;
             }
             self.cache_bytes.extend_from_slice(&fetched);
@@ -750,6 +756,14 @@ impl HttpRangeSource {
         })?;
         self.cache_start = range.start;
         self.cache_bytes = fetched;
+        if self.cache_bytes.is_empty()
+            && self.content_length.is_some_and(|total| range.start < total)
+        {
+            return Err(SourceError::Http(format!(
+                "origin answered an empty body for bytes {}.. although the resource is larger",
+                range.start,
+            )));
+        }
         http_trace_log(format!(
             "{{\"event\":\"http_cache_reanchored\",\"start\":{},\"bytes\":{}}}",
             range.start,
@@ -765,17 +779,31 @@ impl HttpRangeSource {
     /// an origin that keeps answering full pieces cannot grow the cache without
     /// bound. It deliberately has no attempt cap: a sidecar larger than a few
     /// pieces must not be truncated (the old shape read the entire tail in one
-    /// request, which is unbounded in the other direction).
+    /// request, which is unbounded in the other direction). Hitting the hard
+    /// stop is reported as an error, never a silent short read.
     fn stream_to_eof(&mut self, start: u64) -> Result<()> {
         self.prefetch = None;
         self.cache_start = start;
         self.cache_bytes.clear();
-        while self.cache_bytes.len() as u64 <= HTTP_STREAM_TO_EOF_BYTE_LIMIT {
+        loop {
             let chunk_start = self.cache_end();
             if let Some(total) = self.content_length
                 && chunk_start >= total
             {
                 break;
+            }
+            // EOF first so a read that has reached the declared total is a
+            // clean end even when that total exceeds the limit (a final full
+            // piece can land the cache exactly on such a total). With the EOF
+            // check ahead, the hard stop only rejects a read that still owes
+            // bytes beyond the limit: an origin with no known length that
+            // keeps answering full pieces, or a resource genuinely larger
+            // than the limit.
+            if self.cache_bytes.len() as u64 > HTTP_STREAM_TO_EOF_BYTE_LIMIT {
+                return Err(SourceError::Http(format!(
+                    "open-ended read exceeded the {HTTP_STREAM_TO_EOF_BYTE_LIMIT}-byte limit at {}",
+                    self.cache_end(),
+                )));
             }
             let fetched = self.fetch_range(ByteRange {
                 start: chunk_start,
@@ -886,8 +914,15 @@ const HTTP_CACHE_TRIM_SLACK: u64 = 8 * 1024 * 1024;
 
 /// Hard stop for open-ended reads (`read_uri_to_end`: danmaku/subtitle sidecars).
 /// Matches the kernel's other sidecar ceilings; it only exists so an origin that
-/// answers full pieces forever cannot grow the cache without bound.
+/// answers full pieces forever cannot grow the cache without bound. Hitting it is
+/// reported as an error, never a silent short read.
 const HTTP_STREAM_TO_EOF_BYTE_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Ceiling for the configured read-ahead window. The window is a memory buffer,
+/// so an untrusted or extreme value (e.g. `u64::MAX` from a caller) must not be
+/// allowed to make the cache grow toward the whole media file. Default is 2 MiB;
+/// the App's picker tops out at 32 MiB, well under this.
+const HTTP_READ_AHEAD_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Most pieces one read may pull. An origin that answers short bodies needs
 /// several pieces per read (that is normal); this only stops a pathological one,
@@ -1334,6 +1369,14 @@ impl MediaSource for HttpRangeSource {
         let mut gate = HttpRetryGate::new();
         let head_error = loop {
             let attempt = gate.begin_attempt();
+            // Same ceiling as the range fetches: a HEAD probe must not spin
+            // past the budget on a dead origin.
+            if gate.expired() {
+                break SourceError::Http(format!(
+                    "fetch budget of {:?} exhausted probing the length",
+                    HTTP_FETCH_TOTAL_BUDGET,
+                ));
+            }
             let mut request = head_agent.head(&self.uri);
             for (name, value) in &self.http_headers {
                 request = request.header(name, value);
@@ -1400,7 +1443,7 @@ impl MediaSource for HttpRangeSource {
                         thread::sleep(backoff);
                         continue;
                     }
-                    break error;
+                    break SourceError::Http(error.to_string());
                 }
             }
         };
@@ -1470,6 +1513,15 @@ impl MediaSource for HttpRangeSource {
             }
             return Ok(Vec::new());
         };
+        if tail.is_empty() && self.content_length.is_some() {
+            // The top EOF gate already returned empty for reads at/past the
+            // total; an empty serve here means the fetch itself failed (e.g. an
+            // origin answering an empty 206), which must not look like EOF.
+            return Err(SourceError::Http(format!(
+                "cache holds no bytes at {}.. although the resource is larger",
+                range.start,
+            )));
+        }
         let copy_len = range.length.map_or(tail.len(), |length| {
             usize::try_from(length)
                 .unwrap_or(usize::MAX)
@@ -2881,6 +2933,148 @@ mod tests {
         assert_eq!(
             redacted_uri("https://example.invalid/video.mkv?AccessToken=secret"),
             "https://example.invalid/video.mkv?AccessToken=REDACTED"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Origin that always answers full `piece`-sized 206 bodies for the
+    /// requested range, no matter how big the request was.
+    fn spawn_capping_origin(
+        total: u64,
+        piece: u64,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.bin", listener.local_addr().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let maxlen = Arc::new(AtomicUsize::new(0));
+        let (c, m) = (count.clone(), maxlen.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                c.fetch_add(1, Ordering::SeqCst);
+                let lower = head.to_lowercase();
+                if lower.starts_with("head") {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    continue;
+                }
+                // parse "range: bytes=N-M"
+                let start: u64 = lower
+                    .lines()
+                    .find(|l| l.starts_with("range:"))
+                    .and_then(|l| l.split_once("bytes="))
+                    .and_then(|(_, v)| v.split('-').next())
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let end = (start + piece - 1).min(total.saturating_sub(1));
+                let len = end.saturating_sub(start) + 1;
+                m.fetch_max(len as usize, Ordering::SeqCst);
+                let resp = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(resp.as_bytes()).is_err() {
+                    continue;
+                }
+                let mut sent = 0u64;
+                while sent < len {
+                    let n = (32 * 1024u64).min(len - sent) as usize;
+                    if stream.write_all(&vec![b'z'; n]).is_err() {
+                        break;
+                    }
+                    sent += n as u64;
+                }
+                let _ = stream.flush();
+            }
+        });
+        (uri, count, maxlen)
+    }
+
+    #[test]
+    fn probe_stream_to_eof_known_total_just_past_the_limit_ends_cleanly() {
+        // The old ordering checked the hard limit before the declared-total
+        // EOF, so a resource whose total is the limit plus one full piece
+        // (260 MiB with the current constants) was misreported as a limit
+        // violation after the final piece landed exactly on the total. The EOF
+        // check must win over the limit check.
+        let total = HTTP_STREAM_TO_EOF_BYTE_LIMIT + HTTP_REQUEST_MAX_BYTES;
+        let (uri, _, _) = spawn_capping_origin(total, HTTP_REQUEST_MAX_BYTES);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let bytes = source
+            .read_range(ByteRange::suffix_from(0))
+            .expect("a declared total just past the limit is still a clean EOF");
+        assert_eq!(bytes.len() as u64, total);
+    }
+
+    #[test]
+    fn probe_stream_to_eof_beyond_the_hard_limit() {
+        let total = HTTP_STREAM_TO_EOF_BYTE_LIMIT + 16 * 1024 * 1024;
+        let (uri, _, _) = spawn_capping_origin(total, HTTP_REQUEST_MAX_BYTES);
+        let mut source = HttpRangeSource::new(uri);
+        match source.read_range(ByteRange::suffix_from(0)) {
+            Err(error) => assert!(
+                error.to_string().contains("limit"),
+                "expected a limit error, got: {error}"
+            ),
+            Ok(bytes) => panic!(
+                "an open-ended read past the hard limit must fail, got {} bytes",
+                bytes.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn read_that_needs_more_than_the_piece_cap_must_fail_loudly() {
+        // An origin that caps every body at 64 KiB: covering a forward gap much
+        // larger than `HTTP_FETCH_MAX_PIECES_PER_READ` pieces needs more fetches
+        // than one read may pull, and must error rather than hand the caller a
+        // short read that looks like EOF on bytes that exist. The gap is sized
+        // far past the cap so the answer is the same whether or not a prefetch
+        // piece lands before the read.
+        let total = 64 * 1024 * 1024u64;
+        let piece = 64 * 1024u64;
+        let (uri, _, _) = spawn_capping_origin(total, piece);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(8 * 1024 * 1024),
+        );
+        // Warm the cache so fetch_missing takes its multi-piece loop instead of
+        // re-anchoring a fresh window at the read.
+        source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(piece),
+            })
+            .expect("the first piece must serve");
+        let error = source
+            .read_range(ByteRange {
+                start: piece,
+                length: Some(200 * piece),
+            })
+            .expect_err("a gap past the piece cap must error");
+        assert!(
+            error.to_string().contains("short pieces"),
+            "expected a piece-cap error, got: {error}"
         );
     }
 }
