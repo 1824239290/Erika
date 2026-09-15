@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.1.9+dolby.buffering.dev - 2026-09-16
+
+Development kernel for host apps (OcPlayer) until these land on upstream
+main. Based on v0.1.9 and equal parts `v0.1.9+dolby.1` (PR #136) and
+`fix/http-request-cap-and-rewind-cache` (PR #137); the HTTP commits here are
+content-identical to that branch's head. Not intended as an upstream release.
+
+### Playback
+
+- Capped HTTP(S) source request bodies at 4 MiB and filled the read-ahead
+  window with successive pieces, so a large window no longer demands
+  unrealistic sustained bandwidth (a single 32 MiB request needed ~18 Mbps to
+  survive ureq's 15 s body deadline) and slow origins now buffer instead of
+  failing playback. Failed background prefetches degrade to synchronous fetches
+  instead of killing the read, and an origin that keeps delivering bytes
+  licenses more resume attempts than the flat three-attempt rule.
+- Kept a bounded 16 MiB tail of already-played data so a small rewind is served
+  from cache instead of re-fetching, and re-anchored the window for far seeks
+  instead of discarding in-flight prefetches.
+- Surface the media source's own error (HTTP status, timeout) in demux errors
+  rather than a bare `Input/output error (-5)`.
+
+### Renderer
+
+- Same Dolby Vision RPU mapping and HDR tone/gamut pipeline as
+  `v0.1.9+dolby.1`; see that section below for the full list.
+
+### CI
+
+- The Release workflow's Android job pins `packages: platform-tools` on
+  `setup-android`, matching the Android workflow fix: Google retired the
+  legacy `tools` SDK package on 2026-09-15 and the action's default list
+  still names it, which would fail the tag build before compiling.
+
 ## 0.1.9+dolby.1 - 2026-09-10
 
 Based on v0.1.9. Adds the Dolby Vision RPU mapping and HDR tone/gamut pipeline
