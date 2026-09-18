@@ -1,5 +1,6 @@
 #[cfg(target_os = "android")]
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::env;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -351,7 +352,14 @@ pub struct HttpRangeSource {
     /// `HTTP_REQUEST_MAX_BYTES`. The window is filled by successive requests of
     /// at most this size instead of one request for the whole window.
     request_bytes: u64,
-    prefetch: Option<PendingHttpFetch>,
+    /// Prefetch chain: contiguous pieces filling the window ahead of the cache
+    /// end, front first. While the chain is non-empty its front starts exactly
+    /// at `cache_end` and every piece starts where its predecessor ends, so
+    /// absorbing front to back keeps the cache one contiguous run of bytes.
+    prefetch: VecDeque<PendingHttpFetch>,
+    /// How many pieces of the prefetch chain may be in flight at once
+    /// (`ERIKA_HTTP_PREFETCH_PARALLEL` overrides, clamped to 1..=8).
+    prefetch_parallel: usize,
     /// Consecutive failed background prefetches. A failed prefetch is never
     /// fatal (the read path falls back to a synchronous fetch), but retrying on
     /// every read would hammer a sick origin, so the chain parks after a few and
@@ -408,7 +416,8 @@ impl HttpRangeSource {
                 .filter(|bytes| *bytes > 0)
                 .unwrap_or_else(http_read_ahead_bytes)
                 .min(HTTP_REQUEST_MAX_BYTES),
-            prefetch: None,
+            prefetch: VecDeque::new(),
+            prefetch_parallel: http_prefetch_parallel(),
             prefetch_failures: 0,
         }
     }
@@ -500,13 +509,15 @@ impl HttpRangeSource {
         })
     }
 
-    /// Join a pending prefetch and fold its bytes into the cache.
+    /// Join a finished prefetch and fold its bytes into the cache.
     ///
-    /// A prefetch always starts at `cache_end`, so its bytes are contiguous
-    /// with the cache and can simply be appended -- absorbing a finished piece
-    /// is what lets the next one start. A failure is recorded, never returned:
-    /// a dead background fetch must not end the read, the caller falls back to
-    /// a synchronous fetch.
+    /// The chain is contiguous -- the front piece starts at `cache_end` and
+    /// every piece starts where its predecessor ends -- so an in-position piece
+    /// is simply appended; absorbing a finished front is what lets the next one
+    /// start. A failure is recorded, never returned: a dead background fetch
+    /// must not end the read, the caller falls back to a synchronous fetch.
+    /// Either way the pieces behind a gap could never become contiguous, so
+    /// they are dropped along with the front.
     fn absorb_prefetch(&mut self, pending: PendingHttpFetch) {
         let start = pending.range.start;
         match pending.join() {
@@ -533,6 +544,11 @@ impl HttpRangeSource {
                         self.cache_end(),
                         response.bytes.len(),
                     ));
+                    self.drop_prefetch_chain();
+                } else {
+                    // An empty answer folds nothing in, which leaves the same
+                    // gap behind it as a failure would.
+                    self.drop_prefetch_chain();
                 }
             }
             Err(error) => {
@@ -543,85 +559,122 @@ impl HttpRangeSource {
                     self.prefetch_failures,
                     json_escape(&error.to_string()),
                 ));
+                self.drop_prefetch_chain();
             }
         }
     }
 
-    /// Fold in a finished prefetch without blocking. Called before the hit
-    /// checks so they see everything that has already arrived.
+    /// Detach every queued piece: their ranges sit behind a break in the chain
+    /// (a failed, empty, or out-of-position front), so no later piece can ever
+    /// become contiguous with the cache. The detached threads finish their
+    /// requests and the bytes are thrown away.
+    fn drop_prefetch_chain(&mut self) {
+        let cache_start = self.cache_start;
+        let cache_end = self.cache_end();
+        for pending in self.prefetch.drain(..) {
+            http_trace_log(format!(
+                "{{\"event\":\"http_prefetch_dropped\",\"start\":{},\"cache_start\":{},\"cache_end\":{},\"bytes\":0}}",
+                pending.range.start, cache_start, cache_end,
+            ));
+        }
+    }
+
+    /// Fold in finished prefetch pieces without blocking, front to back, for as
+    /// long as they stay contiguous with the cache. Called before the hit
+    /// checks so they see everything that has already arrived. (Absorbing a
+    /// broken front clears the rest of the chain, which also ends this loop.)
     fn settle_finished_prefetch(&mut self) {
-        if !self
+        while self
             .prefetch
-            .as_ref()
+            .front()
             .is_some_and(PendingHttpFetch::is_finished)
         {
-            return;
-        }
-        if let Some(pending) = self.prefetch.take() {
+            let Some(pending) = self.prefetch.pop_front() else {
+                break;
+            };
             self.absorb_prefetch(pending);
         }
     }
 
-    /// Resolve the in-flight prefetch against an incoming read.
+    /// Resolve the in-flight chain against an incoming read.
     ///
-    /// * the piece covers the read, or the read needs bytes at/past the cache
-    ///   end (which is exactly where the piece starts) -> join it; the reader is
-    ///   waiting, and issuing a synchronous fetch of the same bytes would
-    ///   download the range twice;
-    /// * the read jumped past it -> drop the handle: its bytes sit behind the
-    ///   new position (the detached thread finishes its request and is thrown
-    ///   away);
-    /// * otherwise (a rewind, or a read inside the cache) -> leave it running:
-    ///   it holds *forward* data this read still wants. The previous code threw
-    ///   an in-flight piece away here, which is one reason a rewind used to
-    ///   re-download everything.
+    /// * the read needs bytes at/past the cache end (which is where the front
+    ///   piece starts), or is fully covered by the chain -> join pieces front
+    ///   to back until the read is satisfied; the reader is waiting, and
+    ///   issuing a synchronous fetch of the same bytes would download the
+    ///   range twice;
+    /// * the read jumped past the whole chain -> drop every piece: its bytes
+    ///   sit behind the new position (the detached threads finish their
+    ///   requests and are thrown away);
+    /// * otherwise (a rewind, or a read inside the cache) -> leave the chain
+    ///   running: it holds *forward* data this read still wants. The previous
+    ///   code threw an in-flight piece away here, which is one reason a
+    ///   rewind used to re-download everything.
     fn settle_prefetch_for(&mut self, range: ByteRange) {
-        let Some(pending) = self.prefetch.as_ref().map(|pending| pending.range) else {
+        let Some(length) = range.length else {
+            // Open-ended reads take the stream_to_eof path, which resets the
+            // chain.
             return;
         };
-        let covers = range_contains(pending, range);
-        let stale = pending
-            .length
-            .is_some_and(|length| range.start >= pending.start.saturating_add(length));
-        let needs_this_piece = range
-            .length
-            .is_some_and(|length| range.start.saturating_add(length) > self.cache_end());
-        if (covers || needs_this_piece) && !stale {
-            if !self
-                .prefetch
-                .as_ref()
-                .is_some_and(PendingHttpFetch::is_finished)
-            {
-                // Joining is cheaper than issuing a duplicate download of bytes
-                // that are already on the wire.
-                http_trace_log(format!(
-                    "{{\"event\":\"http_prefetch_pending\",\"decision\":\"join\",\"start\":{},\"requested_start\":{}}}",
-                    pending.start, range.start,
-                ));
-            }
-            if let Some(pending) = self.prefetch.take() {
-                self.absorb_prefetch(pending);
-            }
-        } else if stale {
-            if let Some(pending) = self.prefetch.take() {
+        let Some(front) = self.prefetch.front().map(|pending| pending.range) else {
+            return;
+        };
+        let chain_end = self.prefetch.back().map_or(front.start, |pending| {
+            pending
+                .range
+                .start
+                .saturating_add(pending.range.length.unwrap_or(0))
+        });
+        if range.start >= chain_end {
+            while let Some(pending) = self.prefetch.pop_front() {
                 http_trace_log(format!(
                     "{{\"event\":\"http_prefetch_stale\",\"start\":{},\"requested_start\":{}}}",
                     pending.range.start, range.start,
                 ));
             }
+            return;
+        }
+        let read_end = range.start.saturating_add(length);
+        let chain = ByteRange {
+            start: front.start,
+            length: Some(chain_end.saturating_sub(front.start)),
+        };
+        let covers = range_contains(chain, range);
+        let needs_chain = read_end > self.cache_end();
+        if !(covers || needs_chain) {
+            return;
+        }
+        // The front starts at `cache_end`, so each joined piece advances the
+        // cache by exactly its length until the read is covered.
+        while self.cache_end() < read_end {
+            let Some(pending) = self.prefetch.pop_front() else {
+                break;
+            };
+            if !pending.is_finished() {
+                // Joining is cheaper than issuing a duplicate download of
+                // bytes that are already on the wire.
+                http_trace_log(format!(
+                    "{{\"event\":\"http_prefetch_pending\",\"decision\":\"join\",\"start\":{},\"requested_start\":{}}}",
+                    pending.range.start, range.start,
+                ));
+            }
+            self.absorb_prefetch(pending);
         }
     }
 
     /// Keep the cache near its configured depth, one capped piece at a time.
     ///
-    /// Each call first folds in a finished piece and then, if the cache is below
-    /// the refill threshold, starts the next one from `cache_end`. So the window
-    /// still fills to `read_ahead_bytes`, but no single request ever asks for
-    /// more than `request_bytes` -- which is what keeps a slow origin inside the
-    /// client's body deadline.
+    /// Each call first folds in finished pieces and then, if the cache is below
+    /// the refill threshold, extends the prefetch chain from its tail. The
+    /// window still fills to `read_ahead_bytes`, but no single request ever
+    /// asks for more than `request_bytes` -- which is what keeps a slow origin
+    /// inside the client's body deadline. Up to `prefetch_parallel` pieces are
+    /// in flight at once: one-at-a-time serializes the whole fill behind every
+    /// request's fixed cost (connection + round trip), which starves
+    /// high-bitrate media on high-latency origins.
     fn maybe_start_prefetch(&mut self, range: ByteRange) {
         self.settle_finished_prefetch();
-        if self.prefetch.is_some() || self.cache_bytes.is_empty() {
+        if self.cache_bytes.is_empty() {
             return;
         }
         if self.prefetch_failures >= HTTP_PREFETCH_MAX_FAILURES {
@@ -648,19 +701,31 @@ impl HttpRangeSource {
         if remaining >= self.read_ahead_bytes {
             return;
         }
-        let length = self.request_bytes.min(total.saturating_sub(cache_end));
-        if length == 0 {
-            return;
-        }
-        let prefetch_range = ByteRange {
-            start: cache_end,
-            length: Some(length),
+        let window_end = cache_end.saturating_add(self.read_ahead_bytes).min(total);
+        let mut next_start = match self.prefetch.back() {
+            Some(pending) => pending
+                .range
+                .start
+                .saturating_add(pending.range.length.unwrap_or(0)),
+            None => cache_end,
         };
-        self.prefetch = Some(PendingHttpFetch::spawn(
-            self.uri.clone(),
-            self.http_headers.clone(),
-            prefetch_range,
-        ));
+        while self.prefetch.len() < self.prefetch_parallel && next_start < window_end {
+            let length = self.request_bytes.min(total.saturating_sub(next_start));
+            if length == 0 {
+                break;
+            }
+            let prefetch_range = ByteRange {
+                start: next_start,
+                length: Some(length),
+            };
+            self.prefetch.push_back(PendingHttpFetch::spawn(
+                self.agent.clone(),
+                self.uri.clone(),
+                self.http_headers.clone(),
+                prefetch_range,
+            ));
+            next_start = next_start.saturating_add(length);
+        }
     }
 
     /// Make the cache cover `range`, downloading only what is missing.
@@ -736,7 +801,7 @@ impl HttpRangeSource {
     /// Start a fresh window at the read position, discarding what the cache held
     /// (including any in-flight prefetch anchored to the old cache end).
     fn reanchor_window(&mut self, range: ByteRange) -> Result<()> {
-        if let Some(pending) = self.prefetch.take() {
+        while let Some(pending) = self.prefetch.pop_front() {
             http_trace_log(format!(
                 "{{\"event\":\"http_prefetch_stale\",\"start\":{},\"requested_start\":{}}}",
                 pending.range.start, range.start,
@@ -782,7 +847,7 @@ impl HttpRangeSource {
     /// request, which is unbounded in the other direction). Hitting the hard
     /// stop is reported as an error, never a silent short read.
     fn stream_to_eof(&mut self, start: u64) -> Result<()> {
-        self.prefetch = None;
+        self.prefetch.clear();
         self.cache_start = start;
         self.cache_bytes.clear();
         loop {
@@ -823,7 +888,15 @@ impl HttpRangeSource {
 }
 
 impl PendingHttpFetch {
-    fn spawn(uri: String, http_headers: Vec<(String, String)>, range: ByteRange) -> Self {
+    /// Spawns on a clone of the source's agent: the clone shares the
+    /// connection pool, so chain pieces reuse warm connections instead of
+    /// paying a fresh TCP + TLS handshake per piece.
+    fn spawn(
+        agent: ureq::Agent,
+        uri: String,
+        http_headers: Vec<(String, String)>,
+        range: ByteRange,
+    ) -> Self {
         http_trace_log(format!(
             "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{}}}",
             range.start,
@@ -832,7 +905,6 @@ impl PendingHttpFetch {
                 .map_or_else(|| "null".to_string(), |length| length.to_string()),
         ));
         let handle = thread::spawn(move || {
-            let agent = http_agent();
             fetch_http_range(&agent, &uri, &http_headers, range, "http_prefetch_range")
         });
         Self { range, handle }
@@ -932,6 +1004,24 @@ const HTTP_FETCH_MAX_PIECES_PER_READ: u32 = 64;
 /// Consecutive background-prefetch failures before the chain is parked until a
 /// synchronous fetch succeeds.
 const HTTP_PREFETCH_MAX_FAILURES: u32 = 3;
+
+/// Most pieces of the prefetch chain that may be in flight at once.
+///
+/// Filling the window one piece at a time serializes it behind every request's
+/// fixed cost (connection + TLS + a round trip), which on a high-latency
+/// origin starves high-bitrate media: a 71 Mbps remux measured ~21 Mbps
+/// effective because each 4 MiB piece paid ~0.5 s before its first byte.
+/// Overlapping contiguous pieces multiplies the fill rate; every request still
+/// stays inside the 4 MiB body cap, and the chain never extends past the
+/// configured window.
+const HTTP_PREFETCH_PARALLEL_MAX: usize = 3;
+
+fn http_prefetch_parallel() -> usize {
+    env::var("ERIKA_HTTP_PREFETCH_PARALLEL")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(HTTP_PREFETCH_PARALLEL_MAX, |count| count.clamp(1, 8))
+}
 
 /// Retry policy for one logical fetch (every attempt at the same range).
 ///
@@ -1691,6 +1781,8 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     use super::*;
@@ -1932,6 +2024,66 @@ mod tests {
             .parse::<u64>()
             .unwrap_or_else(|_| total.saturating_sub(1));
         (start, end.min(total.saturating_sub(1)))
+    }
+
+    /// Serves every connection on its own thread, so concurrent range requests
+    /// genuinely overlap, and reports the high-water mark of simultaneously
+    /// in-flight requests. Each answer serves the exact requested range with
+    /// position-dependent bytes: `body[offset] == (offset % 251)`.
+    fn spawn_concurrent_mock_http_server(
+        total: u64,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let (in_flight_seen, max_seen) = (Arc::clone(&in_flight), Arc::clone(&max_in_flight));
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let in_flight = Arc::clone(&in_flight_seen);
+                let max_in_flight = Arc::clone(&max_seen);
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut head = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                    }
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    // Hold the request open so the other chain pieces really do
+                    // connect while this one is still on the wire.
+                    thread::sleep(Duration::from_millis(150));
+                    let (start, end) = parse_range_head(&head, total);
+                    let length = end.saturating_sub(start) + 1;
+                    let response = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(response.as_bytes()).is_ok() {
+                        let mut sent = 0u64;
+                        while sent < length {
+                            let count = (32 * 1024u64).min(length - sent) as usize;
+                            let chunk = (0..count)
+                                .map(|index| ((start + sent + index as u64) % 251) as u8)
+                                .collect::<Vec<u8>>();
+                            if stream.write_all(&chunk).is_err() {
+                                break;
+                            }
+                            sent += count as u64;
+                        }
+                    }
+                    let _ = stream.flush();
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (uri, in_flight, max_in_flight)
     }
 
     #[test]
@@ -2238,7 +2390,12 @@ mod tests {
             start: 0,
             length: Some(100),
         };
-        source.prefetch = Some(PendingHttpFetch::spawn(uri, Vec::new(), range));
+        source.prefetch.push_back(PendingHttpFetch::spawn(
+            source.agent.clone(),
+            uri,
+            Vec::new(),
+            range,
+        ));
         assert_eq!(source.read_range(range).unwrap(), body);
         let _ = recv_request_head(&requests);
         // Joining the pending prefetch must not issue a duplicate download.
@@ -2259,7 +2416,12 @@ mod tests {
             start: 0,
             length: Some(100),
         };
-        source.prefetch = Some(PendingHttpFetch::spawn(uri, Vec::new(), range));
+        source.prefetch.push_back(PendingHttpFetch::spawn(
+            source.agent.clone(),
+            uri,
+            Vec::new(),
+            range,
+        ));
         // A short prefetch must trigger the synchronous follow-up, not an
         // empty (fake-EOF) read. The piece already held is kept, so the
         // follow-up only asks for the gap.
@@ -2282,7 +2444,12 @@ mod tests {
             start: 0,
             length: Some(64),
         };
-        source.prefetch = Some(PendingHttpFetch::spawn(uri, Vec::new(), range));
+        source.prefetch.push_back(PendingHttpFetch::spawn(
+            source.agent.clone(),
+            uri,
+            Vec::new(),
+            range,
+        ));
 
         // A dead background prefetch must not end the read: the synchronous path
         // fetches the same bytes.
@@ -2314,7 +2481,8 @@ mod tests {
         // 1 MiB already buffered, and the next piece in flight.
         source.cache_start = 0;
         source.cache_bytes = vec![b'c'; 1024 * 1024];
-        source.prefetch = Some(PendingHttpFetch::spawn(
+        source.prefetch.push_back(PendingHttpFetch::spawn(
+            source.agent.clone(),
             uri,
             Vec::new(),
             ByteRange {
@@ -2488,7 +2656,7 @@ mod tests {
             length: Some(1024),
         });
         assert!(
-            source.prefetch.is_some(),
+            !source.prefetch.is_empty(),
             "20 MiB ahead is below a 32 MiB window"
         );
     }
@@ -2635,10 +2803,14 @@ mod tests {
             MockResponse::immediate(http_206_response(0, total, &piece)),
             MockResponse::immediate(http_206_response(HTTP_REQUEST_MAX_BYTES, total, &piece)),
         ]);
+        // The window is exactly one piece deep: after the first piece lands the
+        // chain holds exactly the refill piece, which keeps this ordered
+        // two-response mock deterministic (a deeper window would put several
+        // pieces on the wire racing for these two answers).
         let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
             uri,
             Vec::new(),
-            Some(8 * 1024 * 1024),
+            Some(HTTP_REQUEST_MAX_BYTES),
         );
         source.content_length = Some(total);
 
@@ -2670,7 +2842,7 @@ mod tests {
         while Instant::now() < deadline
             && !source
                 .prefetch
-                .as_ref()
+                .front()
                 .is_some_and(PendingHttpFetch::is_finished)
         {
             thread::sleep(Duration::from_millis(10));
@@ -2690,6 +2862,137 @@ mod tests {
             2 * HTTP_REQUEST_MAX_BYTES,
             "the finished piece must have been absorbed into the cache"
         );
+    }
+
+    #[test]
+    fn http_prefetch_chain_keeps_several_pieces_in_flight() {
+        // A 32 MiB window against a 64 MiB resource: one read starts a chain of
+        // `HTTP_PREFETCH_PARALLEL_MAX` contiguous pieces, and the mock's
+        // high-water mark proves they really overlap on the wire instead of
+        // queueing behind each other.
+        let total = 64 * 1024 * 1024u64;
+        let (uri, _in_flight, max_in_flight) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 1024 * 1024];
+
+        source.maybe_start_prefetch(ByteRange {
+            start: 0,
+            length: Some(1024),
+        });
+        assert_eq!(
+            source.prefetch.len(),
+            HTTP_PREFETCH_PARALLEL_MAX,
+            "the chain must fill to the parallel depth"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && max_in_flight.load(Ordering::SeqCst) < 2 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) >= 2,
+            "chain pieces must overlap on the wire"
+        );
+    }
+
+    #[test]
+    fn http_read_spanning_chain_pieces_serves_contiguous_bytes() {
+        // One read crossing two chain pieces: joining must fold the pieces in
+        // order (the front starts at the cache end), leave the rest of the
+        // chain running, and hand back exactly the position-dependent bytes.
+        let total = 32 * 1024 * 1024u64;
+        let (uri, _in_flight, _max_in_flight) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        source.cache_start = 0;
+        source.cache_bytes = (0..1024 * 1024u64)
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+
+        source.maybe_start_prefetch(ByteRange {
+            start: 0,
+            length: Some(1024),
+        });
+
+        let read_start = 1024 * 1024 - 512;
+        let read_len = 2 * 1024 * 1024u64;
+        let bytes = source
+            .read_range(ByteRange {
+                start: read_start,
+                length: Some(read_len),
+            })
+            .expect("a read across chain pieces must be served");
+        assert_eq!(bytes.len() as u64, read_len);
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                ((read_start + index as u64) % 251) as u8,
+                "byte {} of the read",
+                read_start + index as u64
+            );
+        }
+        // Only the piece the read consumed is gone; the rest of the chain
+        // stays running for the reader to catch up to.
+        assert!(!source.prefetch.is_empty());
+    }
+
+    #[test]
+    fn http_prefetch_chain_break_clears_the_pieces_behind_it() {
+        // The front piece fails (a 404 is not retryable); the piece behind it
+        // could never become contiguous with the cache, so settling must drop
+        // the whole chain instead of parking orphaned pieces on the deque.
+        let body: Vec<u8> = (0..64u8).collect();
+        let (dead_uri, _dead_requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_simple_response("404 Not Found", b"gone"),
+        )]);
+        let (alive_uri, _alive_requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(32, 64, &body[32..]),
+        )]);
+        let mut source = HttpRangeSource::new("https://example.invalid/video.mp4");
+        source.content_length = Some(64);
+        source.prefetch.push_back(PendingHttpFetch::spawn(
+            source.agent.clone(),
+            dead_uri,
+            Vec::new(),
+            ByteRange {
+                start: 0,
+                length: Some(32),
+            },
+        ));
+        source.prefetch.push_back(PendingHttpFetch::spawn(
+            source.agent.clone(),
+            alive_uri,
+            Vec::new(),
+            ByteRange {
+                start: 32,
+                length: Some(32),
+            },
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && !source.prefetch.iter().all(PendingHttpFetch::is_finished)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        source.settle_finished_prefetch();
+
+        assert!(
+            source.prefetch.is_empty(),
+            "the pieces behind a broken front must be dropped"
+        );
+        assert_eq!(source.prefetch_failures, 1);
+        assert!(source.cache_bytes.is_empty());
     }
 
     #[test]
