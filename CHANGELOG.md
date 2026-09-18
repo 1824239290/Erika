@@ -4,16 +4,26 @@
 
 ### Playback
 
-- Capped HTTP(S) source request bodies at 4 MiB and filled the read-ahead
-  window with successive pieces, so a large window no longer demands
+- HTTP(S) prefetch now runs as persistent streaming workers: each worker holds
+  one open-ended GET (`bytes=anchor-`) so the origin seeks once per worker and
+  the flows run at path bandwidth, instead of re-paying a round trip and a
+  server seek on every 4 MiB piece. Stripes are handed to the reader and
+  appended in frontier order, backpressure is TCP itself (the worker stops
+  reading its socket when the window is full), and seeks re-anchor the
+  workers through an epoch counter. A body error reconnects at the reached
+  offset with the entity validator replayed; past a few fruitless reconnects
+  the read falls back to the synchronous capped path.
+- The rewind budget is host-tunable via `http_back_buffer_bytes` on the open
+  options (the first reserved slot — ABI and layout unchanged; zero keeps the
+  16 MiB default). Hosts playing high-bitrate media should size it from the
+  bitrate: a -10 s skip at 71 Mbps covers ~89 MB, which the fixed default
+  could not hold.
+- Capped HTTP(S) request bodies at 4 MiB so a large window no longer demands
   unrealistic sustained bandwidth (a single 32 MiB request needed ~18 Mbps to
-  survive ureq's 15 s body deadline) and slow origins now buffer instead of
-  failing playback. Failed background prefetches degrade to synchronous fetches
-  instead of killing the read, and an origin that keeps delivering bytes
-  licenses more resume attempts than the flat three-attempt rule.
-- Kept a bounded 16 MiB tail of already-played data so a small rewind is served
-  from cache instead of re-fetching, and re-anchored the window for far seeks
-  instead of discarding in-flight prefetches.
+  survive ureq's 15 s body deadline); failed background work degrades to
+  synchronous fetches instead of killing the read, and an origin that keeps
+  delivering bytes licenses more resume attempts than the flat three-attempt
+  rule.
 - Surface the media source's own error (HTTP status, timeout) in demux errors
   rather than a bare `Input/output error (-5)`.
 
