@@ -353,6 +353,10 @@ pub struct HttpRangeSource {
     /// `HTTP_REQUEST_MAX_BYTES`. The window is filled by successive requests of
     /// at most this size instead of one request for the whole window.
     request_bytes: u64,
+    /// How much already-played data stays in the cache (the rewind budget).
+    /// `HTTP_CACHE_RETAIN_BYTES` is the default; hosts sizing by media bitrate
+    /// override it through the open options (`http_back_buffer_bytes`).
+    cache_retain_bytes: u64,
     /// Persistent prefetch streams: workers holding open-ended GET responses
     /// (`bytes=anchor-`), each delivering fixed-size stripes that the reader
     /// appends to the cache in order. Two workers cover the window with two
@@ -427,7 +431,7 @@ impl HttpRangeSource {
     }
 
     pub fn with_http_headers(uri: impl Into<String>, http_headers: Vec<(String, String)>) -> Self {
-        Self::with_http_headers_and_read_ahead(uri, http_headers, None)
+        Self::with_http_headers_and_window(uri, http_headers, None, None)
     }
 
     /// `read_ahead`: explicit read-ahead window in bytes; `None` (or `Some(0)`)
@@ -437,6 +441,19 @@ impl HttpRangeSource {
         uri: impl Into<String>,
         http_headers: Vec<(String, String)>,
         read_ahead: Option<u64>,
+    ) -> Self {
+        Self::with_http_headers_and_window(uri, http_headers, read_ahead, None)
+    }
+
+    /// `back_buffer`: how much already-played data the cache retains behind
+    /// the reader, i.e. the rewind budget; `None` (or `Some(0)`) uses the
+    /// 16 MiB engine default. High-bitrate sources need more -- a -10 s skip
+    /// at 71 Mbps covers ~89 MB, which a fixed 16 MiB tail cannot hold.
+    pub fn with_http_headers_and_window(
+        uri: impl Into<String>,
+        http_headers: Vec<(String, String)>,
+        read_ahead: Option<u64>,
+        back_buffer: Option<u64>,
     ) -> Self {
         let agent = http_agent();
         Self {
@@ -454,6 +471,10 @@ impl HttpRangeSource {
                 .filter(|bytes| *bytes > 0)
                 .unwrap_or_else(http_read_ahead_bytes)
                 .min(HTTP_REQUEST_MAX_BYTES),
+            cache_retain_bytes: back_buffer
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or(HTTP_CACHE_RETAIN_BYTES)
+                .min(HTTP_READ_AHEAD_MAX_BYTES),
             streams: None,
             stream_frontier: 0,
             stream_reader_end: 0,
@@ -493,7 +514,7 @@ impl HttpRangeSource {
         // is what a rewind can hit, but nothing the current read needs may be
         // dropped (a read larger than the retention budget still has to be
         // served from the cache it started in).
-        let retain_floor = range.start.saturating_sub(HTTP_CACHE_RETAIN_BYTES);
+        let retain_floor = range.start.saturating_sub(self.cache_retain_bytes);
         let drop = retain_floor.saturating_sub(self.cache_start);
         if drop < HTTP_CACHE_TRIM_SLACK {
             return;
@@ -1202,7 +1223,10 @@ const HTTP_REQUEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// How much already-played data stays in the cache. A rewind inside this tail is
 /// served locally instead of re-downloaded: mpv keeps 50 MiB of back buffer by
 /// default (`--demuxer-max-back-bytes`), VLC reuses a 3x4 MiB ring set. 16 MiB
-/// sits between them and covers a 10 s step at up to ~13 Mbps.
+/// sits between them and covers a 10 s step at up to ~13 Mbps. This is the
+/// DEFAULT budget -- `http_back_buffer_bytes` on the open options overrides it,
+/// which is how hosts size the tail from media bitrate (a -10 s step at
+/// 71 Mbps covers ~89 MB).
 const HTTP_CACHE_RETAIN_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The retained tail is only cut once it is this much over budget, so the O(n)
@@ -1916,27 +1940,35 @@ pub fn source_from_uri_with_hint_and_headers(
     source_hint: MediaSourceHint,
     http_headers: Vec<(String, String)>,
 ) -> Result<Box<dyn MediaSource>> {
-    source_from_uri_with_options(uri, source_hint, http_headers, None)
+    source_from_uri_with_options(uri, source_hint, http_headers, None, None)
 }
 
 /// `http_read_ahead_bytes` only applies to HTTP(S) sources and overrides the
 /// per-request read-ahead window; `None` keeps the default resolution
-/// (env override, then the 2 MiB engine default).
+/// (env override, then the 2 MiB engine default). `http_back_buffer_bytes`
+/// likewise overrides the rewind budget; `None` keeps the 16 MiB default.
 pub fn source_from_uri_with_options(
     uri: &str,
     source_hint: MediaSourceHint,
     http_headers: Vec<(String, String)>,
     http_read_ahead_bytes: Option<u64>,
+    http_back_buffer_bytes: Option<u64>,
 ) -> Result<Box<dyn MediaSource>> {
     match source_hint {
-        MediaSourceHint::Auto => source_from_auto_uri(uri, http_headers, http_read_ahead_bytes),
+        MediaSourceHint::Auto => source_from_auto_uri(
+            uri,
+            http_headers,
+            http_read_ahead_bytes,
+            http_back_buffer_bytes,
+        ),
         MediaSourceHint::LocalFile => source_from_local_uri(uri),
         MediaSourceHint::Http => {
             if uri.starts_with("http://") || uri.starts_with("https://") {
-                Ok(Box::new(HttpRangeSource::with_http_headers_and_read_ahead(
+                Ok(Box::new(HttpRangeSource::with_http_headers_and_window(
                     uri,
                     http_headers,
                     http_read_ahead_bytes,
+                    http_back_buffer_bytes,
                 )))
             } else {
                 Err(SourceError::Unsupported(uri.to_string()))
@@ -1949,6 +1981,7 @@ fn source_from_auto_uri(
     uri: &str,
     http_headers: Vec<(String, String)>,
     http_read_ahead_bytes: Option<u64>,
+    http_back_buffer_bytes: Option<u64>,
 ) -> Result<Box<dyn MediaSource>> {
     if uri.starts_with("fd://") {
         return source_from_local_uri(uri);
@@ -1957,10 +1990,11 @@ fn source_from_auto_uri(
         return Ok(Box::new(LocalFileSource::open(path)?));
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        return Ok(Box::new(HttpRangeSource::with_http_headers_and_read_ahead(
+        return Ok(Box::new(HttpRangeSource::with_http_headers_and_window(
             uri,
             http_headers,
             http_read_ahead_bytes,
+            http_back_buffer_bytes,
         )));
     }
     let path = Path::new(uri);
@@ -2903,6 +2937,31 @@ mod tests {
         assert_eq!(
             source.cache_start,
             25 * 1024 * 1024 - HTTP_CACHE_RETAIN_BYTES
+        );
+    }
+
+    #[test]
+    fn http_back_buffer_budget_is_honored_by_trim() {
+        // The rewind budget is host-tunable: a host sizing it from media
+        // bitrate (a -10 s skip at 71 Mbps covers ~89 MB) must see the trim
+        // honor the larger tail instead of the 16 MiB default.
+        let mut source = HttpRangeSource::with_http_headers_and_window(
+            "https://example.invalid/video.mp4",
+            Vec::new(),
+            None,
+            Some(96 * 1024 * 1024),
+        );
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 128 * 1024 * 1024];
+
+        source.trim_cache(ByteRange {
+            start: 128 * 1024 * 1024,
+            length: Some(1024),
+        });
+        assert_eq!(
+            source.cache_start,
+            128 * 1024 * 1024 - 96 * 1024 * 1024,
+            "the tail must be trimmed to the configured back-buffer budget"
         );
     }
 

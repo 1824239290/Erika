@@ -845,6 +845,7 @@ impl PlaybackSession {
             request.source_hint,
             request.http_headers.clone(),
             request.http_read_ahead_bytes,
+            request.http_back_buffer_bytes,
         )?;
         let mut demuxer = Demuxer::open_source(source)?;
         let mut probe = demuxer.probe().clone();
@@ -6043,6 +6044,7 @@ mod tests {
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,
@@ -8044,6 +8046,7 @@ mod tests {
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,

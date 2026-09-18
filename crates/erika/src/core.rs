@@ -168,6 +168,10 @@ pub struct MediaRequest {
     /// `ERIKA_HTTP_READAHEAD_BYTES` env override, then uses the 2 MiB engine
     /// default (see `HttpRangeSource::DEFAULT_READ_AHEAD_BYTES`).
     pub http_read_ahead_bytes: Option<u64>,
+    /// HTTP rewind budget in bytes: how much already-played data the source
+    /// retains behind the reader. `None` uses the 16 MiB engine default
+    /// (`HTTP_CACHE_RETAIN_BYTES`).
+    pub http_back_buffer_bytes: Option<u64>,
 }
 
 /// Hand-written so that credentials carried by custom headers (`Authorization`,
@@ -187,6 +191,7 @@ impl std::fmt::Debug for MediaRequest {
                     .collect::<Vec<_>>(),
             )
             .field("http_read_ahead_bytes", &self.http_read_ahead_bytes)
+            .field("http_back_buffer_bytes", &self.http_back_buffer_bytes)
             .finish()
     }
 }
@@ -198,6 +203,7 @@ impl MediaRequest {
             source_hint: MediaSourceHint::Auto,
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
         }
     }
 
@@ -216,6 +222,19 @@ impl MediaRequest {
     /// default resolution; `Some(0)` is normalized to `None`.
     pub fn map_http_read_ahead_bytes(mut self, read_ahead_bytes: Option<u64>) -> Self {
         self.http_read_ahead_bytes = read_ahead_bytes.filter(|bytes| *bytes > 0);
+        self
+    }
+
+    /// Overrides the HTTP rewind budget in bytes. Only meaningful for HTTP(S)
+    /// sources; other source kinds ignore it. `0` is treated as `None`.
+    pub fn with_http_back_buffer_bytes(self, back_buffer_bytes: u64) -> Self {
+        self.map_http_back_buffer_bytes(Some(back_buffer_bytes))
+    }
+
+    /// Same as [`Self::with_http_back_buffer_bytes`] but `None` keeps the
+    /// default budget; `Some(0)` is normalized to `None`.
+    pub fn map_http_back_buffer_bytes(mut self, back_buffer_bytes: Option<u64>) -> Self {
+        self.http_back_buffer_bytes = back_buffer_bytes.filter(|bytes| *bytes > 0);
         self
     }
 }
@@ -4437,6 +4456,7 @@ mod tests {
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
         };
         let mut engine = VideoPlaybackEngine::open(
             &request,
