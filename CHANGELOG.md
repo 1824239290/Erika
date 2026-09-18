@@ -4,18 +4,98 @@
 
 ### Playback
 
-- Capped HTTP(S) source request bodies at 4 MiB and filled the read-ahead
-  window with successive pieces, so a large window no longer demands
+- HTTP(S) prefetch now runs as persistent streaming workers: each worker holds
+  one open-ended GET (`bytes=anchor-`) so the origin seeks once per worker and
+  the flows run at path bandwidth, instead of re-paying a round trip and a
+  server seek on every 4 MiB piece. Stripes are handed to the reader and
+  appended in frontier order, backpressure is TCP itself (the worker stops
+  reading its socket when the window is full), and seeks re-anchor the
+  workers through an epoch counter. A body error reconnects at the reached
+  offset with the entity validator replayed; past a few fruitless reconnects
+  the read falls back to the synchronous capped path.
+- The rewind budget is host-tunable via `http_back_buffer_bytes` on the open
+  options (the first reserved slot — ABI and layout unchanged; zero keeps the
+  16 MiB default). Hosts playing high-bitrate media should size it from the
+  bitrate: a -10 s skip at 71 Mbps covers ~89 MB, which the fixed default
+  could not hold.
+- Capped HTTP(S) request bodies at 4 MiB so a large window no longer demands
   unrealistic sustained bandwidth (a single 32 MiB request needed ~18 Mbps to
-  survive ureq's 15 s body deadline) and slow origins now buffer instead of
-  failing playback. Failed background prefetches degrade to synchronous fetches
-  instead of killing the read, and an origin that keeps delivering bytes
-  licenses more resume attempts than the flat three-attempt rule.
-- Kept a bounded 16 MiB tail of already-played data so a small rewind is served
-  from cache instead of re-fetching, and re-anchored the window for far seeks
-  instead of discarding in-flight prefetches.
+  survive ureq's 15 s body deadline); failed background work degrades to
+  synchronous fetches instead of killing the read, and an origin that keeps
+  delivering bytes licenses more resume attempts than the flat three-attempt
+  rule.
 - Surface the media source's own error (HTTP status, timeout) in demux errors
   rather than a bare `Input/output error (-5)`.
+### Renderer
+
+#### Dolby Vision and HDR tone mapping
+
+- Dolby Vision RPU mapping via libplacebo-style piecewise polynomial/MMR
+  reshaping, followed by the RPU nonlinear matrix, PQ linearization, and
+  LMS→RGB composite. Profile 5/8 VUI tags are forced to BT.2020/PQ.
+- Profile 5 falls back to software decode on mobile backends (MediaCodec /
+  generic AvCodec) that cannot attach RPU side data to hardware frames;
+  VideoToolbox and D3D11VA keep hardware decode.
+- Profile 7 FEL/MEL RPUs are no longer rejected outright. An RPU whose
+  `disable_residual_flag` asks for an enhancement layer still applies its
+  base-layer reshaping curves, color matrices, and L1 trims — dropping the
+  whole RPU threw those away and left the frame as plain HDR10. The
+  un-composable residual is reported through the new `Frame::dovi_el_status()`
+  and one throttled `dovi_el_not_composed` diagnostic per stream, matching
+  libplacebo's split between `nlq_active` and "consumers that have not bound an
+  enhancement layer must not look at these fields".
+- Per-frame Dolby Vision L1 brightness (`min_pq`/`max_pq`/`avg_pq`) drives the
+  tone-map source peak and scene-average pivot; the static mastering-display
+  (L0) peak still decides output-mode negotiation and whether tone mapping /
+  the perceptual gamut LUT are enabled.
+- Tone mapping switched to a libplacebo-style IPT-domain color map with
+  **BT.2390 EETF as the default** operator, plus spline, BT.2446 method A,
+  SMPTE ST 2094-10, Mobius, Reinhard, and clip. Black-point compensation uses
+  `target black = target peak / contrast_ratio` (auto 1000:1 for SDR).
+- Perceptual gamut mapping via a CPU-generated 48×32×256 IPT 3D LUT
+  (following libplacebo's lattice and index mapping) when a tone-mapped HDR
+  source is compressed into a smaller gamut; generated on a background thread
+  so the first wide-gamut frame does not stall the render thread. Chroma
+  rolloff is currently a simplified dead-zone blend rather than libplacebo's
+  full per-hue boundary search.
+- Scene-adaptive HDR10: software-decoded PQ frames without DoVi L1 get a
+  CPU-measured scene-average luminance (`luma_stats`) that drives the
+  tone-map pivot, mirroring mpv's `--hdr-compute-peak`.
+- Metal EDR negotiation reads the presenting screen rather than
+  `NSScreen.mainScreen`, and Auto HDR is decided from that display's
+  capability. Callers must set `CAMetalLayer.delegate` (examples updated).
+- Metal: the perceptual gamut LUT is only marked active when the texture
+  resolved for the frame actually matches its (source, target, target-peak)
+  key. A headroom or primaries change while a new LUT generates used to bind
+  the 1x1x1 placeholder with `gamut_lut_enabled` still set, rendering black
+  frames until generation finished. D3D11 now masks the uniform the same way
+  while its LUT is still generating.
+- ST 2094-10 tone mapping picks its knee in the PQ domain, matching
+  libplacebo's internal rescale, and `ToneMapConfig::curve_param` now tunes
+  its knee adaptation (default 0.70, libplacebo's `param_def`). Previously the
+  parameter had no effect and the knee was selected in linear nits.
+- The tone map, its black-point compensation, and the perceptual gamut LUT are
+  enabled from the static mastering-display (L0) peak rather than the
+  per-frame Dolby Vision L1 peak, so dark scenes no longer drop them for a
+  frame and then restore them.
+- Metal EDR / extended-linear output linearizes subtitle and danmaku colors
+  before compositing into the linear drawable; previously they were written
+  gamma-encoded, making mid-tones and colored text too bright.
+- HDR10 scene-luma measurement honors the frame's color range: limited (TV)
+  range luma planes are expanded over the legal code span like the shaders'
+  `expand_ycbcr_range`, instead of being measured as full range. The
+  measurement also distinguishes `yuv420p10le` (10-bit code in bits `[9:0]`)
+  from P010 (left-aligned in `[15:6]`); treating both as P010 measured
+  software Main10 HDR10 as near-black.
+- The perceptual gamut LUT's I axis now spans the target's `[black, peak]` in
+  PQ codes (libplacebo's `gamut.min_luma`/`max_luma`) instead of
+  `[0, peak]`; generation and all three backends' samplers agree, and the
+  cache key includes the target black, so a `contrast_ratio` change
+  regenerates the LUT. SDR targets shift their gamut mapping by up to ~3.5%
+  of the I axis; HDR/EDR targets are unchanged (black = 0).
+- A degenerate ST 2094-10 anchor set (duplicated/non-finite points) falls back
+  to the identity curve (Clip) instead of zero coefficients, which the shader
+  would have rendered as a black frame.
 
 ## 0.1.8 - 2026-09-07
 
