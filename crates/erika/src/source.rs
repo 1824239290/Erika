@@ -1866,9 +1866,13 @@ impl MediaSource for HttpRangeSource {
         // bytes from `cache_end` onward -- wait for them instead of issuing a
         // duplicate download. A read behind the cache (a rewind) skips the
         // wait: re-anchoring in the fetch below handles it. Dead or stalled
-        // streams hand the wait back to the synchronous path.
+        // streams hand the wait back to the synchronous path. A read that ends
+        // farther ahead than a fetch could ever cover is skipped too: the
+        // workers stop at the read-ahead boundary, so the wait could only burn
+        // the stall clock before `fetch_missing` re-anchors at the read.
         let waiting_end = range.start.saturating_add(range.length.unwrap_or(0));
         if waiting_end > self.cache_end()
+            && waiting_end <= self.cache_end().saturating_add(HTTP_REQUEST_MAX_BYTES)
             && self.wait_for_stream_coverage(waiting_end)
             && let Some(bytes) = self.cached_slice(range)
         {
@@ -3206,6 +3210,66 @@ mod tests {
                 read_start + index as u64
             );
         }
+    }
+
+    #[test]
+    fn http_stream_far_forward_read_reanchors_without_the_stall_wait() {
+        // A read far beyond the window (a demuxer probing the tail, a large
+        // forward seek) can never be covered by the streams: the workers stop
+        // at the read-ahead boundary. It must skip the coverage wait and
+        // re-anchor immediately, not burn the full HTTP_STREAM_STALL clock on
+        // a wait that cannot succeed. The window is 8 MiB (two stripe budgets
+        // in flight), so any far-forward read sees the workers paused.
+        let total = 128 * 1024 * 1024u64;
+        let (uri, _in_flight, _max_in_flight, heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(8 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+
+        // The first read anchors the window and spawns the workers; the far
+        // read follows immediately, before the workers could have drained the
+        // whole file into the cache.
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(64 * 1024)
+                })
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+
+        let far_start = total - 4096;
+        let started = Instant::now();
+        let bytes = source
+            .read_range(ByteRange {
+                start: far_start,
+                length: Some(4096),
+            })
+            .expect("a far-forward read must re-anchor instead of stalling");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "far-forward read took {:?} (the stall wait is 20s)",
+            started.elapsed()
+        );
+        assert_eq!(bytes.len(), 4096);
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, ((far_start + index as u64) % 251) as u8);
+        }
+        // The read was served by a synchronous re-anchor at the far position,
+        // not by draining a window the workers could never cover.
+        let expected = format!("range: bytes={far_start}-{}", far_start + 4095);
+        let heads = heads.lock().unwrap();
+        assert!(
+            heads
+                .iter()
+                .any(|head| head.to_lowercase().contains(&expected)),
+            "a re-anchor request must be issued for the far position: {heads:?}"
+        );
     }
 
     #[test]
