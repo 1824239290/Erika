@@ -1351,6 +1351,11 @@ impl D3d11Renderer {
                 surface.output_texture = None;
             }
         }
+        // The cached LUT SRV belongs to the previous device, and D3D11 cannot
+        // bind a resource across devices. Drop it even when the key is
+        // unchanged: the CPU-side `gamut_lut_job` only holds parameters, so a
+        // later frame regenerates the texture on the new device and reuses it.
+        self.gamut_lut = None;
         self.state = Some(state);
         self.recreate_surface_targets()?;
         Ok(())
