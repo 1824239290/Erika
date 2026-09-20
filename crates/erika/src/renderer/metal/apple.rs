@@ -61,7 +61,7 @@ use crate::renderer::metal::{
     metal_target_color,
 };
 use crate::renderer::output::negotiate_output_mode;
-use crate::renderer::pipeline::{ColorRange, DoviUniforms, LumaUpscalerMode, ToneMapOperator};
+use crate::renderer::pipeline::{ColorRange, DoviUniforms, LumaUpscalerMode};
 use crate::renderer::pipeline::{SourceColorState, TargetColorState, VideoRenderPipeline};
 use crate::renderer::presentation::PresentationLayout as VideoPresentationLayout;
 use crate::subtitle::{AssColor, SubtitleAlphaBitmap};
@@ -1182,7 +1182,7 @@ impl MetalRendererImpl {
                 full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
                 source_transfer: transfer_code(frame.pipeline.source.transfer),
                 target_transfer: transfer_code(frame.pipeline.target.transfer),
-                tone_map: tone_map_code(frame.pipeline.tone_map.operator),
+                tone_map: frame.pipeline.tone_map_uniform_code(),
                 edr_output: self.output_mode.is_edr() as u32,
                 _reserved0: self.video_alpha_mode as u32,
                 _reserved1: 0,
@@ -1403,7 +1403,7 @@ impl MetalRendererImpl {
                 full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
                 source_transfer: transfer_code(frame.pipeline.source.transfer),
                 target_transfer: transfer_code(frame.pipeline.target.transfer),
-                tone_map: tone_map_code(frame.pipeline.tone_map.operator),
+                tone_map: frame.pipeline.tone_map_uniform_code(),
                 edr_output: self.output_mode.is_edr() as u32,
                 _reserved0: 0,
                 _reserved1: 0,
@@ -2743,18 +2743,6 @@ fn ui_output_nits(target: TargetColorState, edr_output: bool) -> [f32; 4] {
         0.0,
         0.0,
     ]
-}
-
-fn tone_map_code(operator: ToneMapOperator) -> u32 {
-    match operator {
-        ToneMapOperator::Clip => 0,
-        ToneMapOperator::Reinhard => 1,
-        ToneMapOperator::Mobius => 2,
-        ToneMapOperator::Bt2390 => 3,
-        ToneMapOperator::Spline => 4,
-        ToneMapOperator::Bt2446a => 5,
-        ToneMapOperator::St209410 => 6,
-    }
 }
 
 fn luma_coefficients(coeffs: crate::renderer::pipeline::LumaCoefficients) -> [f32; 4] {

@@ -1181,6 +1181,21 @@ impl VideoRenderPipeline {
         requires_tone_mapping(self.source, self.target)
             && resolve_primaries(self.source.primaries) != resolve_primaries(self.target.primaries)
     }
+
+    /// Operator code for the shaders' `tone_map` uniform.
+    ///
+    /// Zero (Clip, an identity curve) whenever this pipeline does not tone
+    /// map, so a Reinhard/Mobius selection cannot alter SDR->SDR content.
+    /// The configured operator would otherwise run unconditionally: the
+    /// shaders only branch on the code, and `tone_map_extra`'s black point
+    /// is already gated the same way.
+    pub fn tone_map_uniform_code(&self) -> u32 {
+        if requires_tone_mapping(self.source, self.target) {
+            tone_map_code(self.tone_map.operator)
+        } else {
+            tone_map_code(ToneMapOperator::Clip)
+        }
+    }
 }
 
 impl Default for VideoRenderPipeline {
@@ -1251,7 +1266,7 @@ impl VideoUniforms {
             full_range: u32::from(matches!(pipeline.source.range, ColorRange::Full)),
             source_transfer: transfer_code(pipeline.source.transfer),
             target_transfer: transfer_code(pipeline.target.transfer),
-            tone_map: tone_map_code(pipeline.tone_map.operator),
+            tone_map: pipeline.tone_map_uniform_code(),
             edr_output: u32::from(edr_output),
             input_mode: 0,
             scene_linear: 0,
@@ -2107,6 +2122,43 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn tone_map_uniform_code_skips_the_curve_for_unmapped_content() {
+        // SDR -> SDR needs no tone mapping, so the shader must receive Clip
+        // (an identity curve) rather than the selected operator: running
+        // Reinhard here brightened an SDR 100-nit grey from ~130 to ~175 in
+        // the review's readback.
+        let source = SourceColorState::new(ColorPrimaries::Bt709, TransferFunction::Srgb);
+        let target = TargetColorState::sdr(ColorPrimaries::Bt709);
+        let mut pipeline = VideoRenderPipeline::new(source, target);
+        assert!(!pipeline.requires_tone_mapping());
+        pipeline.tone_map.operator = ToneMapOperator::Reinhard;
+        assert_eq!(
+            pipeline.tone_map_uniform_code(),
+            tone_map_code(ToneMapOperator::Clip)
+        );
+        assert_eq!(
+            VideoUniforms::from_pipeline(&pipeline, false, false).tone_map,
+            0,
+            "the shader must see the identity curve"
+        );
+
+        // An HDR source that overshoots the target keeps the operator so the
+        // curve actually runs.
+        let hdr_source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+        let mut hdr_pipeline = VideoRenderPipeline::new(
+            hdr_source,
+            TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt709),
+        );
+        assert!(hdr_pipeline.requires_tone_mapping());
+        hdr_pipeline.tone_map.operator = ToneMapOperator::Reinhard;
+        assert_eq!(
+            hdr_pipeline.tone_map_uniform_code(),
+            tone_map_code(ToneMapOperator::Reinhard)
+        );
+    }
+
     #[test]
     fn bt2390_curve_anchors_and_monotonicity() {
         let (source_peak, target_peak, black) = (1000.0_f32, 100.0_f32, 0.203_f32);
