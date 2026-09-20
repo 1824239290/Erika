@@ -1897,13 +1897,20 @@ impl MediaSource for HttpRangeSource {
         // bytes from `cache_end` onward -- wait for them instead of issuing a
         // duplicate download. A read behind the cache (a rewind) skips the
         // wait: re-anchoring in the fetch below handles it. Dead or stalled
-        // streams hand the wait back to the synchronous path. A read that ends
-        // farther ahead than a fetch could ever cover is skipped too: the
-        // workers stop at the read-ahead boundary, so the wait could only burn
-        // the stall clock before `fetch_missing` re-anchors at the read.
+        // streams hand the wait back to the synchronous path.
+        //
+        // The skip is keyed off the read's *start*, matching the boundary
+        // `fetch_missing` re-anchors at: the wait is skipped exactly when the
+        // fetch will re-anchor, so there is no band where the wait is skipped
+        // *and* the fetch fills from `cache_end` -- which would re-download the
+        // range the workers are already delivering (and `drain_stripes` would
+        // then discard their copy as overlap). Keying it off the read's *end*
+        // opened that band for any read longer than one request cap. A read
+        // that jumps farther ahead than the fetch could cover re-anchors at the
+        // read instead, so waiting for it could only burn the stall clock.
         let waiting_end = range.start.saturating_add(range.length.unwrap_or(0));
         if waiting_end > self.cache_end()
-            && waiting_end <= self.cache_end().saturating_add(HTTP_REQUEST_MAX_BYTES)
+            && range.start <= self.cache_end().saturating_add(HTTP_REQUEST_MAX_BYTES)
             && self.wait_for_stream_coverage(waiting_end)
             && let Some(bytes) = self.cached_slice(range)
         {
@@ -2801,6 +2808,63 @@ mod tests {
             assert!(
                 range_line.trim_end().ends_with('-'),
                 "worker GETs must be open-ended: {range_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_read_past_the_request_cap_is_still_covered_by_the_streams() {
+        // A read that starts inside the window but ends past `cache_end +
+        // HTTP_REQUEST_MAX_BYTES` must be served by the streaming workers too.
+        // The wait was keyed off the read's *end* while the re-anchor was keyed
+        // off its *start*, so this read skipped the wait and `fetch_missing`
+        // re-downloaded the gap from `cache_end` -- the very range the workers
+        // were delivering, which `drain_stripes` then discarded as overlap.
+        // The origin saw the bytes twice and the demuxer thread blocked for the
+        // whole synchronous fill.
+        let total = 64 * 1024 * 1024u64;
+        let (uri, _in_flight, _max, heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 1024 * 1024];
+        source.ensure_streams();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && heads.lock().unwrap().len() < 2 {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Starts at the cache end and runs 8 MiB: two request caps past it.
+        let read_start = 1024 * 1024u64;
+        let read_length = 8 * 1024 * 1024u64;
+        let bytes = source
+            .read_range(ByteRange {
+                start: read_start,
+                length: Some(read_length),
+            })
+            .expect("the streams must cover a read that starts inside the window");
+        assert_eq!(bytes.len() as u64, read_length);
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, ((read_start + index as u64) % 251) as u8);
+        }
+
+        // Only the two open-ended worker GETs: a closed-range request here
+        // means the read was re-downloaded instead of waited for.
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 2, "heads: {heads:?}");
+        for head in heads.iter() {
+            let lower = head.to_lowercase();
+            let range_line = lower
+                .lines()
+                .find(|line| line.starts_with("range:"))
+                .unwrap_or_default();
+            assert!(
+                range_line.trim_end().ends_with('-'),
+                "a closed-range request means the read was re-downloaded: {range_line}"
             );
         }
     }
