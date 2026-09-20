@@ -221,6 +221,8 @@ pub struct MetalRendererStats {
     pub edr_rendered_frames: u64,
     pub sdr_tonemap_frames: u64,
     pub output_mode_switches: u64,
+    /// Host headroom reports accepted by `set_output_headroom`.
+    pub headroom_updates: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1134,7 +1136,7 @@ impl RendererBackend for MetalRenderer {
             fallback_reason: OutputFallbackReason::None,
             fallback_count: 0,
             data_space_failures: 0,
-            headroom_updates: 0,
+            headroom_updates: stats.headroom_updates,
             extended_linear_frames: stats.edr_rendered_frames,
         }
     }
@@ -1147,6 +1149,22 @@ impl RendererBackend for MetalRenderer {
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         {
             let _ = mode;
+        }
+    }
+
+    /// Caches the display headroom the host resolved on the main thread.
+    ///
+    /// `MetalRendererImpl::select_output_mode_for_source` runs on the render
+    /// thread and must not query AppKit, so the host owns the `NSView` /
+    /// `NSScreen` lookup and pushes the result here.
+    fn set_output_headroom(&mut self, headroom: f32, known: bool) {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.set_output_headroom(headroom, known);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            let _ = (headroom, known);
         }
     }
 }

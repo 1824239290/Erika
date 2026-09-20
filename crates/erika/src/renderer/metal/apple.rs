@@ -194,6 +194,16 @@ pub struct MetalRendererImpl {
     gamut_lut_job: Option<GamutLutJob>,
     dummy_gamut_lut: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     logged_first_video_frame: bool,
+    /// EDR headroom of the display the layer is presented on, published by
+    /// the host through `RendererBackend::set_output_headroom`.
+    ///
+    /// Read here instead of querying AppKit: `select_output_mode_for_source`
+    /// runs on the render thread (CVDisplayLink or the host's render queue),
+    /// where touching `NSView`/`NSWindow`/`NSApplication` violates AppKit's
+    /// main-thread requirement. `None` means no host has reported a value
+    /// yet, which negotiates as SDR — the same fallback this used when AppKit
+    /// could not answer.
+    reported_display_headroom: Option<f32>,
 }
 
 fn hdr_debug_enabled() -> bool {
@@ -268,6 +278,7 @@ impl MetalRendererImpl {
             gamut_lut_job: None,
             dummy_gamut_lut: None,
             logged_first_video_frame: false,
+            reported_display_headroom: None,
         })
     }
 
@@ -450,67 +461,28 @@ impl MetalRendererImpl {
             )
     }
 
-    /// EDR headroom of the display the player window is presented on.
+    /// EDR headroom of the display the player window is presented on, as
+    /// published by the host through `RendererBackend::set_output_headroom`.
     ///
-    /// The *potential* value is used deliberately: it reports what the display
-    /// can do regardless of the current brightness setting, so playback does
-    /// not flip between SDR and EDR while the brightness slider moves. Falls
-    /// back to 1.0 (no EDR) when AppKit cannot answer. Resolved through the
-    /// layer's hosting window: `NSScreen.mainScreen` tracks the systemwide
-    /// key window, which belongs to a *different* app whenever this one is
-    /// inactive — negotiating from it then enables PQ passthrough while the
-    /// layer sits on an SDR display, rendering washed-out colors. AppKit
-    /// makes the hosting NSView the delegate of a view-assigned backing
-    /// layer, so prefer delegate→window→screen and fall back to mainScreen
-    /// when that chain is unavailable (e.g. detached layers).
-    #[cfg(target_os = "macos")]
+    /// The host resolves this on the main thread (it owns the `NSView` and
+    /// knows which screen the window is on) and pushes it here; querying
+    /// AppKit from this renderer would run on the render thread and violate
+    /// AppKit's main-thread requirement. No report yet negotiates as SDR.
     fn display_edr_headroom(&self) -> f32 {
-        use objc2::msg_send;
-        use objc2::runtime::{AnyClass, AnyObject};
-        use objc2::sel;
+        self.reported_display_headroom.unwrap_or(1.0)
+    }
 
-        unsafe {
-            let screen: Option<Retained<AnyObject>> = self
-                .layer
-                .as_ref()
-                .and_then(|layer| {
-                    let layer_obj: &AnyObject = layer;
-                    if let Some(screen) = screen_from_layer_delegate(layer_obj) {
-                        return Some(screen);
-                    }
-                    let mut curr: Option<Retained<AnyObject>> = msg_send![layer_obj, superlayer];
-                    while let Some(parent) = curr {
-                        if let Some(screen) = screen_from_layer_delegate(&parent) {
-                            return Some(screen);
-                        }
-                        curr = msg_send![&parent, superlayer];
-                    }
-                    if let Some(screen) = screen_from_app_windows(layer_obj) {
-                        return Some(screen);
-                    }
-                    None
-                })
-                .or_else(|| {
-                    let class = AnyClass::get(c"NSScreen")?;
-                    msg_send![class, mainScreen]
-                });
-            let Some(screen) = screen else {
-                return 1.0;
-            };
-            let selector = sel!(maximumPotentialExtendedDynamicRangeColorComponentValue);
-            let responds: bool = msg_send![&screen, respondsToSelector: selector];
-            if !responds {
-                return 1.0;
-            }
-            let potential: f64 = msg_send![
-                &screen,
-                maximumPotentialExtendedDynamicRangeColorComponentValue
-            ];
-            if potential.is_finite() && potential > 0.0 {
-                potential as f32
-            } else {
-                1.0
-            }
+    /// Records a host-reported display headroom. `known == false` clears the
+    /// cache so negotiation falls back to SDR until a real value arrives.
+    pub fn set_output_headroom(&mut self, headroom: f32, known: bool) {
+        let resolved = if known && headroom.is_finite() && headroom > 0.0 {
+            Some(headroom)
+        } else {
+            None
+        };
+        if resolved != self.reported_display_headroom {
+            self.reported_display_headroom = resolved;
+            self.stats.headroom_updates = self.stats.headroom_updates.saturating_add(1);
         }
     }
 
@@ -2515,86 +2487,6 @@ fn configure_layer_dynamic_range(layer: &CAMetalLayer, enabled: bool) {
     }
 }
 
-#[cfg(target_os = "macos")]
-unsafe fn screen_from_layer_delegate(
-    layer: &objc2::runtime::AnyObject,
-) -> Option<objc2::rc::Retained<objc2::runtime::AnyObject>> {
-    use objc2::msg_send;
-    use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject};
-    let delegate: Option<Retained<AnyObject>> = msg_send![layer, delegate];
-    let delegate = delegate?;
-    let view_class = AnyClass::get(c"NSView")?;
-    let is_view: bool = msg_send![&delegate, isKindOfClass: view_class];
-    if !is_view {
-        return None;
-    }
-    let window: Option<Retained<AnyObject>> = msg_send![&delegate, window];
-    let window = window?;
-    let screen: Option<Retained<AnyObject>> = msg_send![&window, screen];
-    screen
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn screen_from_app_windows(
-    target_layer: &objc2::runtime::AnyObject,
-) -> Option<objc2::rc::Retained<objc2::runtime::AnyObject>> {
-    use objc2::msg_send;
-    use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject};
-    let app_class = AnyClass::get(c"NSApplication")?;
-    let app: Option<Retained<AnyObject>> = msg_send![app_class, sharedApplication];
-    let app = app?;
-    let windows: Option<Retained<AnyObject>> = msg_send![&app, windows];
-    let windows = windows?;
-    let count: usize = msg_send![&windows, count];
-    for i in 0..count {
-        let window: Retained<AnyObject> = msg_send![&windows, objectAtIndex: i];
-        let content_view: Option<Retained<AnyObject>> = msg_send![&window, contentView];
-        if let Some(content_view) = content_view {
-            if unsafe { view_contains_layer(&content_view, target_layer) } {
-                let screen: Option<Retained<AnyObject>> = msg_send![&window, screen];
-                return screen;
-            }
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn view_contains_layer(
-    view: &objc2::runtime::AnyObject,
-    target_layer: &objc2::runtime::AnyObject,
-) -> bool {
-    use objc2::msg_send;
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    let view_layer: Option<Retained<AnyObject>> = msg_send![view, layer];
-    if let Some(vl) = view_layer {
-        if Retained::as_ptr(&vl) == target_layer as *const AnyObject {
-            return true;
-        }
-        let mut curr: Option<Retained<AnyObject>> = msg_send![target_layer, superlayer];
-        while let Some(parent) = curr {
-            if Retained::as_ptr(&parent) == Retained::as_ptr(&vl) {
-                return true;
-            }
-            curr = msg_send![&parent, superlayer];
-        }
-    }
-    let subviews: Option<Retained<AnyObject>> = msg_send![view, subviews];
-    if let Some(subviews) = subviews {
-        let count: usize = msg_send![&subviews, count];
-        for i in 0..count {
-            let subview: Retained<AnyObject> = msg_send![&subviews, objectAtIndex: i];
-            if unsafe { view_contains_layer(&subview, target_layer) } {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct VideoUniforms {
@@ -4526,6 +4418,48 @@ mod tests {
         renderer
             .danmaku_batch_pipeline_state()
             .expect("dual-atlas danmaku pipeline");
+    }
+
+    #[test]
+    fn reported_display_headroom_drives_output_mode_negotiation() {
+        // The renderer negotiates on the render thread, where AppKit must not
+        // be touched, so it consumes whatever the host published from the main
+        // thread. A missing report negotiates as SDR, exactly like the AppKit
+        // fallback it replaced.
+        let config = crate::renderer::metal::MetalRendererConfig {
+            output_mode: crate::renderer::metal::MetalOutputMode::auto(1.0),
+            ..crate::renderer::metal::MetalRendererConfig::default()
+        };
+        // Needs a real Metal device; skip rather than fail where there is none.
+        let Ok(mut renderer) = super::MetalRendererImpl::new(config) else {
+            eprintln!("skipping: no Metal device available");
+            return;
+        };
+        let hdr = crate::renderer::pipeline::SourceColorState::new(
+            ColorPrimaries::Bt2020,
+            TransferFunction::Pq,
+        );
+
+        assert_eq!(renderer.display_edr_headroom(), 1.0);
+        renderer.select_output_mode_for_source(hdr);
+        assert!(
+            !renderer.active_output_mode().is_edr(),
+            "an unreported display must not promote to EDR"
+        );
+
+        renderer.set_output_headroom(4.0, true);
+        assert_eq!(renderer.display_edr_headroom(), 4.0);
+        renderer.select_output_mode_for_source(hdr);
+        assert_eq!(
+            renderer.active_output_mode(),
+            crate::renderer::metal::MetalOutputMode::apple_edr(4.0)
+        );
+
+        // An unreported value clears the cache and returns to SDR.
+        renderer.set_output_headroom(4.0, false);
+        assert_eq!(renderer.display_edr_headroom(), 1.0);
+        renderer.select_output_mode_for_source(hdr);
+        assert!(!renderer.active_output_mode().is_edr());
     }
 
     #[test]

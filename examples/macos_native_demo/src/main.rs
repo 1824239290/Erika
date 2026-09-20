@@ -198,6 +198,20 @@ pub extern "C" fn erika_demo_attach_layer(layer: *mut c_void, width: u32, height
     });
 }
 
+/// Publishes the presenting display's EDR headroom.
+///
+/// The renderer negotiates its output mode on the render thread and no longer
+/// probes AppKit itself, so the AppKit side (the demo view) resolves the value
+/// on the main thread and pushes it here.
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_demo_set_display_headroom(headroom: f32, known: bool) {
+    DEMO.with(|demo| {
+        demo.borrow_mut()
+            .presenter
+            .set_output_headroom(headroom, known);
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn erika_demo_resize_layer(width: u32, height: u32, scale: f64) {
     DEMO.with(|demo| {

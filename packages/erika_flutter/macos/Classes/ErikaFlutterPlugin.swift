@@ -647,6 +647,7 @@ private final class ErikaNativeLibrary {
   ) -> Int32
   typealias ResizeSurfaceFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, Double) -> Int32
   typealias RenderTickFn = @convention(c) (UnsafeMutableRawPointer?, Double, UnsafeMutableRawPointer?) -> Int32
+  typealias SetOutputHeadroomFn = @convention(c) (UnsafeMutableRawPointer?, Float, Bool) -> Int32
   typealias CaptureFrameRgbaFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, UnsafeMutableRawPointer?, Int) -> Int32
   typealias PollEventFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias LastErrorMessageFn = @convention(c) () -> UnsafeMutablePointer<CChar>?
@@ -712,6 +713,7 @@ private final class ErikaNativeLibrary {
   let renderTick: RenderTickFn
   let captureFrameRgba: CaptureFrameRgbaFn?
   let pollEvent: PollEventFn
+  let setOutputHeadroom: SetOutputHeadroomFn?
   let lastErrorMessage: LastErrorMessageFn
   let stringFree: StringFreeFn
 
@@ -783,6 +785,7 @@ private final class ErikaNativeLibrary {
     renderTick = try Self.load("erika_presenter_render_tick", from: libraryHandle, as: RenderTickFn.self)
     captureFrameRgba = Self.loadOptional("erika_presenter_capture_frame_rgba", from: libraryHandle, as: CaptureFrameRgbaFn.self)
     pollEvent = try Self.load("erika_presenter_poll_event", from: libraryHandle, as: PollEventFn.self)
+    setOutputHeadroom = Self.loadOptional("erika_presenter_set_output_headroom", from: libraryHandle, as: SetOutputHeadroomFn.self)
     lastErrorMessage = try Self.load("erika_last_error_message", from: libraryHandle, as: LastErrorMessageFn.self)
     stringFree = try Self.load("erika_string_free", from: libraryHandle, as: StringFreeFn.self)
   }
@@ -1822,6 +1825,7 @@ private final class ErikaPlayerHost {
           operation: "attach_metal_layer"
         )
       }
+      reportDisplayHeadroom()
     } else {
       try withNativeCall {
         try check(
@@ -1829,6 +1833,23 @@ private final class ErikaPlayerHost {
           operation: "resize_surface"
         )
       }
+    }
+  }
+
+  /// Publishes the presenting display's EDR headroom to the renderer.
+  ///
+  /// The renderer negotiates its output mode on the render thread (the
+  /// CVDisplayLink callback), where AppKit must not be touched, so the value
+  /// is resolved here and pushed through the C ABI instead. Main thread only:
+  /// it reads the attached `NSView`'s screen.
+  private func reportDisplayHeadroom() {
+    guard let setOutputHeadroom = library.setOutputHeadroom,
+          let view = attachedView else {
+      return
+    }
+    let headroom = view.displayEdrHeadroom()
+    withNativeCall {
+      _ = setOutputHeadroom(handle, headroom, true)
     }
   }
 
@@ -1884,6 +1905,10 @@ private final class ErikaPlayerHost {
         object: nil,
         queue: .main
       ) { [weak self] _ in
+        // Screen parameters change without the display ID changing (the EDR
+        // capability of the same screen can move), so republish the headroom
+        // before the display-link retarget short-circuits.
+        self?.reportDisplayHeadroom()
         self?.retargetDisplayDriverIfScreenChanged()
       }
       displayConfigurationObservers.append(observer)
@@ -2170,6 +2195,23 @@ private func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CCh
   }
 }
 
+/// Potential EDR headroom of a screen: what it can do regardless of the
+/// current brightness setting, so playback does not flip between SDR and EDR
+/// while the brightness slider moves. 1.0 means no EDR.
+///
+/// Main thread only — `NSScreen` is AppKit.
+private func screenPotentialEdrHeadroom(_ screen: NSScreen?) -> Float {
+  guard let screen else {
+    return 1.0
+  }
+  let key = "maximumPotentialExtendedDynamicRangeColorComponentValue"
+  guard screen.responds(to: Selector((key))),
+        let number = screen.value(forKey: key) as? NSNumber else {
+    return 1.0
+  }
+  return max(1.0, number.floatValue)
+}
+
 private protocol ErikaMetalSurfaceView: AnyObject {
   var platformViewId: Int64 { get }
   var metalLayer: CAMetalLayer { get }
@@ -2179,6 +2221,11 @@ private protocol ErikaMetalSurfaceView: AnyObject {
 
   func updateDrawableSize()
   func pngSnapshotData() -> Data?
+
+  /// EDR headroom of the display this view is presented on. Main thread only:
+  /// the renderer consumes the reported value on its own thread and must not
+  /// query AppKit itself.
+  func displayEdrHeadroom() -> Float
 }
 
 private final class WeakErikaVideoPlatformViewBox {
@@ -2278,6 +2325,10 @@ final class ErikaVideoPlatformView: NSView, ErikaMetalSurfaceView {
 
   func pngSnapshotData() -> Data? {
     snapshotPngData(of: self)
+  }
+
+  func displayEdrHeadroom() -> Float {
+    screenPotentialEdrHeadroom(window?.screen)
   }
 }
 
@@ -2407,6 +2458,10 @@ final class ErikaWindowOverlayView: NSView, ErikaMetalSurfaceView {
 
   func pngSnapshotData() -> Data? {
     snapshotPngData(of: self)
+  }
+
+  func displayEdrHeadroom() -> Float {
+    screenPotentialEdrHeadroom(window?.screen)
   }
 }
 
@@ -3451,16 +3506,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       NSApp.keyWindow?.screen ??
       NSApp.mainWindow?.screen ??
       NSScreen.main
-    guard let screen else {
-      return 1.0
-    }
-
-    let key = "maximumPotentialExtendedDynamicRangeColorComponentValue"
-    guard screen.responds(to: Selector((key))),
-          let number = screen.value(forKey: key) as? NSNumber else {
-      return 1.0
-    }
-    return max(1.0, number.floatValue)
+    return screenPotentialEdrHeadroom(screen)
   }
 
   private func boolEnvironmentFlag(
