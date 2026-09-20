@@ -3454,6 +3454,14 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   private func presenterConfigForNewPlayer(arguments: Any?) throws -> ErikaPresenterConfigC {
     let alphaMode = (arguments as? [String: Any])
       .flatMap { int32Value($0["videoAlphaMode"]) } ?? 0
+    // An explicit disable must become SDR, not `auto(headroom: 1.0)`: under
+    // the per-presenting-display Auto negotiation a headroom of 1.0 means "no
+    // embedder cap, defer to the display", so an EDR display would promote
+    // again and ignore ERIKA_DISABLE_EDR.
+    let edrDisabled = boolEnvironmentFlag(
+      "ERIKA_DISABLE_EDR",
+      environment: ProcessInfo.processInfo.environment
+    )
     if let args = arguments as? [String: Any],
        let explicitMode = int32Value(args["outputMode"]) {
       let headroom = floatValue(args["edrHeadroom"]) ?? 4.0
@@ -3464,7 +3472,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       case 2:
         config = ErikaPresenterConfigC(outputMode: 2, edrHeadroom: max(1.0, headroom))
       case 3:
-        config = .auto(headroom: headroom)
+        config = edrDisabled ? .sdr : .auto(headroom: headroom)
       default:
         config = .sdr
       }
@@ -3472,7 +3480,12 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       return config
     }
 
-    let headroom = resolvedEdrHeadroom()
+    guard let headroom = resolvedEdrHeadroom() else {
+      NSLog("ErikaFlutterPlugin: ERIKA_DISABLE_EDR is set; using SDR output")
+      var config = ErikaPresenterConfigC.sdr
+      config.videoAlphaMode = alphaMode
+      return config
+    }
     NSLog("ErikaFlutterPlugin: using automatic Apple output, headroom \(headroom)x")
     let config = ErikaPresenterConfigC.auto(headroom: headroom)
     var alphaConfig = config
@@ -3480,10 +3493,12 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     return alphaConfig
   }
 
-  private func resolvedEdrHeadroom() -> Float {
+  /// EDR headroom to request for a new player, or `nil` when
+  /// `ERIKA_DISABLE_EDR` disables EDR and the player must use SDR.
+  private func resolvedEdrHeadroom() -> Float? {
     let environment = ProcessInfo.processInfo.environment
     if boolEnvironmentFlag("ERIKA_DISABLE_EDR", environment: environment) {
-      return 1.0
+      return nil
     }
     if let override = floatEnvironmentValue("ERIKA_EDR_HEADROOM", environment: environment),
        override > 1.0 {
