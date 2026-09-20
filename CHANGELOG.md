@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.1.9+dolby.streaming.dev - 2026-09-21
+
+Combines the Dolby Vision RPU mapping / HDR tone-gamut pipeline (PR #136) with
+the HTTP(S) persistent streaming-worker prefetch and request-cap / rewind-cache
+work (PR #139) on top of upstream main. Intended as a prebuilt kernel for host
+apps (OcPlayer) until both features land upstream.
 
 ### Renderer
 
