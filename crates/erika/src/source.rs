@@ -399,6 +399,10 @@ struct StreamInner {
     worker_failed: Vec<bool>,
     /// Slots whose failure the reader has already counted.
     failure_acked: Vec<bool>,
+    /// Next stripe index the reader will append (mirrors the reader's
+    /// `stream_frontier`). A worker reads it to keep backpressure from pausing
+    /// the very stripe the reader waits for.
+    frontier: u64,
     /// Body bytes received so far, for the reader's stall detection.
     progress_bytes: u64,
     last_progress: Instant,
@@ -582,11 +586,20 @@ impl HttpRangeSource {
             let handoff = {
                 let mut inner = lock_stream(&shared);
                 match inner.pending.remove(&self.stream_frontier) {
-                    Some(handoff) => handoff,
+                    Some(handoff) => {
+                        self.stream_frontier += 1;
+                        // Mirror the frontier for the workers: it is what keeps
+                        // backpressure from pausing the stripe the reader waits
+                        // for (see `stream_worker_main`). Wake them so a worker
+                        // whose stripe just became the frontier starts at once
+                        // instead of on its next poll timeout.
+                        inner.frontier = self.stream_frontier;
+                        shared.signal.notify_all();
+                        handoff
+                    }
                     None => break,
                 }
             };
-            self.stream_frontier += 1;
             if handoff.start >= self.cache_end() {
                 self.cache_bytes.extend_from_slice(&handoff.bytes);
             } else if let Ok(skip) = usize::try_from(self.cache_end() - handoff.start)
@@ -603,23 +616,34 @@ impl HttpRangeSource {
     /// throttles itself. The budget is measured from the consumer position,
     /// never from `cache_start`: the retained tail behind the reader must not
     /// count against the window or the streams would pause forever.
+    ///
+    /// The in-flight reserve (one stripe per worker, what each may still add
+    /// before it next observes the flag) is capped at half the window. Without
+    /// the cap a window smaller than the stripe budget -- the 2 MiB default
+    /// against 2 x 4 MiB -- would make `ahead >= read_ahead` hold from the
+    /// first byte, so the workers would never deliver and every frontier read
+    /// would burn the full stall clock before the synchronous fallback.
     fn update_stream_backpressure(&mut self) {
         let Some(shared) = self.streams.clone() else {
             return;
         };
-        let held = {
+        let (pending, reserve) = {
             let inner = lock_stream(&shared);
             let pending: u64 = inner
                 .pending
                 .values()
                 .map(|stripe| stripe.bytes.len() as u64)
                 .sum();
-            pending + inner.worker_count as u64 * inner.stripe_bytes
+            let reserve = (inner.worker_count as u64)
+                .saturating_mul(inner.stripe_bytes)
+                .min(self.read_ahead_bytes / 2);
+            (pending, reserve)
         };
         let ahead = self
             .cache_end()
             .saturating_sub(self.stream_reader_end)
-            .saturating_add(held);
+            .saturating_add(pending)
+            .saturating_add(reserve);
         let paused = ahead >= self.read_ahead_bytes;
         let mut inner = lock_stream(&shared);
         if inner.paused != paused {
@@ -701,6 +725,7 @@ impl HttpRangeSource {
                 worker_done: vec![false; worker_count],
                 worker_failed: vec![false; worker_count],
                 failure_acked: vec![false; worker_count],
+                frontier: 0,
                 progress_bytes: 0,
                 last_progress: Instant::now(),
                 paused: false,
@@ -1058,7 +1083,13 @@ fn stream_worker_main(
             if inner.stopped || inner.epoch != epoch {
                 return;
             }
-            if !inner.paused {
+            // Backpressure pauses production, but never the stripe the reader
+            // is waiting for: the cache only ever appends the frontier index,
+            // so a paused frontier owner would block the frontier -- and with
+            // it every other worker, whose stripes sit behind the gap -- for
+            // as long as the window stays full. A worker whose stripe is
+            // already ahead of the frontier still pauses.
+            if !inner.paused || stripe_index == inner.frontier {
                 break;
             }
             let _ = shared
@@ -2155,10 +2186,6 @@ mod tests {
                 delay: Duration::ZERO,
                 raw,
             }
-        }
-
-        fn delayed(delay: Duration, raw: Vec<u8>) -> Self {
-            Self { delay, raw }
         }
     }
 
@@ -3269,6 +3296,91 @@ mod tests {
                 .iter()
                 .any(|head| head.to_lowercase().contains(&expected)),
             "a re-anchor request must be issued for the far position: {heads:?}"
+        );
+    }
+
+    #[test]
+    fn http_default_window_keeps_the_streams_delivering() {
+        // The default 2 MiB window is smaller than the workers' in-flight
+        // stripe budget (2 x 4 MiB). The backpressure reserve must be capped so
+        // `ahead >= read_ahead` can still become false, or the streams never
+        // deliver and every frontier read burns the full HTTP_STREAM_STALL
+        // clock (20 s) before the synchronous fallback -- a sequential run
+        // past the first window then freezes for 20 s per window.
+        let total = 32 * 1024 * 1024u64;
+        let (uri, _in_flight, _max, heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+
+        let started = Instant::now();
+        let mut offset = 0u64;
+        while offset < 8 * 1024 * 1024 {
+            let bytes = source
+                .read_range(ByteRange {
+                    start: offset,
+                    length: Some(64 * 1024),
+                })
+                .unwrap();
+            assert_eq!(bytes.len(), 64 * 1024);
+            offset += 64 * 1024;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "default-window sequential reads took {:?}: the 20 s stall clock means the streams never delivered",
+            started.elapsed()
+        );
+        // The run must be served by the open-ended stream GETs, not only by the
+        // capped synchronous fallback (which requests a closed range).
+        let heads = heads.lock().unwrap();
+        assert!(
+            heads.iter().any(|head| head
+                .to_lowercase()
+                .lines()
+                .any(|line| line.starts_with("range:") && line.trim_end().ends_with('-'))),
+            "the default window must keep the streaming workers delivering: {heads:?}"
+        );
+    }
+
+    #[test]
+    fn http_small_window_backpressure_still_leaves_room_for_the_streams() {
+        // Pin the reserve cap directly: with the default 2 MiB window and the
+        // 2 x 4 MiB stripe budget, an *empty* cache must not read as "window
+        // full". Without the cap the predicate holds from the first byte, the
+        // streams never deliver in parallel, and the frontier-aware pause --
+        // which keeps playback alive -- serializes prefetch to one flow.
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            "https://example.invalid/video.mp4",
+            Vec::new(),
+            Some(2 * 1024 * 1024),
+        );
+        source.content_length = Some(64 * 1024 * 1024);
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 1024 * 1024];
+        source.stream_reader_end = source.cache_end();
+        let worker_count = http_stream_workers();
+        source.streams = Some(Arc::new(StreamShared {
+            inner: Mutex::new(StreamInner {
+                epoch: 1,
+                worker_count,
+                stripe_bytes: HTTP_STREAM_STRIPE_BYTES,
+                pending: BTreeMap::new(),
+                worker_done: vec![false; worker_count],
+                worker_failed: vec![false; worker_count],
+                failure_acked: vec![false; worker_count],
+                frontier: 0,
+                progress_bytes: 0,
+                last_progress: Instant::now(),
+                paused: true,
+                stopped: false,
+            }),
+            signal: Condvar::new(),
+        }));
+
+        source.update_stream_backpressure();
+        let shared = source.streams.clone().unwrap();
+        assert!(
+            !lock_stream(&shared).paused,
+            "the in-flight reserve alone must not report a 2 MiB window full"
         );
     }
 
