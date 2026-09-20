@@ -129,6 +129,9 @@ pub fn export_gif(options: &GifExportOptions) -> Result<GifExportResult> {
         options.input.source_hint,
         options.input.http_headers.clone(),
         options.input.http_read_ahead_bytes,
+        // The export walks one bounded range forward, so it keeps the default
+        // rewind budget: `ErikaGifExportOptions` exposes no knob for it.
+        None,
     )
     .map_err(|error| ExportError::Source(error.to_string()))?;
     let mut demuxer = Demuxer::open_source(source).map_err(ffmpeg_error)?;
