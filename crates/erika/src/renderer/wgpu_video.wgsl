@@ -188,24 +188,40 @@ fn tone_map_curve_pq(x_in: f32, param: f32) -> f32 {
     }
     if (uniforms.tone_map == 1u) {
         // Reinhard (output-relative, libplacebo pl_tone_map_reinhard).
-        let peak = in_max / out_range;
+        //
+        // libplacebo evaluates this curve in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators (BT.2390, spline, ST 2094-10)
+        // work on encoded values. Running it on PQ codes bends the curve's
+        // meaning: against a 1000->203 nit target mid-tones darken badly, and
+        // the Mobius knee lands far below its intended position. Rescale to
+        // linear nits here and encode back at the end.
+        let in_max_nits = max(src_peak, 0.000001);
+        let out_min_nits = dst_black;
+        let out_range_nits = max(dst_peak - dst_black, 0.000001);
+        let peak = in_max_nits / out_range_nits;
         let contrast = select(0.5, param, param > 0.0);
         let offset = (1.0 - contrast) / max(contrast, 0.000001);
         let scale = (peak + offset) / peak;
-        let t = x / out_range;
+        let t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
         let mapped = t / (t + offset) * scale;
-        return mapped * out_range + out_min;
+        return pq_code(mapped * out_range_nits + out_min_nits);
     }
     if (uniforms.tone_map == 2u) {
-        // Mobius: Möbius transform with a 1:1 linear region below the knee.
-        let peak = in_max / out_range;
+        // Mobius: Möbius transform with a 1:1 linear region below the knee,
+        // also evaluated in linear nits (see the Reinhard note above). The
+        // knee j is relative to the output range, so the linear region ends
+        // at dst_black + j * (dst_peak - dst_black).
+        let in_max_nits = max(src_peak, 0.000001);
+        let out_min_nits = dst_black;
+        let out_range_nits = max(dst_peak - dst_black, 0.000001);
+        let peak = in_max_nits / out_range_nits;
         let j = select(0.3, param, param > 0.0);
         let a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
         let b = (j * j - 2.0 * j * peak + peak) / max(peak - 1.0, 0.000001);
         let scale = (b * b + 2.0 * b * j + j * j) / (b - a);
-        let t = x / out_range;
+        let t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
         let mapped = select(t, scale * (t + a) / (t + b), t > j);
-        return mapped * out_range + out_min;
+        return pq_code(mapped * out_range_nits + out_min_nits);
     }
     if (uniforms.tone_map == 3u) {
         // ITU-R BT.2390 EETF with black-point compensation (the libplacebo

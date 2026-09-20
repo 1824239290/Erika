@@ -5895,27 +5895,21 @@ mod tests {
     }
 
     fn ref_tone_map(nits: [f32; 3], u: &VideoUniforms) -> [f32; 3] {
-        let source_peak = u.nits[0].max(1.0);
+        // Modeled for the configurations this suite renders: Clip (code 0) and
+        // BT.2390 (code 3), which is the identity once the source peak already
+        // fits the target. Reinhard (1) and Mobius (2) are deliberately not
+        // approximated here — the shader evaluates them in IPT space with the
+        // curve in linear light, so a nits-domain stand-in would silently
+        // disagree with it. `wgpu_reinhard_and_mobius_run_in_linear_luminance`
+        // covers those against an independent reference instead.
+        assert!(
+            matches!(u.tone_map, 0 | 3),
+            "ref_tone_map models only clip and BT.2390, not code {}",
+            u.tone_map
+        );
         let target_peak = u.nits[1].max(1.0);
-        let white = (source_peak / target_peak).max(1.0);
         let x = nits.map(|n| n.max(0.0) / target_peak);
-        match u.tone_map {
-            1 => {
-                let white2 = white * white;
-                x.map(|xi| target_peak * (xi * (1.0 + xi / white2) / (1.0 + xi)).clamp(0.0, 1.0))
-            }
-            2 => {
-                let knee = 0.75;
-                let denom = (white - knee).max(0.0001);
-                x.map(|xi| {
-                    let t = ((xi - knee) / denom).clamp(0.0, 1.0);
-                    let shoulder = knee + (1.0 - knee) * (1.0 - (1.0 - t).powf(2.0));
-                    let s = if xi >= knee { shoulder } else { xi };
-                    target_peak * s
-                })
-            }
-            _ => x.map(|xi| target_peak * xi.clamp(0.0, 1.0)),
-        }
+        x.map(|xi| target_peak * xi.clamp(0.0, 1.0))
     }
 
     fn ref_output(rgb: [f32; 3], u: &VideoUniforms) -> [f32; 3] {
@@ -5994,6 +5988,113 @@ mod tests {
             chroma.push(cr);
         }
         (luma, chroma)
+    }
+
+    /// Renders a solid grey NV12 sample and returns the readback's red
+    /// channel. The uniforms below keep the shader output in
+    /// target-reference-linear space, so the channel value is
+    /// `255 * nits / target_reference_white`.
+    fn render_grey_sample(
+        renderer: &mut WgpuRenderer,
+        uniforms: &VideoUniforms,
+        tone_map: u32,
+        y: u8,
+    ) -> u8 {
+        let mut uniforms = *uniforms;
+        uniforms.tone_map = tone_map;
+        let (luma, chroma) = build_solid_nv12(4, 4, y, 128, 128);
+        let out = renderer
+            .render_nv12_offscreen(4, 4, &luma, &chroma, uniforms)
+            .unwrap();
+        out.pixel(1, 1)[0]
+    }
+
+    #[test]
+    fn wgpu_reinhard_and_mobius_run_in_linear_luminance() {
+        // The PR review's readback case: a 1000-nit source peak mapped onto a
+        // 203-nit target, so the Mobius knee sits at 0.3 * 203 = 60.9 nits.
+        // libplacebo evaluates Reinhard and Mobius in the linear PL_HDR_NORM
+        // domain; running them on PQ codes instead moved the knee far lower
+        // and darkened a 50-nit patch from ~50 to ~31 nits.
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let sdr = VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+
+        let mut uniforms = sdr;
+        uniforms.full_range = 1;
+        uniforms.source_transfer = 0;
+        uniforms.target_transfer = 0;
+        uniforms.scene_linear = 1;
+        uniforms.nits = [1000.0, 203.0, 203.0, 203.0];
+        uniforms.tone_map_extra = [0.0, 0.0, 0.0, 0.0];
+        uniforms.gamut_lut_enabled = 0;
+        uniforms.luma_coefficients = [0.2126, 0.7152, 0.0722, 0.0];
+        uniforms.gamut_matrix_rows = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+
+        // Y = 63 is 50.15 nits in this configuration, below the knee.
+        let below_knee_y = 63u8;
+        let clip = render_grey_sample(&mut renderer, &uniforms, 0, below_knee_y);
+        let mobius = render_grey_sample(&mut renderer, &uniforms, 2, below_knee_y);
+        let reinhard = render_grey_sample(&mut renderer, &uniforms, 1, below_knee_y);
+
+        assert!(
+            (clip as i16 - 63).abs() <= 2,
+            "clip should reproduce the 50.15-nit input, got {clip}"
+        );
+        // Mobius' 1:1 region covers everything below the knee, so this sample
+        // must come back untouched. A PQ-domain curve would return ~39 here.
+        assert!(
+            (mobius as i16 - clip as i16).abs() <= 1,
+            "mobius below the knee = {mobius}, clip = {clip}"
+        );
+        // Reinhard compresses the whole range, so this sample darkens a
+        // little, but only a little.
+        assert!(
+            (clip as i16 - reinhard as i16) >= 1 && (clip as i16 - reinhard as i16) <= 3,
+            "reinhard below the knee = {reinhard}, clip = {clip}"
+        );
+
+        // Independent reference for the readback. libplacebo evaluates both
+        // curves in linear light, so the sample's nits go through the curve
+        // and come back as `255 * mapped_nits / target_reference_white`; the
+        // CPU tests in `renderer::pipeline` pin the same formulas. The
+        // PQ-domain port this replaces would miss these by tens of LSBs.
+        let expected = |nits: f32, tone_map: u32| -> i16 {
+            let (src_peak, dst_peak, dst_black) = (1000.0_f32, 203.0_f32, 0.0_f32);
+            let out_range = dst_peak - dst_black;
+            let peak = src_peak / out_range;
+            let t = nits / out_range;
+            let mapped = match tone_map {
+                1 => {
+                    // Reinhard, contrast 0.5 -> offset 1.
+                    let offset = 1.0;
+                    let scale = (peak + offset) / peak;
+                    t / (t + offset) * scale
+                }
+                2 => {
+                    let j = 0.3;
+                    let a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
+                    let b = (j * j - 2.0 * j * peak + peak) / (peak - 1.0);
+                    let scale = (b * b + 2.0 * b * j + j * j) / (b - a);
+                    if t > j { scale * (t + a) / (t + b) } else { t }
+                }
+                _ => t,
+            };
+            (255.0 * mapped).round() as i16
+        };
+
+        for (y, tone_map) in [(below_knee_y, 1u32), (below_knee_y, 2), (200, 1), (200, 2)] {
+            let nits = f32::from(y) / 255.0 * 203.0;
+            let want = expected(nits, tone_map);
+            let got = i16::from(render_grey_sample(&mut renderer, &uniforms, tone_map, y));
+            assert!(
+                (got - want).abs() <= 2,
+                "y={y} tone_map={tone_map} ({nits} nits) = {got}, expected {want}"
+            );
+        }
     }
 
     #[test]

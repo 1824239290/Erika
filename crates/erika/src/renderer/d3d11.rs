@@ -276,24 +276,40 @@ float tone_map_curve_pq(float x_in, float param) {
     }
     if (tone_map == 1u) {
         // Reinhard (output-relative, libplacebo pl_tone_map_reinhard).
-        float peak = in_max / out_range;
+        //
+        // libplacebo evaluates this curve in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators (BT.2390, spline, ST 2094-10)
+        // work on encoded values. Running it on PQ codes bends the curve's
+        // meaning: against a 1000->203 nit target mid-tones darken badly, and
+        // the Mobius knee lands far below its intended position. Rescale to
+        // linear nits here and encode back at the end.
+        float in_max_nits = max(src_peak, 0.000001);
+        float out_min_nits = dst_black;
+        float out_range_nits = max(dst_peak - dst_black, 0.000001);
+        float peak = in_max_nits / out_range_nits;
         float contrast = param > 0.0 ? param : 0.5;
         float offset = (1.0 - contrast) / max(contrast, 0.000001);
         float scale = (peak + offset) / peak;
-        float t = x / out_range;
+        float t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
         float mapped = t / (t + offset) * scale;
-        return mapped * out_range + out_min;
+        return pq_code(mapped * out_range_nits + out_min_nits);
     }
     if (tone_map == 2u) {
-        // Mobius: Mobius transform with a 1:1 linear region below the knee.
-        float peak = in_max / out_range;
+        // Mobius: Mobius transform with a 1:1 linear region below the knee,
+        // also evaluated in linear nits (see the Reinhard note above). The
+        // knee j is relative to the output range, so the linear region ends
+        // at dst_black + j * (dst_peak - dst_black).
+        float in_max_nits = max(src_peak, 0.000001);
+        float out_min_nits = dst_black;
+        float out_range_nits = max(dst_peak - dst_black, 0.000001);
+        float peak = in_max_nits / out_range_nits;
         float j = param > 0.0 ? param : 0.3;
         float a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
         float b = (j * j - 2.0 * j * peak + peak) / max(peak - 1.0, 0.000001);
         float scale = (b * b + 2.0 * b * j + j * j) / (b - a);
-        float t = x / out_range;
+        float t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
         float mapped = t > j ? scale * (t + a) / (t + b) : t;
-        return mapped * out_range + out_min;
+        return pq_code(mapped * out_range_nits + out_min_nits);
     }
     if (tone_map == 3u) {
         // ITU-R BT.2390 EETF with black-point compensation (the libplacebo
@@ -4345,6 +4361,34 @@ mod tests {
 
         assert_eq!(hdr10.scene_linear, 1);
         assert_eq!(sdr.scene_linear, 0);
+    }
+
+    #[test]
+    fn hlsl_evaluates_reinhard_and_mobius_in_linear_nits() {
+        // libplacebo runs these two curves in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators work on encoded values; evaluating
+        // them on PQ codes moved the Mobius knee far below its intended
+        // position. The HLSL is compiled by the D3D11 runtime, not by the Rust
+        // build, so this pins the source shape rather than executing it.
+        let source = std::str::from_utf8(SHADER_SOURCE).unwrap();
+        for branch in ["if (tone_map == 1u)", "if (tone_map == 2u)"] {
+            let start = source.find(branch).expect("branch");
+            let rest = &source[start..];
+            let end = rest.find("\n    }").expect("branch end");
+            let body = &rest[..end];
+            assert!(
+                body.contains("float out_range_nits = max(dst_peak - dst_black, 0.000001);"),
+                "{branch} must scale in linear nits"
+            );
+            assert!(
+                body.contains("nits_from_pq(x)"),
+                "{branch} must decode the PQ code before the curve"
+            );
+            assert!(
+                body.contains("return pq_code("),
+                "{branch} must re-encode the result"
+            );
+        }
     }
 
     #[test]

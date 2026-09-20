@@ -1978,6 +1978,135 @@ mod tests {
         u * in_max
     }
 
+    /// Reference implementation of the shaders' `tone_map_curve_pq` Reinhard
+    /// branch (tone_map code 1).
+    ///
+    /// libplacebo evaluates this curve in the linear PL_HDR_NORM domain while
+    /// the PQ-domain operators (BT.2390, spline, ST 2094-10) work on encoded
+    /// values, so the reference rescales out of PQ codes before the curve and
+    /// re-encodes the result. Normalization cancels: `pl_tone_map_reinhard`
+    /// uses ratios and differences of same-unit linear values, so absolute
+    /// nits are equivalent to PL_HDR_NORM here.
+    fn reinhard_nits(
+        x: f32,
+        src_peak_nits: f32,
+        dst_peak_nits: f32,
+        dst_black_nits: f32,
+        contrast: f32,
+    ) -> f32 {
+        let in_max = src_peak_nits.max(0.000_001);
+        let out_min = dst_black_nits;
+        let out_range = (dst_peak_nits - dst_black_nits).max(0.000_001);
+        let peak = in_max / out_range;
+        let contrast = if contrast > 0.0 { contrast } else { 0.5 };
+        let offset = (1.0 - contrast) / contrast.max(0.000_001);
+        let scale = (peak + offset) / peak;
+        let t = nits_from_pq(x).clamp(0.0, in_max) / out_range;
+        let mapped = t / (t + offset) * scale;
+        pq_code(mapped * out_range + out_min)
+    }
+
+    /// Reference implementation of the shaders' `tone_map_curve_pq` Mobius
+    /// branch (tone_map code 2); linear domain as in [`reinhard_nits`]. The
+    /// knee `knee` is relative to the output range, so the 1:1 region ends at
+    /// `dst_black + knee * (dst_peak - dst_black)` nits.
+    fn mobius_nits(
+        x: f32,
+        src_peak_nits: f32,
+        dst_peak_nits: f32,
+        dst_black_nits: f32,
+        knee: f32,
+    ) -> f32 {
+        let in_max = src_peak_nits.max(0.000_001);
+        let out_min = dst_black_nits;
+        let out_range = (dst_peak_nits - dst_black_nits).max(0.000_001);
+        let peak = in_max / out_range;
+        let j = if knee > 0.0 { knee } else { 0.3 };
+        let a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
+        let b = (j * j - 2.0 * j * peak + peak) / (peak - 1.0).max(0.000_001);
+        let scale = (b * b + 2.0 * b * j + j * j) / (b - a);
+        let t = nits_from_pq(x).clamp(0.0, in_max) / out_range;
+        let mapped = if t > j { scale * (t + a) / (t + b) } else { t };
+        pq_code(mapped * out_range + out_min)
+    }
+
+    #[test]
+    fn reinhard_and_mobius_run_in_linear_luminance() {
+        // The PR review measured a 1000->203 nit target with a near-zero
+        // black and the Mobius knee at 0.3: a 50-nit patch must pass through
+        // untouched, because the 1:1 region ends at 0.3 * 203 = 60.9 nits.
+        // Evaluating the curve on PQ codes instead pushed the knee far lower
+        // and darkened that patch to ~31.3 nits.
+        let (source_peak, target_peak, black) = (1000.0_f32, 203.0_f32, 0.0_f32);
+        let knee_nits = 0.3 * (target_peak - black);
+        assert!((knee_nits - 60.9).abs() < 0.05, "knee = {knee_nits}");
+
+        let below_knee = nits_from_pq(mobius_nits(
+            pq_code(50.0),
+            source_peak,
+            target_peak,
+            black,
+            0.3,
+        ));
+        assert!(
+            (below_knee - 50.0).abs() < 0.5,
+            "50-nit patch below the knee = {below_knee} nits"
+        );
+
+        // Both curves anchor the source peak on the target peak.
+        for mapped in [
+            nits_from_pq(reinhard_nits(
+                pq_code(source_peak),
+                source_peak,
+                target_peak,
+                black,
+                0.0,
+            )),
+            nits_from_pq(mobius_nits(
+                pq_code(source_peak),
+                source_peak,
+                target_peak,
+                black,
+                0.3,
+            )),
+        ] {
+            assert!(
+                (mapped - target_peak).abs() < 0.5,
+                "peak maps to {mapped} nits"
+            );
+        }
+
+        // Reinhard compresses the whole range, so it must darken the 50-nit
+        // patch slightly and stay monotonic.
+        let reinhard_50 = nits_from_pq(reinhard_nits(
+            pq_code(50.0),
+            source_peak,
+            target_peak,
+            black,
+            0.0,
+        ));
+        assert!(
+            reinhard_50 > 40.0 && reinhard_50 < 50.0,
+            "reinhard 50-nit patch = {reinhard_50} nits"
+        );
+
+        for curve in [0, 1] {
+            let mut previous = -1.0_f32;
+            for step in 0..=100 {
+                let x = pq_code(source_peak) * step as f32 / 100.0;
+                let mapped = if curve == 0 {
+                    reinhard_nits(x, source_peak, target_peak, black, 0.0)
+                } else {
+                    mobius_nits(x, source_peak, target_peak, black, 0.3)
+                };
+                assert!(
+                    mapped >= previous,
+                    "curve {curve} step {step} is not monotonic"
+                );
+                previous = mapped;
+            }
+        }
+    }
     #[test]
     fn bt2390_curve_anchors_and_monotonicity() {
         let (source_peak, target_peak, black) = (1000.0_f32, 100.0_f32, 0.203_f32);

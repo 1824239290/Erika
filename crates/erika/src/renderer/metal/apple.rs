@@ -3452,24 +3452,40 @@ float tone_map_curve_pq(float x_in, float param, constant VideoUniforms& uniform
     }
     if (uniforms.tone_map == 1) {
         // Reinhard (output-relative, libplacebo pl_tone_map_reinhard).
-        float peak = in_max / out_range;
+        //
+        // libplacebo evaluates this curve in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators (BT.2390, spline, ST 2094-10)
+        // work on encoded values. Running it on PQ codes bends the curve's
+        // meaning: against a 1000->203 nit target mid-tones darken badly, and
+        // the Mobius knee lands far below its intended position. Rescale to
+        // linear nits here and encode back at the end.
+        float in_max_nits = max(src_peak, 0.000001);
+        float out_min_nits = dst_black;
+        float out_range_nits = max(dst_peak - dst_black, 0.000001);
+        float peak = in_max_nits / out_range_nits;
         float contrast = param > 0.0 ? param : 0.5;
         float offset = (1.0 - contrast) / max(contrast, 0.000001);
         float scale = (peak + offset) / peak;
-        float t = x / out_range;
+        float t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
         float mapped = t / (t + offset) * scale;
-        return mapped * out_range + out_min;
+        return pq_code(mapped * out_range_nits + out_min_nits);
     }
     if (uniforms.tone_map == 2) {
-        // Mobius: Mobius transform with a 1:1 linear region below the knee.
-        float peak = in_max / out_range;
+        // Mobius: Mobius transform with a 1:1 linear region below the knee,
+        // also evaluated in linear nits (see the Reinhard note above). The
+        // knee j is relative to the output range, so the linear region ends
+        // at dst_black + j * (dst_peak - dst_black).
+        float in_max_nits = max(src_peak, 0.000001);
+        float out_min_nits = dst_black;
+        float out_range_nits = max(dst_peak - dst_black, 0.000001);
+        float peak = in_max_nits / out_range_nits;
         float j = param > 0.0 ? param : 0.3;
         float a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
         float b = (j * j - 2.0 * j * peak + peak) / max(peak - 1.0, 0.000001);
         float scale = (b * b + 2.0 * b * j + j * j) / (b - a);
-        float t = x / out_range;
+        float t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
         float mapped = t > j ? scale * (t + a) / (t + b) : t;
-        return mapped * out_range + out_min;
+        return pq_code(mapped * out_range_nits + out_min_nits);
     }
     if (uniforms.tone_map == 3) {
         // ITU-R BT.2390 EETF with black-point compensation (the libplacebo
@@ -4522,6 +4538,48 @@ mod tests {
         renderer
             .danmaku_batch_pipeline_state()
             .expect("dual-atlas danmaku pipeline");
+    }
+
+    #[test]
+    fn video_shader_compiles() {
+        // The video shader is the one carrying the tone-map curves, and it is
+        // only compiled at runtime, so a syntax error there would reach users.
+        // Needs a real Metal device; skip rather than fail where there is none.
+        let Ok(mut renderer) =
+            super::MetalRendererImpl::new(crate::renderer::metal::MetalRendererConfig::default())
+        else {
+            eprintln!("skipping: no Metal device available");
+            return;
+        };
+        renderer.video_pipeline_state().expect("video pipeline");
+    }
+
+    #[test]
+    fn video_shader_evaluates_reinhard_and_mobius_in_linear_nits() {
+        // libplacebo runs these two curves in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators work on encoded values; evaluating
+        // them on PQ codes moved the Mobius knee far below its intended
+        // position and produced the mid-tone darkening the PR review measured.
+        for branch in ["uniforms.tone_map == 1", "uniforms.tone_map == 2"] {
+            let start = VIDEO_SHADER_SOURCE
+                .find(branch)
+                .unwrap_or_else(|| panic!("{branch} branch"));
+            let rest = &VIDEO_SHADER_SOURCE[start..];
+            let end = rest.find("\n    }").expect("branch end");
+            let body = &rest[..end];
+            assert!(
+                body.contains("float out_range_nits = max(dst_peak - dst_black, 0.000001);"),
+                "{branch} must scale in linear nits"
+            );
+            assert!(
+                body.contains("nits_from_pq(x)"),
+                "{branch} must decode the PQ code before the curve"
+            );
+            assert!(
+                body.contains("return pq_code("),
+                "{branch} must re-encode the result"
+            );
+        }
     }
 
     #[test]
