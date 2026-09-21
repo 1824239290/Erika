@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.1.9+dolby.streaming.fix.dev - 2026-09-21
+
+Follow-up to `0.1.9+dolby.streaming.dev`: same Dolby Vision RPU mapping
+(#136) and HTTP(S) persistent streaming prefetch (#139) bundle, plus
+`fix(http): bound the persistent-stream prefetch window in the worker`.
+The workers only learned "window full" from the reader's `paused` flag, which
+a reader parked on a full packet queue stops refreshing, so a fast origin
+prefetched the whole resource (659 MB of cache on a 927 MB source). Each worker
+now self-throttles on its own production offset against an absolute boundary.
 
 ### Renderer
 
