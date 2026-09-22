@@ -400,7 +400,27 @@ impl Demuxer {
             if code == AVERROR_EOF {
                 return Ok(None);
             }
-            check(code, "av_read_frame")?;
+            if let Err(error) = check(code, "av_read_frame") {
+                // A read that failed because the media source could not deliver
+                // the bytes keeps its real reason on the AVIO (HTTP status,
+                // timeout, ...). Carry it into the terminal error: without it the
+                // error reads only "Input/output error (-5)" and the cause lives
+                // on stderr alone, which is why a report such as issue #1 needs a
+                // reproduction instead of a log line.
+                return Err(
+                    match self
+                        .context
+                        .avio
+                        .as_ref()
+                        .and_then(|avio| avio.last_error.as_deref())
+                    {
+                        Some(source_error) => {
+                            FfmpegError::Source(format!("{error}; custom AVIO: {source_error}"))
+                        }
+                        None => error,
+                    },
+                );
+            }
 
             let stream_index = packet.stream_index();
             packet.time_base = self.stream_time_base(stream_index);
@@ -3751,8 +3771,14 @@ impl CustomAvio {
             start: self.offset,
             length: Some(length),
         }) {
-            Ok(bytes) if bytes.is_empty() => AVERROR_EOF,
+            Ok(bytes) if bytes.is_empty() => {
+                // A source that answered is not the cause of any later failure:
+                // a sticky `last_error` would be appended to an unrelated one.
+                self.last_error = None;
+                AVERROR_EOF
+            }
             Ok(bytes) => {
+                self.last_error = None;
                 let copy_len = bytes.len().min(buffer_size as usize);
                 unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len) };
                 self.offset = self.offset.saturating_add(copy_len as u64);
@@ -3807,6 +3833,7 @@ impl CustomAvio {
             return av_error(EINVAL) as i64;
         }
         self.offset = target as u64;
+        self.last_error = None;
         self.offset.min(i64::MAX as u64) as i64
     }
 }
