@@ -4,21 +4,20 @@
 
 ### Playback
 
-- HTTP(S) prefetch now runs as persistent streaming workers: each worker holds
-  one open-ended GET (`bytes=anchor-`) so the origin seeks once per worker and
-  the flows run at path bandwidth, instead of re-paying a round trip and a
-  server seek on every 4 MiB piece. Stripes are handed to the reader and
-  appended in frontier order, backpressure is TCP itself (the worker stops
-  reading its socket when the window is full), and seeks re-anchor the
-  workers through an epoch counter. A body error reconnects at the reached
-  offset with the entity validator replayed; past a few fruitless reconnects
-  the read falls back to the synchronous capped path.
+- HTTP(S) prefetch now uses one persistent stream with an open-ended GET
+  (`bytes=anchor-`), avoiding a request and server seek on every 4 MiB piece
+  without downloading overlapping tails. The worker stops reading its socket
+  when the read-ahead window fills; seeks retire the old stream through an
+  epoch counter. Short responses and body errors resume at the reached offset
+  with the entity validator replayed; repeated failures fall back to bounded
+  synchronous requests. Cache appends preserve byte continuity, and final
+  partial reads return at the known EOF without waiting for a full buffer.
 - The rewind budget is host-tunable via `http_back_buffer_bytes` on the open
   options (the first reserved slot — ABI and layout unchanged; zero keeps the
   16 MiB default). Hosts playing high-bitrate media should size it from the
   bitrate: a -10 s skip at 71 Mbps covers ~89 MB, which the fixed default
   could not hold.
-- Capped HTTP(S) request bodies at 4 MiB so a large window no longer demands
+- Capped synchronous HTTP(S) range requests at 4 MiB so a large window no longer demands
   unrealistic sustained bandwidth (a single 32 MiB request needed ~18 Mbps to
   survive ureq's 15 s body deadline); failed background work degrades to
   synchronous fetches instead of killing the read, and an origin that keeps
