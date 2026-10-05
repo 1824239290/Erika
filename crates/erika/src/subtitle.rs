@@ -2104,11 +2104,11 @@ impl SubtitleTimeline {
 
 pub fn parse_srt(input: &str) -> Result<SubtitleTimeline> {
     let mut cues = Vec::new();
-    for block in input.replace("\r\n", "\n").split("\n\n") {
-        let lines = block
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect::<Vec<_>>();
+    // SRT and WebVTT separators may contain spaces or tabs. Treat any
+    // whitespace-only line as a boundary, preserving multiline cue text.
+    let normalized = input.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    for lines in lines.split(|line| line.trim().is_empty()) {
         if lines.is_empty() {
             continue;
         }
@@ -2810,6 +2810,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         let overflow =
             parse_srt("1\n99999999999999999:00:00,000 --> 99999999999999999:00:01,000\nboom\n");
         assert!(overflow.is_err());
+    }
+
+    #[test]
+    fn subtitle_cues_split_on_whitespace_separators_with_lf_and_crlf() {
+        for newline in ["\n", "\r\n"] {
+            for separator in [" ", "\t", " \t "] {
+                let srt = [
+                    "1",
+                    "00:00:01,000 --> 00:00:02,000",
+                    "First",
+                    "continued",
+                    separator,
+                    "2",
+                    "00:00:03,000 --> 00:00:04,000",
+                    "Second",
+                ]
+                .join(newline);
+                let timeline = parse_srt(&srt).unwrap();
+                assert_eq!(
+                    timeline.cues().len(),
+                    2,
+                    "newline={newline:?}, separator={separator:?}"
+                );
+                assert_eq!(timeline.cues()[0].text, "First\ncontinued");
+                assert_eq!(timeline.cues()[1].text, "Second");
+                assert_eq!(timeline.active_cues(Duration::from_millis(3500)).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn webvtt_cues_split_on_whitespace_separators_and_preserve_multiline_text() {
+        let vtt = "WEBVTT\r\n\r\n00:00:01.000 --> 00:00:02.000\r\nFirst\r\ncontinued\r\n \t \r\n00:00:03.000 --> 00:00:04.000\r\nSecond\r\n";
+        let timeline = parse_webvtt(vtt).unwrap();
+        assert_eq!(timeline.cues().len(), 2);
+        assert_eq!(timeline.cues()[0].text, "First\ncontinued");
+        assert_eq!(timeline.cues()[1].text, "Second");
     }
 
     #[test]
