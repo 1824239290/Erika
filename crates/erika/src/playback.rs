@@ -7112,13 +7112,12 @@ mod tests {
         assert_eq!(engine.media_time_at(paused_at), target);
 
         let mut ticks = 0;
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
         while engine.has_pending_paused_seek_frame() {
-            let _ = engine
-                .tick_at(paused_at + Duration::from_millis(ticks))
-                .unwrap();
+            let _ = engine.tick_at(paused_at).unwrap();
             ticks += 1;
             assert!(
-                ticks < 2000,
+                Instant::now() < deadline,
                 "the preview pump must reach the abandonment path"
             );
             assert_eq!(
@@ -7127,9 +7126,10 @@ mod tests {
                 "a paused session must not become Ended while only seeking"
             );
             assert_eq!(
-                engine.media_time_at(paused_at + Duration::from_millis(ticks)),
+                engine.media_time_at(paused_at + Duration::from_secs(60)),
                 target
             );
+            thread::yield_now();
         }
         assert!(ticks > 0);
         assert_eq!(engine.state(), PlaybackRunState::Paused);

@@ -3703,10 +3703,16 @@ mod tests {
             .seek_with_playback_intent(Duration::from_millis(5_125), false)
             .unwrap();
         engine.play().unwrap();
-        for _ in 0..2000 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
             if engine.tick().unwrap().is_some() {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the asynchronous seek preview"
+            );
+            std::thread::yield_now();
         }
         let engine_clock = engine.clock();
         assert!(
