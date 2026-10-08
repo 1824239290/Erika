@@ -1,8 +1,9 @@
 # PR #150–#159：目的、取舍与运行验证
 
-调查日期：2026-10-05。仓库：AimesSoft/Erika。作者：TsangAsuna。
+调查日期：2026-10-05；鸿蒙运行验证补充：2026-10-08。仓库：AimesSoft/Erika。作者：TsangAsuna。
 评估基线：`4390c78f4467e2047e19690700fbead6a18d8e31`。
-审阅后的代码：`004b118`，分支 `codex/pr-150-159-reviewed`。
+播放内核审阅提交：`004b118`；模拟器构建支持与运行证据见分支后续提交。
+分支：`codex/pr-150-159-reviewed`。
 
 Erika 是 NipaPlay 的嵌入式播放内核，负责解码、时序、渲染、字幕、弹幕和音频输出。
 这里以实际播放可靠性、宿主生命周期、平台一致性和可观测性判断贡献。
@@ -127,17 +128,28 @@ EOF seek 后公开状态仍为 Paused，暂停期间 decodedVideoFrames 不增�
 host harness 强制每次 presenter 返回同一地址 0x10，执行两个生产文件的 NativeCreate、FindPlayer、NativeDestroy；
 基线都失败，修复后旧 lookup／destroy 不影响新对象。5 个 packaging 检查实际执行 C++，无跳过。
 
-SDK 5.1.0.107 / API 18 已安装；两个完整生产桥接已通过 ARM64 官方工具链编译和链接，
-链接 ACE NAPI／native_window／hilog。所链接 C API 为清单固定且校验过的 v0.2.1 release，
-不是本分支的 OHOS Rust runtime。该结果是 SDK 构建验证，**不是模拟器运行验证**。
-公开包包含 toolchains／previewer，不包含完整手机系统镜像。DevEco 官方下载入口要求华为账号登录，
-等待用户完成登录后继续安装本地模拟器。尚未启动鸿蒙应用或播放器。
+SDK 5.1.0.107 / API 18 已安装。本分支 Rust C API runtime 已成功编译为 ARM64 和 x86_64，
+两个完整生产桥接均链接本分支运行库。早期链接 v0.2.1 release 的构建日志仅作为历史证据保留。
+DevEco Studio 26.0.0.851 与官方 HarmonyOS 5.1.0.110 手机镜像已安装；
+本地 x86_64／API 18 模拟器通过 hdc 连接，真实 HAP 已安装并运行。
+
+两个生产桥接分别完成 H.264＋AAC 播放、暂停、暂停 seek 到 EOF、seek 回 3.5 秒、
+1.25 倍速恢复、Surface detach／attach、附封面 MP3、销毁重建与旧 ID 调用。
+各执行 64 次真实创建／销毁后，旧 ID 2 的 stop 返回 unknown player，旧 destroy 不影响新 ID 67；
+新播放器均继续输出视频和音频。渲染／导入／音频错误均为零，截图已核实。
+这是 ArkTS HAP 调用 Flutter 的完整生产 NAPI 桥接，不是完整 Flutter 引擎／NipaPlay 应用运行证明。
+
+另将两个桥接换回基线、仍链接同一当前 Rust runtime，各尝试 128 次真实创建／销毁，
+没有复用到指定旧地址。不能将这组结果写成真实基线故障复现；
+地址复用缺陷的确定性证据仍来自上述强制复用生产 C++ harness。
+详细计数与重现说明见 [鸿蒙运行记录](ohos-runtime.zh.md)。
 
 Flutter 现有 Dart 代码已经正确处理 dispose 等待期间的事件、关闭流、100 个晚到事件及未知 ID；
 113 项测试通过，analysis 无问题。无需笼统吞掉 StateError。
 GIF 36000 帧硬上限属于任意产品限制，不能代替取消、进度或显式预算设计。
 
-提交：`627b846`。证据：`pr158-baseline-ohos.log`、`pr158-reviewed-ohos.log`、`final-ohos-sdk-build.log`。
+提交：`627b846`。证据：`pr158-baseline-ohos.log`、`pr158-reviewed-ohos.log`、
+`ohos-arkts-review.jsonl`、`ohos-flutter-review.jsonl`、`ohos-live-summary.json`。
 
 ### #159：公共解析接口有改进，播放器收益有限
 
@@ -165,7 +177,7 @@ SRT/VTT 按 whitespace-only 行分块修复了公共 `parse_srt`／`parse_webvtt
 | Linux 字幕 | 实际 shared library＋Xlib＋libass，外挂 SRT、seek、恢复后暂停、RGBA capture | 画面“Second”已肉眼核实；纯暂停预览未通过 |
 | Linux 附封面 MP3 | 独立 Python C ABI 宿主，真实 MP3 解码、PulseAudio 输出 | 48000 audio frames、队列归零、0 audio errors；null sink 无听感验证 |
 | Linux PulseAudio | 正式 native pause／resume／flush／reconfigure 测试＋null sink | 通过；null sink 不证明扬声器听感 |
-| OHOS | 官方 SDK 完整桥接编译链接＋生产 create/destroy 地址复用回归 | 构建通过；本地模拟器运行待官方登录入口解锁 |
+| OHOS 官方手机模拟器 | 当前 Rust runtime＋两个生产桥接，真实 HAP／XComponent、H.264＋AAC、暂停／EOF seek／倍速／Surface 重连／封面 MP3／销毁重建 | ArkTS 518 rendered、Flutter 517 rendered；MP3 各消费 235190 音频帧；旧 ID 拒绝，错误均为零；系统 decoder 经 CPU 回退呈现，非真机零拷贝证据 |
 | Apple | 本机未运行 | 由用户单独处理，不能标记完成 |
 
 使用的 BBB 文件 969201 字节，SHA256：
@@ -183,6 +195,7 @@ SRT/VTT 按 whitespace-only 行分块修复了公共 `parse_srt`／`parse_webvtt
 Windows：erika 单元 702 通过／1 ignored，integration 4＋6 通过，C API 42 通过。
 Linux：erika 单元 677 通过／2 ignored，integration 4＋6 通过，C API 41 通过。
 Flutter 113 通过，flutter analyze 无问题；packaging 5 通过；Rust fmt 通过。
+鸿蒙模拟器依赖构建新增 x86_64 target 支持；xtask 26 项通过，ARM64／x86_64 实际构建均通过。
 Windows clippy 完成，但有现存 warnings，未以 `-D warnings` 运行。
 
 整个 `--workspace` 在 Apple-only demo 的 ObjC 构建脚本失败，后续验证限定核心与 C API。
