@@ -1,4 +1,4 @@
-# Erika 文档 / Documentation
+# liberika 文档 / Documentation
 
 当前接入说明以 **0.2.1** 为基线。选择 SDK 后，先读其安装和使用指南；需要自建
 渲染宿主或开发内核时，再进入下列参考文档。

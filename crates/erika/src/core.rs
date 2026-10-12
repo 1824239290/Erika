@@ -587,7 +587,7 @@ impl PlatformSurface {
     }
 }
 
-/// Exact native drawable/swapchain extent. Surface width and height in Erika's
+/// Exact native drawable/swapchain extent. Surface width and height in liberika's
 /// public API are physical pixels and are never derived from the content scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfacePhysicalExtent {
@@ -956,7 +956,7 @@ pub struct RendererRuntimeStats {
 }
 
 /// Snapshot of memory visible from the renderer. Individual fields describe
-/// resources tracked by Erika; `device_current_allocated_bytes` is Metal's
+/// resources tracked by liberika; `device_current_allocated_bytes` is Metal's
 /// process-wide device counter and can therefore include driver allocations
 /// that do not belong to a single presenter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

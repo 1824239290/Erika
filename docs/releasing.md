@@ -1,4 +1,4 @@
-# Releasing Erika
+# Releasing liberika
 
 [中文](releasing.zh.md) · [日本語](releasing.ja.md) · [Documentation](README.md)
 
@@ -73,7 +73,7 @@ Flutter downloads its package-pinned native tag and verifies SHA-256 by default.
 | `ERIKA_PREBUILT_TAG` | Override the native version; also supply matching checksums. |
 | `ERIKA_PREBUILT_SHA256` | Archive checksum for a custom tag. |
 | `ERIKA_PREBUILT_SHA256_<ABI>` | Set `ARM64_V8A`, `ARMEABI_V7A`, `X86_64`, and `X86` separately for multi-ABI Android. |
-| `ERIKA_FORCE_SOURCE_BUILD=1` | Build the local Erika source. |
+| `ERIKA_FORCE_SOURCE_BUILD=1` | Build the local liberika source. |
 | `ERIKA_MACOS_ARCHS` | `universal`, `arm64`, `x86_64`, `arm64,x86_64` |
 
 C/C++ consumers link `lib/` and include `include/erika.h` after extracting a bundle. The macOS dylib uses `@rpath/liberika_capi.dylib`. Use the [native integration guide](integration.md).
@@ -87,4 +87,4 @@ bash packaging/bundle.sh erika-capi-macos-universal \
   dist/erika-capi-macos-universal.zip out/liberika_capi.dylib out/liberika_capi.a
 ```
 
-Erika uses MPL-2.0; third-party dependencies retain their own licenses. Preserve license texts, third-party notices, and build provenance in published bundles. The [build guide](building.md#license-profiles) maintains the `lgpl` / `gpl-full` dependency configuration.
+liberika uses MPL-2.0; third-party dependencies retain their own licenses. Preserve license texts, third-party notices, and build provenance in published bundles. The [build guide](building.md#license-profiles) maintains the `lgpl` / `gpl-full` dependency configuration.

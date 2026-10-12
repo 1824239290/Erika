@@ -764,7 +764,7 @@ fn select_linux_surface_output(
 }
 
 fn requested_device_limits(adapter_limits: wgpu::Limits, backend: wgpu::Backend) -> wgpu::Limits {
-    // Erika only needs the portable binding-count and buffer-size baseline, but
+    // liberika only needs the portable binding-count and buffer-size baseline, but
     // video and swapchain textures must retain the adapter's real resolution.
     // This also keeps Android software Vulkan implementations usable: SwiftShader
     // exposes the Vulkan minimum 16 KiB uniform-buffer binding limit, while

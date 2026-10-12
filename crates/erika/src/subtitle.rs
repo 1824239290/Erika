@@ -783,7 +783,7 @@ impl Default for LibassRenderConfig {
     }
 }
 
-/// Text colour Erika falls back to when nothing else specifies one, as
+/// Text colour liberika falls back to when nothing else specifies one, as
 /// `0xRRGGBBAA` with alpha 255 meaning fully opaque.
 pub const DEFAULT_SUBTITLE_PRIMARY_COLOR_RGBA: u32 = 0xffff_ffff;
 /// Outline/shadow colour fallback, half-transparent black.
@@ -810,7 +810,7 @@ pub const SUBTITLE_OVERRIDE_ALL: u32 = SUBTITLE_OVERRIDE_LEGACY_FORCE
     | SUBTITLE_OVERRIDE_MARGINS
     | SUBTITLE_OVERRIDE_BLUR;
 
-/// User-chosen subtitle look. Empty strings mean "keep Erika's default", so
+/// User-chosen subtitle look. Empty strings mean "keep liberika's default", so
 /// [`SubtitleStyleConfig::default`] reproduces the built-in style exactly.
 ///
 /// The font and colours act as *fallbacks*: a container ASS script keeps its
@@ -888,7 +888,7 @@ impl Default for SubtitleStyleConfig {
 impl SubtitleStyleConfig {
     /// Trims caller-provided paths and family names, and clamps the metrics to
     /// a range libass can render. An empty string stays the "unset" marker; a
-    /// non-finite metric falls back to Erika's default.
+    /// non-finite metric falls back to liberika's default.
     pub fn normalized(mut self) -> Self {
         self.font_family = self.font_family.trim().to_string();
         self.font_file_path = self.font_file_path.trim().to_string();
@@ -2394,7 +2394,7 @@ const MIN_ASS_FONT_SIZE: f64 = 8.0;
 const MAX_ASS_FONT_SIZE: f64 = 400.0;
 const MAX_ASS_OUTLINE: f64 = 32.0;
 
-/// Attachment name Erika registers the bundled `assets/subfont.ttf` under.
+/// Attachment name liberika registers the bundled `assets/subfont.ttf` under.
 const BUNDLED_ASS_FALLBACK_FONT_NAME: &str = "subfont.ttf";
 /// Family name carried by the bundled fallback face. Keep in sync with the
 /// asset itself; `bundled_ass_fallback_family_matches_asset` locks the two.

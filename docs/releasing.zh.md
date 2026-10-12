@@ -1,4 +1,4 @@
-# 发布 Erika
+# 发布 liberika
 
 [English](releasing.md) · [日本語](releasing.ja.md) · [文档目录](README.md)
 
@@ -73,7 +73,7 @@ Flutter 默认下载当前 package 固定的原生 tag 并校验 SHA-256。应�
 | `ERIKA_PREBUILT_TAG` | 覆盖原生版本，须同时提供对应校验值。 |
 | `ERIKA_PREBUILT_SHA256` | 自定义 tag 的归档校验值。 |
 | `ERIKA_PREBUILT_SHA256_<ABI>` | Android 多 ABI 分别设置 `ARM64_V8A`、`ARMEABI_V7A`、`X86_64`、`X86`。 |
-| `ERIKA_FORCE_SOURCE_BUILD=1` | 使用本地 Erika 源码。 |
+| `ERIKA_FORCE_SOURCE_BUILD=1` | 使用本地 liberika 源码。 |
 | `ERIKA_MACOS_ARCHS` | `universal`, `arm64`, `x86_64`, `arm64,x86_64` |
 
 C/C++ 接入解压归档后链接 `lib/`，包含 `include/erika.h`；macOS 动态库使用 `@rpath/liberika_capi.dylib`。接入方式在 [原生接入指南](integration.zh.md)。
@@ -87,4 +87,4 @@ bash packaging/bundle.sh erika-capi-macos-universal \
   dist/erika-capi-macos-universal.zip out/liberika_capi.dylib out/liberika_capi.a
 ```
 
-Erika 使用 MPL-2.0，第三方依赖保留各自许可证。发布包保留许可证、第三方声明和构建来源；`lgpl` / `gpl-full` 的依赖与配置在 [构建指南](building.zh.md#许可证-profile) 中维护。
+liberika 使用 MPL-2.0，第三方依赖保留各自许可证。发布包保留许可证、第三方声明和构建来源；`lgpl` / `gpl-full` 的依赖与配置在 [构建指南](building.zh.md#许可证-profile) 中维护。

@@ -2019,7 +2019,7 @@ fn apply_ffmpeg_patches(layout: &WorkspaceLayout) -> Result<()> {
         Ok(application) => application,
         Err(first_error) => {
             // third_party/src is generated from the pinned archive. If an older
-            // Erika patch set or an interrupted partial application left it in
+            // liberika patch set or an interrupted partial application left it in
             // an unknown state, refresh it automatically instead of requiring
             // users to repair the vendored source tree by hand.
             println!(

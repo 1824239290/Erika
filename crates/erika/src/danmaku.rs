@@ -1,4 +1,4 @@
-//! Native Erika danmaku pipeline.
+//! Native liberika danmaku pipeline.
 //!
 //! The DFM-style track retainer and filters are adapted from the MIT-licensed
 //! NipaPlay-Reload DFM+ Rust implementation:
