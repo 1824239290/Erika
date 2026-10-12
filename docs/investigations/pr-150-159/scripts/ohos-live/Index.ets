@@ -123,6 +123,8 @@ class ReviewController extends XComponentController {
       previous = next;
     }
     this.id = this.create();
+    this.log('create', JSON.stringify({ id: this.id, surface: this.surfaceId, width: this.width, height: this.height,
+      error: this.flutter ? flutterBridge.nativeLastError() : arkBridge.nativeLastError() }));
     const staleInvoke: string = this.invoke(oldId, 'stop');
     const staleResult: Response = JSON.parse(staleInvoke) as Response;
     this.destroy(oldId);
@@ -140,6 +142,8 @@ class ReviewController extends XComponentController {
     this.done = done;
     this.log('start', this.label());
     this.id = this.create();
+    this.log('initial-create', JSON.stringify({ id: this.id, surface: this.surfaceId, width: this.width, height: this.height,
+      error: this.flutter ? flutterBridge.nativeLastError() : arkBridge.nativeLastError() }));
     if (this.id <= 0 || this.surfaceId.length === 0 || this.width <= 0) { throw new Error('player or surface unavailable'); }
     this.attach();
     this.open(media);

@@ -1,4 +1,5 @@
 export const nativeCreate: (mode: number, headroom: number, upscaler: number, alpha: number) => number;
+export const nativeLastError: () => string;
 export const nativeDestroy: (id: number) => void;
 export const nativeInvoke: (id: number, method: string, args: string) => string;
 export const nativeRenderTick: (id: number, time: number) => string;
