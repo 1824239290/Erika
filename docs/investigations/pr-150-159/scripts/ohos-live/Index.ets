@@ -38,6 +38,9 @@ class ReviewController extends XComponentController {
   private flutter: boolean = false;
   private pausedDecoded: number = 0;
   private lastState: number = 0;
+  private recreatedAt: number = 0;
+  private pauseSampled: boolean = false;
+  private pausedAudio: number = 0;
 
   constructor(flutter: boolean) { super(); this.flutter = flutter; }
 
@@ -133,6 +136,7 @@ class ReviewController extends XComponentController {
     if (staleResult.ok || !newResult.ok) { throw new Error('stale ID affected recreated player'); }
     this.attach();
     this.open(this.media);
+    this.recreatedAt = Date.now();
   }
 
   start(media: string, cover: string, logPath: string, done: () => void): void {
@@ -176,8 +180,18 @@ class ReviewController extends XComponentController {
       if (stats.renderedVideoFrames === 0 || stats.audioClockReadFrames === 0) { throw new Error('no video or audio playback'); }
       this.call('pause'); this.phase++;
     }
+    if (this.phase === 1 && elapsed >= 5 && !this.pauseSampled) {
+      const stats: Stats = this.stats('pause-settled');
+      if (this.lastState !== 4) { throw new Error('pause did not settle'); }
+      this.pausedDecoded = stats.decodedVideoFrames;
+      this.pausedAudio = stats.audioClockReadFrames;
+      this.pauseSampled = true;
+    }
     if (this.phase === 1 && elapsed >= 6) {
-      this.pausedDecoded = this.stats('paused').decodedVideoFrames;
+      const stats: Stats = this.stats('paused');
+      if (stats.decodedVideoFrames !== this.pausedDecoded || stats.audioClockReadFrames !== this.pausedAudio) {
+        throw new Error('settled pause continued decoding or consuming audio');
+      }
       this.call('seek', '{"positionMicros":10000000}'); this.phase++;
     }
     if (this.phase === 2 && elapsed >= 7) {
@@ -203,7 +217,7 @@ class ReviewController extends XComponentController {
       if (stats.audioClockReadFrames === 0 || stats.decodedVideoFrames !== 0) { throw new Error('cover MP3 did not play as audio only'); }
       this.recreate(); this.phase++;
     }
-    if (this.phase === 8 && elapsed >= 27) {
+    if (this.phase === 8 && Date.now() - this.recreatedAt >= 5000) {
       const stats: Stats = this.stats('recreated-playback');
       if (stats.renderedVideoFrames === 0 || stats.audioClockReadFrames === 0) { throw new Error('recreated player did not play'); }
       this.call('pause');

@@ -153,12 +153,15 @@ try:
     tracks=call(player,'tracks')
     print('attached-cover MP3 tracks',tracks,flush=True)
     assert len(tracks)==1 and tracks[0]['kind']==1,tracks
-    before_audio=call(player,'getPresenterStats')['audioClockReadFrames']
-    call(player,'play')
-    stats=pump(player,4)
-    assert stats['audioClockReadFrames']-before_audio > 30000 and stats['audioFailures']==0,stats
-    print('real WASAPI cover MP3 audio consumption',stats,flush=True)
-    call(player,'stop')
+    if '--video-only' not in sys.argv:
+        before_audio=call(player,'getPresenterStats')['audioClockReadFrames']
+        call(player,'play')
+        stats=pump(player,4)
+        assert stats['audioClockReadFrames']-before_audio > 30000 and stats['audioFailures']==0,stats
+        print('real WASAPI cover MP3 audio consumption',stats,flush=True)
+        call(player,'stop')
+    else:
+        print('WASAPI playback explicitly omitted in video-only run',flush=True)
     call(player,'loadDanmakuJson',json=json.dumps({'comments':[{'time':'1e100','content':'invalid'},{'time':0,'content':'valid'}]}))
     raw=invoke(player,b'addExternalSubtitle',json.dumps({'uri':str(bad_subtitle)}).encode())
     try:

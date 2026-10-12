@@ -1,13 +1,18 @@
 import json
-import sys
+import argparse
 from pathlib import Path
 
-root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent
+parser = argparse.ArgumentParser()
+parser.add_argument('root', nargs='?', type=Path, default=Path(__file__).resolve().parent)
+parser.add_argument('--api', type=int, default=18)
+parser.add_argument('--os', default='HarmonyOS 5.1.0.110(SP2DEVC00E110R4P11)')
+args = parser.parse_args()
+root = args.root
 if not (root / "ohos-arkts-review.jsonl").exists():
     root = root.parent / "evidence"
-summary = {"device": "127.0.0.1:5555", "os": "HarmonyOS 5.1.0.110(SP2DEVC00E110R4P11)",
-           "api": 18, "abi": "x86_64", "bridges": {}}
-stages = ("playing", "paused", "paused-eof", "resumed", "surface-reconnected", "cover-audio", "recreated-playback")
+summary = {"device": "127.0.0.1:5555", "os": args.os,
+           "api": args.api, "abi": "x86_64", "bridges": {}}
+stages = ("playing", "pause-settled", "paused", "paused-eof", "resumed", "surface-reconnected", "cover-audio", "recreated-playback")
 for bridge in ("arkts", "flutter"):
     rows = [json.loads(line) for line in (root / f"ohos-{bridge}-review.jsonl").read_text().splitlines()]
     assert not any(row["stage"] == "FAILED" for row in rows), bridge
@@ -17,7 +22,8 @@ for bridge in ("arkts", "flutter"):
     for data in stats.values():
         assert data["renderFailures"] == data["importFailures"] == data["audioFailures"] == 0
     assert stats["paused"]["decodedVideoFrames"] == stats["paused-eof"]["decodedVideoFrames"]
-    assert stats["playing"]["audioClockReadFrames"] == stats["paused"]["audioClockReadFrames"]
+    assert stats["pause-settled"]["decodedVideoFrames"] == stats["paused"]["decodedVideoFrames"]
+    assert stats["pause-settled"]["audioClockReadFrames"] == stats["paused"]["audioClockReadFrames"]
     assert any(row["stage"] == "paused-eof-state" and row["value"] == "4" for row in rows)
     assert stats["resumed"]["decodedVideoFrames"] > stats["paused"]["decodedVideoFrames"]
     assert stats["cover-audio"]["decodedVideoFrames"] == 0

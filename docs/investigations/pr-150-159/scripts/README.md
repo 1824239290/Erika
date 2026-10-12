@@ -1,8 +1,8 @@
 # Reproducing the native checks
 
-These are independent hosts of the actual Erika binaries. They complement the
-baseline/head regression logs; they do not claim OHOS emulator execution or
-Apple coverage.
+These are independent hosts of the actual binaries. They complement the
+baseline/head regression logs. Actual OHOS emulator results are recorded in
+`../ohos-runtime.zh.md`; Apple coverage remains separate.
 
 ## Windows
 
@@ -17,8 +17,11 @@ python .\windows-live-capi.py C:\path\to\Erika
 ```
 
 The host creates a Win32 HWND, attaches the production D3D11 renderer, plays
-local and HTTP media, and exercises pause, EOF seek, resume, rate, MP3 probe,
-and malformed inputs. It does not record a visible window or listen to audio.
+local media and HTTP 206/whole-file 200 responses with small cache windows,
+and exercises pause, EOF seek, resume, rate, MP3 probe and malformed inputs.
+The default run requires a real default WASAPI endpoint. Pass `--video-only`
+to explicitly omit audio playback when no endpoint is available. D3D11 does
+not implement the optional C API screenshot; that limitation is logged.
 
 ## Linux
 
@@ -86,24 +89,48 @@ This builds the full modified Flutter and ArkTS bridges for ARM64 against
 API 18, links the SDK libraries, and links the checksum-pinned v0.2.1 C API
 release. It does not rebuild this branch's Rust runtime or run an emulator.
 
-## OHOS emulator: required next stage
+## OHOS emulator: actual production runtime
 
-The official DevEco download entry currently requires a Huawei login. The
-public SDK archive has a previewer, not a complete phone OS emulator image.
-After obtaining DevEco and a supported local image:
+The SDK-only command above is an initial ARM64 link check. For actual playback,
+use the official DevEco Studio emulator, a matching x86_64 image, and this
+branch's Rust runtime and full production NAPI bridges:
 
-1. Verify the image ABI before choosing the runtime. The package and xtask
-   currently support ARM64. An x86_64 emulator needs a matching C API build and
-   FFmpeg dependencies; renaming the ARM64 `.so` is not sufficient.
-2. Build/install a real HAP with the modified ArkTS bridge and attach an
-   XComponent. Push the BBB and audio/video fixtures via `hdc`.
-3. Observe actual decoded/rendered/audio frames, zero error counters, pause,
-   EOF seek, resume, rate, subtitle output, and surface resize/recreation.
-4. Keep an old native ID, destroy its player, create a new one, then execute
-   late invoke/poll/destroy calls against the old ID. The new player's media,
-   surface, state, and audio must remain unaffected. Repeat this on both
-   bridges. Host allocation-reuse checks are not a substitute for this stage.
-5. Save `hilog`, `hdc` install/start results, emulator image/ABI/version, and
-   screenshots of actual playback before marking the platform verified.
+```sh
+bash /review-logs/ohos-x86_64-deps-build.sh
+bash /review-logs/ohos-x86_64-runtime-build.sh
+bash /review-logs/ohos-x86_64-bridges-build.sh
+```
 
-These steps are pending; no emulator result is claimed in this report.
+Copy these scripts and their CMake project directory from this folder to
+`/review-logs` first. `ohos-live/setup.ps1` prepares the ArkTS HAP project and
+stages the source and fixture files. Build with `devecocli build`, install
+the unsigned HAP on the official emulator with `hdc install`, then start
+`com.aimesoft.erika.review/EntryAbility` with `hdc shell aa start`.
+
+The app runs two XComponents, each through a production bridge, and records
+video/audio playback, pause, EOF/middle seek, rate changes, actual NativeWindow
+detach/attach, MP3 output, 64 create/destroy cycles, and stale-ID rejection.
+Export the two JSONL files from filesDir to `ohos-arkts-review.jsonl` and
+`ohos-flutter-review.jsonl`, run `python summarize-ohos-live.py /path/to/output`,
+and inspect an hdc screenshot.
+
+Alternatively, run the collector to wait for both bridges and check the summary:
+
+```powershell
+./collect-ohos-live.ps1 -Hdc C:\path\to\hdc.exe -OutputDirectory C:\path\to\output -ApiVersion 18 -OperatingSystem OpenHarmony-5.1.0.105
+```
+
+It leaves the
+emulator running on failure or timeout. The current host samples after pause
+has settled and compares a second sample, then separately checks the paused
+EOF seek. Older JSONL files without `pause-settled` do not satisfy this check.
+
+For Windows audio, install `numpy` and `soundcard`, then run
+`python wasapi-loopback.py C:\path\to\Erika` with the same DLL/media layout.
+It records two seconds from the real default WASAPI output, requires nonzero
+PCM and actual audio consumption, and saves `merge-wasapi-loopback.wav`.
+
+See `../ohos-runtime.zh.md` and `../merge-validation.zh.md` for versions,
+binaries, results, failed attempts and coverage limits. This is production
+NAPI execution in an ArkTS app; it does not run a full Flutter engine or
+establish physical-device zero-copy performance.

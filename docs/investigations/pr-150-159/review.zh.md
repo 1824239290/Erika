@@ -12,7 +12,9 @@ Erika 是 NipaPlay 的嵌入式播放内核，负责解码、时序、渲染、�
 
 **结论：8 个 PR 的局部改动进入合并候选；#152 缺真实受影响输入，#157 的问题前提尚未成立。**
 #152 与 #159 的当前产品价值较低，后者不改变正常外挂字幕的 FFmpeg 路径。
-已将适合保留的部分整理为独立提交，并修正数处原实现缺口。尚未发布、合并或关闭 GitHub PR。
+已将适合保留的部分整理为独立提交，并修正数处原实现缺口。
+集成 PR 为 [#164](https://github.com/AimesSoft/liberika/pull/164)。最新验证见 [2026-10-13 集成验证](merge-validation.zh.md)。
+下文提交号、计数和环境是最初审阅及 10 月 8 日验证记录；最终主分支集成结果以上述最新验证为准。
 
 ## 逐项判断
 
@@ -57,7 +59,8 @@ Linux 原生 demo 另对 5 秒附封面 MP3 消费了 144480 个音频帧；demo
 “最大 mastering 亮度低于 1 nit”不适合作为 HDR 峰值；最低亮度低于 1 nit 是正常数据，必须保留。
 35 个 frame/HDR 测试通过，但均不能代替真实异常 mastering 文件和 HDR 显示器上的对比。
 原 PR 没给出坏片源，0.0001 nit 是“已知 sentinel”的说法没有可核验来源。
-可以作为小型防御改动，优先级低于播放与生命周期修复。
+10 月 13 日尝试生成真实异常 mastering 文件，但 FFmpeg 未暴露所需亮度元数据，未证明实际受影响路径。
+因此本次集成通过 `0004667` 撤回此改动；历史测试日志保留，不作为合入依据。
 
 提交：`bf23517`。证据：`pr152-reviewed.log`。
 
@@ -79,7 +82,9 @@ Linux 原生 demo 另对 5 秒附封面 MP3 消费了 144480 个音频帧；demo
 原生 Windows COM 接口 harness 调用生产 GetCurrentPadding／GetBuffer／ReleaseBuffer，4 项通过。
 它有真实 ABI 交互，但仍是受控 endpoint，不能代替真实声卡故障。
 
-本机默认音频 endpoint 查询返回 `0x80070490`，因此真实 WASAPI 输出与设备重连未验证。
+初次审阅时本机默认音频 endpoint 查询返回 `0x80070490`。10 月 13 日 Remote Audio 可用期间，
+已完成真实默认 endpoint 提交、附封面 MP3 消费及 WASAPI 回环录音；后续 endpoint 断开导致复验失败。
+真实设备异常重连仍未验证。精确结果及录音哈希见最新集成验证。
 CoreAudio 部分详见 [Apple 交接](apple-handoff.zh.md)。
 
 提交：`84d62de`。证据：`pr154-original-com.log`、`pr154-original-native.log`、`pr154-reviewed.log`。
@@ -166,7 +171,7 @@ SRT/VTT 按 whitespace-only 行分块修复了公共 `parse_srt`／`parse_webvtt
 
 提交：`28e949a`。证据：`pr159-baseline.log`、`pr159-reviewed.log`、`final-linux-subtitle-pixels.log`。
 
-## 真实运行与覆盖边界
+## 初次审阅及 10 月 8 日的真实运行与覆盖边界
 
 | 环境 | 实际执行 | 结果与边界 |
 |---|---|---|
@@ -191,7 +196,7 @@ SRT/VTT 按 whitespace-only 行分块修复了公共 `parse_srt`／`parse_webvtt
 
 原视频来自 Blender Foundation / Big Buck Bunny，媒体元数据标注 CC BY 3.0。
 
-## 汇总回归
+## 初次审阅汇总回归
 
 Windows：erika 单元 702 通过／1 ignored，integration 4＋6 通过，C API 42 通过。
 Linux：erika 单元 677 通过／2 ignored，integration 4＋6 通过，C API 41 通过。
