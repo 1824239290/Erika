@@ -680,6 +680,7 @@ dependencies = [
  "tokio-util",
  "wgpu",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

@@ -777,9 +777,18 @@ fn requested_device_limits(adapter_limits: wgpu::Limits, backend: wgpu::Backend)
     } else {
         wgpu::Limits::downlevel_defaults()
     };
-    baseline
+    let mut limits = baseline
         .using_resolution(adapter_limits.clone())
-        .using_alignment(adapter_limits)
+        .using_alignment(adapter_limits.clone());
+    if backend == wgpu::Backend::Gl {
+        // Some phone emulators expose fewer varyings than the WebGL2 baseline.
+        // Our presentation shaders use only a few; asking for all 15 prevents
+        // device creation even when these shaders fit the adapter.
+        limits.max_inter_stage_shader_variables = limits
+            .max_inter_stage_shader_variables
+            .min(adapter_limits.max_inter_stage_shader_variables);
+    }
+    limits
 }
 
 fn wgpu_instance_flags() -> wgpu::InstanceFlags {
@@ -2720,6 +2729,12 @@ impl WgpuRenderer {
                 PlayerError::Renderer(format!("stage=ohos_native_image_conversion reason={error}"))
             })?;
         let Some(texture) = texture else {
+            // The NativeImage could not produce a texture this tick. Keeping
+            // the previous frame on screen is correct, but the drop must stay
+            // observable instead of silently mimicking a successful import.
+            crate::trace::log(
+                "[erika-wgpu-trace] stage=ohos_native_image_conversion result=texture_not_ready",
+            );
             return Ok(());
         };
         let uniforms = self
@@ -6096,6 +6111,7 @@ mod tests {
         let adapter_limits = wgpu::Limits {
             max_texture_dimension_2d: 8192,
             max_uniform_buffer_binding_size: 16 * 1024,
+            max_inter_stage_shader_variables: 7,
             max_compute_workgroup_storage_size: 0,
             max_compute_invocations_per_workgroup: 0,
             max_compute_workgroup_size_x: 0,
@@ -6105,11 +6121,12 @@ mod tests {
             ..wgpu::Limits::downlevel_webgl2_defaults()
         };
 
-        let requested = requested_device_limits(adapter_limits, wgpu::Backend::Gl);
+        let requested = requested_device_limits(adapter_limits.clone(), wgpu::Backend::Gl);
 
         assert_eq!(requested.max_texture_dimension_2d, 8192);
         assert_eq!(requested.max_uniform_buffer_binding_size, 16 * 1024);
         assert_eq!(requested.max_compute_workgroups_per_dimension, 0);
+        assert!(requested.check_limits(&adapter_limits));
     }
 
     #[test]
