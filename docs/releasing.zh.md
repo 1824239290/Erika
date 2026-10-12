@@ -36,7 +36,7 @@ git push origin "v${VERSION}"
 - 用已上传的校验值更新 Flutter 和 OHPM 的版本与 `native_artifacts.properties`，提交到 `main`。
 - 创建内部 `erika_flutter-vX.Y.Z` tag，触发 [Flutter OIDC 发布](../.github/workflows/flutter-package.yml)。
 - 构建 ArkTS HAR 并上传 OHPM。
-- 组装 Swift XCFramework，追加到核心 Release 和 `SHA256SUMS`，通知 ErikaSwift 更新、测试并发布对应版本。
+- 组装 Swift XCFramework，追加到核心 Release 和 `SHA256SUMS`，通知 liberika-swift 更新、测试并发布对应版本。
 
 Flutter、OHPM 和 Swift 发布可以并行进行。维护者只创建核心 tag；跨仓库 tag 和 Swift 发布使用仓库 secret `ERIKA_SWIFT_RELEASE_TOKEN`。
 

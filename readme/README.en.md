@@ -28,7 +28,7 @@ Current release: **0.2.1**. Start with the [documentation index](../docs/README.
 | Host | Install / entry point | Guide |
 |---|---|---|
 | Flutter | `flutter pub add erika_flutter` (0.2.1) | [Plugin guide](../packages/erika_flutter/README.md) |
-| Swift / Apple | Add `https://github.com/AimesSoft/ErikaSwift` in Xcode, from 0.2.1 | [ErikaSwift](https://github.com/AimesSoft/ErikaSwift) |
+| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode, from 0.2.1 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | Matching C ABI bundle and `erika.h` | [Native integration](../docs/integration.md) |
 | Rust | Git dependency pinned to `v0.2.1` | [Build guide](../docs/building.md) |

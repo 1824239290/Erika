@@ -28,7 +28,7 @@
 | ホスト | インストール / 入口 | ガイド |
 |---|---|---|
 | Flutter | `flutter pub add erika_flutter`（0.2.1） | [プラグイン](../packages/erika_flutter/README.ja.md) |
-| Swift / Apple | Xcode に `https://github.com/AimesSoft/ErikaSwift` を追加、0.2.1 以降 | [ErikaSwift](https://github.com/AimesSoft/ErikaSwift) |
+| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加、0.2.1 以降 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
 | Rust | Git 依存を `v0.2.1` に固定 | [ビルド](../docs/building.ja.md) |

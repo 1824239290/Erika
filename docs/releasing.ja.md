@@ -36,7 +36,7 @@ git push origin "v${VERSION}"
 - 公開済みの checksum で Flutter/OHPM version と `native_artifacts.properties` を更新し、metadata を `main` に commit。
 - 内部 tag `erika_flutter-vX.Y.Z` を作成し、[Flutter OIDC 公開](../.github/workflows/flutter-package.yml)を開始。
 - ArkTS HAR を build し OHPM に upload。
-- Swift XCFramework を組み立て、コア Release と `SHA256SUMS` に追加。ErikaSwift に更新・テスト・同じ version の公開を通知。
+- Swift XCFramework を組み立て、コア Release と `SHA256SUMS` に追加。liberika-swift に更新・テスト・同じ version の公開を通知。
 
 Flutter、OHPM、Swift の公開は並列実行できます。メンテナーが作成するのはコア tag だけです。別 repository の tag と Swift 公開には secret `ERIKA_SWIFT_RELEASE_TOKEN` を使います。
 

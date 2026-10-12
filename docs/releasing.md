@@ -36,7 +36,7 @@ git push origin "v${VERSION}"
 - Updates Flutter/OHPM versions and `native_artifacts.properties` with the uploaded checksums, committing the metadata to `main`.
 - Creates the internal `erika_flutter-vX.Y.Z` tag to trigger [Flutter OIDC publishing](../.github/workflows/flutter-package.yml).
 - Builds the ArkTS HAR and uploads it to OHPM.
-- Assembles the Swift XCFramework, appends it to the core Release and `SHA256SUMS`, and dispatches ErikaSwift to update, test, and publish its matching version.
+- Assembles the Swift XCFramework, appends it to the core Release and `SHA256SUMS`, and dispatches liberika-swift to update, test, and publish its matching version.
 
 Flutter, OHPM, and Swift publishing can run in parallel. Maintainers create only the core tag. Cross-repository tags and Swift publishing use the repository secret `ERIKA_SWIFT_RELEASE_TOKEN`.
 
