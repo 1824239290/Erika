@@ -1211,7 +1211,8 @@ impl Player {
         self.inner.lock().expect("player mutex poisoned").state
     }
 
-    pub(crate) fn is_stopped_at_end(&self) -> bool {
+    /// Playback stopped because the media ended, as opposed to `stop()`.
+    pub fn is_stopped_at_end(&self) -> bool {
         let inner = self.inner.lock().expect("player mutex poisoned");
         inner.state == PlayerState::Stopped && inner.ended
     }
