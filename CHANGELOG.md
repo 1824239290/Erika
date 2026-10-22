@@ -30,6 +30,29 @@
   Retries reject changed entity validators instead of mixing file versions.
   Entity validation failures also block synchronous fallback and later reads;
   weak ETags cannot authorize resuming a partial response.
+- Added a process-wide diagnostics log ring, read with the new
+  `erika_log_read_json`. It keeps operational diagnostics (with a level and
+  timestamp), operational failures that previously went to bare stderr, and
+  FFmpeg warnings and errors through an `av_log` bridge that never blocks,
+  folds repeats and rate-limits floods. Exports are redacted (URL query strings
+  and user info, credentials, home directories). Existing stderr, logcat and
+  hilog output is unchanged; `ERIKA_FFMPEG_LOG_CAPTURE=0` turns FFmpeg capture
+  off, and Linux builds against a shared system FFmpeg capture only with
+  `ERIKA_FFMPEG_LOG_CAPTURE=1`.
+- Added `erika_presenter_get_diagnostics_json`, a one-call JSON snapshot of the
+  decoder and hardware path, presenter counters, output/HDR, resources,
+  upscaler, audio, buffer depths and timing. Timing adds counters that did not
+  exist before: frames the scheduler dropped for being late, late frames shown
+  after the drop budget ran out, presentation cadence and jitter, and audio
+  clock drift, corrections and snaps. Existing structs are unchanged.
+- `erika_presenter_invoke_json` is now a discoverable pass-through: one
+  dispatch table backs it, `listMethods` returns that table with arguments and
+  results, `invokeJson` nests a call, `listMethods`/`getLogs` accept a NULL
+  handle, and unknown methods return `"code": "unknown_method"`. The table adds
+  `getDiagnosticsSnapshot`, `getLogs`, `setDebugHudEnabled`,
+  `setOutputHeadroom`, `trackSelection`, `getDanmakuConfig`,
+  `setSubtitleFont` and `setSubtitleStyle`; Android's JSON bridge falls back to
+  it for methods it does not implement itself.
 
 ## 0.2.1 - 2026-10-02
 

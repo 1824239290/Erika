@@ -847,7 +847,16 @@ ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *handle, ErikaEvent 
 
 /* JSON bridge used by embedders whose platform channel already serializes
  * structured arguments. Returned strings are owned by liberika and must be
- * released with erika_string_free. poll_event_json returns NULL when idle. */
+ * released with erika_string_free. poll_event_json returns NULL when idle.
+ *
+ * invoke_json is also the generic pass-through into liberika: method names
+ * come from one dispatch table, and "listMethods" returns that table (name,
+ * scope, arguments, result) so hosts can forward new capabilities without
+ * code changes. Methods with scope "global" ("listMethods", "getLogs")
+ * accept a NULL handle. The response is {"ok":true,"status":0,"value":...}
+ * or {"ok":false,"status":n,"error":"..."}; an unknown method adds
+ * "code":"unknown_method" and "method", malformed arguments JSON adds
+ * "code":"invalid_arguments". */
 char *erika_presenter_invoke_json(
     ErikaPresenterHandle *handle,
     const char *method,
@@ -856,6 +865,46 @@ char *erika_presenter_render_tick_json(
     ErikaPresenterHandle *handle,
     double time_seconds);
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *handle);
+
+/* ===== Diagnostics (JSON) =====
+ * New diagnostic data is returned as JSON documents, never as new fields on
+ * the structs above. Both functions may be missing from older native
+ * libraries: resolve them optionally (dlsym / GetProcAddress) and treat a
+ * missing symbol as "not supported". On Ok, *out_json receives a caller-owned
+ * NUL-terminated UTF-8 document; free it with erika_string_free. It is NULL on
+ * any other status. Each document has a "schema" number; fields are only
+ * added within a schema. Layout: docs/capi_reference.md, "Diagnostics". */
+typedef enum ErikaLogLevel {
+  ErikaLogLevel_Trace = 0,
+  ErikaLogLevel_Debug = 1,
+  ErikaLogLevel_Info = 2,
+  ErikaLogLevel_Warn = 3,
+  ErikaLogLevel_Error = 4,
+} ErikaLogLevel;
+
+/* Process-wide log ring: liberika's operational diagnostics plus FFmpeg
+ * warnings and errors. Returns the newest `limit` entries (0 = every retained
+ * entry) at or above min_level (an ErikaLogLevel, or -1 for every level) with
+ * seq >= since_seq (0 = from the oldest; pass the previous "nextSeq" to read
+ * incrementally). Entries are oldest first and redacted: URL query strings
+ * and user info, credential-like values and headers, the user's home
+ * directory. The ring holds at most 2000 entries / 512 KiB. Needs no handle
+ * and may be called from any thread. */
+ErikaStatus erika_log_read_json(
+    uint32_t limit,
+    int32_t min_level,
+    uint64_t since_seq,
+    char **out_json);
+
+/* One-call presenter snapshot: decoder and hardware-decode path, presenter
+ * counters and stage durations, output/HDR, resources, upscaler, audio,
+ * buffer depths, and timing (scheduler late drops, presentation cadence and
+ * jitter, clock drift and corrections). Unknown values are null. It only
+ * reads counters: no decoding or rendering, and it never waits on the
+ * playback worker. Same threading rule as every other handle call. */
+ErikaStatus erika_presenter_get_diagnostics_json(
+    ErikaPresenterHandle *handle,
+    char **out_json);
 
 /* Screenshot: render the current composited frame (video + subtitle, no
  * danmaku) off-screen into a caller-allocated RGBA8 buffer at the requested

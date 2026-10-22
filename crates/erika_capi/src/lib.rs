@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "android")]
 mod android_jni;
+mod diagnostics;
+pub use diagnostics::ErikaLogLevel;
 #[cfg(any(
     target_os = "macos",
     any(target_os = "ios", target_os = "tvos"),
