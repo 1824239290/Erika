@@ -13,6 +13,7 @@ use crate::core::{
     ChapterInfo, MediaRequest, MediaSourceHint, TrackInfo, TrackKind, TrackSelection,
     VideoDecoderEvent, VideoFrameImportFailure, VideoParams,
 };
+use crate::diagnostics::{PlaybackTimingCounters, QueueDepths};
 use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
     DoviRejectReason, Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat, StreamSelection,
@@ -1280,7 +1281,10 @@ impl PlaybackSession {
                     subtitle_decoder = Some(decoder);
                 }
                 Err(error) => {
-                    eprintln!("Erika playback subtitle decoder open failed: {error}");
+                    trace::diagnostic_at(
+                        trace::LogLevel::Warn,
+                        format!("Erika playback subtitle decoder open failed: {error}"),
+                    );
                 }
             }
         }
@@ -4261,6 +4265,9 @@ pub struct VideoPlaybackEngine {
     video_seek_preroll_started_at: Option<Instant>,
     video_seek_preroll_dropped_frames: u64,
     last_video_seek_preroll_log: Option<Instant>,
+    /// Scheduler/clock/buffering counters read by diagnostics snapshots.
+    /// Replaced by the player's shared instance when it opens media.
+    timing_counters: Arc<PlaybackTimingCounters>,
 }
 
 impl VideoPlaybackEngine {
@@ -4349,6 +4356,8 @@ impl VideoPlaybackEngine {
         timing: PlaybackTimingConfig,
     ) -> Self {
         let buffer_recovery_audio = session.buffer_recovery_audio;
+        let timing_counters = Arc::new(PlaybackTimingCounters::new());
+        timing_counters.set_config(&timing);
         Self {
             session,
             state: PlaybackRunState::Paused,
@@ -4379,7 +4388,38 @@ impl VideoPlaybackEngine {
             video_seek_preroll_started_at: None,
             video_seek_preroll_dropped_frames: 0,
             last_video_seek_preroll_log: None,
+            timing_counters,
         }
+    }
+
+    /// Routes this engine's timing counters into `counters` (the player's
+    /// shared instance), restarting them for the newly opened media.
+    pub(crate) fn attach_timing_counters(&mut self, counters: Arc<PlaybackTimingCounters>) {
+        counters.reset(&self.timing);
+        self.timing_counters = counters;
+    }
+
+    pub(crate) fn timing_counters(&self) -> &PlaybackTimingCounters {
+        &self.timing_counters
+    }
+
+    /// Publishes queue depths for diagnostics. Called once per worker loop;
+    /// it only reads lengths and stores relaxed atomics.
+    pub(crate) fn publish_queue_depths(&self) {
+        let session = &self.session;
+        self.timing_counters.publish_queues(QueueDepths {
+            demux_packets: session.demuxer.packets.len(),
+            demux_packet_capacity: DEMUX_PACKET_QUEUE_LIMIT,
+            pending_video_packets: session.pending_video_packets.len(),
+            video_frames: session.video_frames.len() + usize::from(self.pending_frame.is_some()),
+            video_frame_limit: session.queue_limits.video_frames,
+            audio_frames: session.audio_frames.len() + usize::from(self.pending_audio.is_some()),
+            audio_frame_limit: session.queue_limits.audio_frames,
+            subtitle_frames: session.subtitle_frames.len()
+                + usize::from(self.pending_subtitle.is_some()),
+            subtitle_frame_limit: session.queue_limits.subtitle_frames,
+            demux_eof: session.demux_eof,
+        });
     }
 
     pub fn info(&self) -> &OpenedMediaInfo {
@@ -5156,6 +5196,7 @@ impl VideoPlaybackEngine {
             self.timing.audio_sync,
         );
         let after = self.clock.media_time_at(now);
+        self.timing_counters.record_clock_correction(&correction);
         trace_clock_correction(
             "output_audio_clock",
             before,
@@ -5388,6 +5429,7 @@ impl VideoPlaybackEngine {
                 seek_preroll_drops = seek_preroll_drops.saturating_add(1);
                 self.video_seek_preroll_dropped_frames =
                     self.video_seek_preroll_dropped_frames.saturating_add(1);
+                self.timing_counters.record_seek_preroll_drop();
                 let elapsed = tick_started.elapsed();
                 if seek_preroll_budget_exhausted(
                     seek_preroll_drops,
@@ -5447,11 +5489,13 @@ impl VideoPlaybackEngine {
                 .schedule(pts, media_time, should_present_first)
             {
                 VideoFrameDecision::Wait { .. } => return Ok(None),
-                VideoFrameDecision::Drop { .. }
+                VideoFrameDecision::Drop { late_by }
                     if consecutive_drops < self.timing.video_scheduler.max_consecutive_drops =>
                 {
                     let _ = self.pending_frame.take();
                     consecutive_drops += 1;
+                    self.timing_counters
+                        .record_late_drop(late_by, consecutive_drops);
                 }
                 decision => {
                     #[cfg(target_os = "android")]
@@ -5459,6 +5503,12 @@ impl VideoPlaybackEngine {
                         return Ok(None);
                     }
                     let frame = self.pending_frame.take().expect("pending frame exists");
+                    match decision {
+                        VideoFrameDecision::Drop { late_by } => {
+                            self.timing_counters.record_forced_late_present(late_by)
+                        }
+                        decision => self.timing_counters.record_present(decision.late_by()),
+                    }
                     self.last_presented_pts = pts;
                     if paused_seek_preview {
                         self.paused_seek_frame_pending = false;
@@ -7285,6 +7335,51 @@ mod tests {
         assert_eq!(after.media_time, Duration::from_secs(5));
         assert_eq!(after.source, PlaybackClockSource::Audio);
         assert_eq!(after.rate, 2.0);
+
+        // The correction that used to reach only the opt-in clock trace is
+        // now counted for diagnostics.
+        let clock = engine.timing_counters().clock_json();
+        assert_eq!(clock["observations"], 1);
+        assert_eq!(clock["snaps"], 1);
+        assert_eq!(clock["corrections"], 0);
+        assert_eq!(clock["forwardCorrections"], 1);
+        assert!(clock["lastDriftMs"].as_f64().unwrap() > 4_000.0);
+        assert!(clock["lastSnapAgoMs"].as_f64().is_some());
+    }
+
+    #[test]
+    fn playback_fixture_scheduler_counts_late_drops_and_presents() {
+        let mut engine = playback_fixture_engine();
+        let counters = Arc::new(PlaybackTimingCounters::new());
+        engine.attach_timing_counters(Arc::clone(&counters));
+        assert_eq!(counters.scheduler_json()["dropToleranceMs"], 120.0);
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let _ = next_fixture_video_at(&mut engine, t0);
+        assert_eq!(counters.presented_frames(), 1);
+        assert_eq!(counters.late_dropped_frames(), 0);
+
+        // Two seconds on, the frames queued right after the first one are far
+        // past the 120 ms drop tolerance: the scheduler discards them (at most
+        // five in a row) before presenting again.
+        let late_at = t0 + Duration::from_secs(2);
+        let _ = next_fixture_video_at(&mut engine, late_at);
+        let scheduler = counters.scheduler_json();
+        assert!(counters.late_dropped_frames() >= 1, "{scheduler}");
+        assert!(counters.presented_frames() >= 2, "{scheduler}");
+        let burst = scheduler["maxDropBurst"].as_u64().unwrap();
+        assert!((1..=5).contains(&burst), "{scheduler}");
+        assert!(scheduler["maxDroppedLateMs"].as_f64().unwrap() > 120.0);
+        assert!(scheduler["lastDropAgoMs"].as_f64().is_some());
+        assert_eq!(
+            scheduler["lateByMs"]["samples"],
+            counters.presented_frames()
+        );
+
+        engine.publish_queue_depths();
+        let queues = counters.queues_json();
+        assert_eq!(queues["demuxPackets"]["capacity"], DEMUX_PACKET_QUEUE_LIMIT);
+        assert!(queues["decodedVideoFrames"]["capacity"].as_u64().unwrap() > 0);
     }
 
     fn clock_test_ring() -> crate::audio::AudioRingBuffer {
