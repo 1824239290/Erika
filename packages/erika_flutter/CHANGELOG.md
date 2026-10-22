@@ -9,6 +9,10 @@
   HarmonyOS and Android use the shared JSON bridge, and Windows (or an older
   native library) throws `UnsupportedError`. Requires native artifacts from
   the matching release.
+- Added `ErikaPlayer.exportFrame()`, which returns the picture shown at a
+  position of a media URI as RGBA or PNG through the native headless frame
+  export, off the UI thread (a native worker on macOS, a background isolate on
+  the FFI platforms).
 
 ## 0.2.1
 

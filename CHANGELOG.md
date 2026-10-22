@@ -61,6 +61,10 @@
   (`hwaccel_<backend>_to_software`, or `…_restored` when the hardware returns)
   with the software pixel format and the reason, counts the fallback, and tags
   frames with the backend that actually decoded them.
+- Added `erika_export_frame` and `erika_frame_export_result_free`: a headless
+  single-frame export that returns the picture shown at a media time as RGBA or
+  PNG, scaled within optional bounds, from its own demuxer and multi-threaded
+  software decoder.
 
 ## 0.2.1 - 2026-10-02
 

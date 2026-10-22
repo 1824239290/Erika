@@ -411,6 +411,33 @@ private struct ErikaGifExportResultC {
   var fileSize: UInt64 = 0
 }
 
+private struct ErikaFrameExportOptionsC {
+  var inputUri: UnsafePointer<CChar>?
+  var headers: UnsafeRawPointer?
+  var headerCount: UInt
+  var positionMillis: UInt64
+  var httpReadAheadBytes: UInt64
+  var maxWidth: UInt32
+  var maxHeight: UInt32
+  var format: Int32
+  var reservedFlags: UInt32 = 0
+  var reserved: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
+}
+
+private struct ErikaFrameExportResultC {
+  var data: UnsafeMutablePointer<UInt8>?
+  var dataLen: UInt = 0
+  var timestampMicros: UInt64 = 0
+  var durationMicros: UInt64 = 0
+  var width: UInt32 = 0
+  var height: UInt32 = 0
+  var sourceWidth: UInt32 = 0
+  var sourceHeight: UInt32 = 0
+  var format: Int32 = 0
+  var reservedFlags: UInt32 = 0
+  var reserved: (UInt64, UInt64) = (0, 0)
+}
+
 private struct ErikaEventC {
   var kind: Int32 = 0
   var status: Int32 = 0
@@ -682,6 +709,8 @@ private final class ErikaNativeLibrary {
   typealias SetOutputHeadroomFn = @convention(c) (UnsafeMutableRawPointer?, Float, Bool) -> Int32
   typealias CaptureFrameRgbaFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, UnsafeMutableRawPointer?, Int) -> Int32
   typealias ExportGifFn = @convention(c) (UnsafeRawPointer?, UnsafeMutableRawPointer?) -> Int32
+  typealias ExportFrameFn = @convention(c) (UnsafeRawPointer?, UnsafeMutableRawPointer?) -> Int32
+  typealias FrameExportResultFreeFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
   typealias PollEventFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias LastErrorMessageFn = @convention(c) () -> UnsafeMutablePointer<CChar>?
   typealias StringFreeFn = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
@@ -763,6 +792,8 @@ private final class ErikaNativeLibrary {
   let renderTick: RenderTickFn
   let captureFrameRgba: CaptureFrameRgbaFn?
   let exportGif: ExportGifFn?
+  let exportFrame: ExportFrameFn?
+  let frameExportResultFree: FrameExportResultFreeFn?
   let pollEvent: PollEventFn
   let setOutputHeadroom: SetOutputHeadroomFn?
   let lastErrorMessage: LastErrorMessageFn
@@ -839,6 +870,12 @@ private final class ErikaNativeLibrary {
     renderTick = try Self.load("erika_presenter_render_tick", from: libraryHandle, as: RenderTickFn.self)
     captureFrameRgba = Self.loadOptional("erika_presenter_capture_frame_rgba", from: libraryHandle, as: CaptureFrameRgbaFn.self)
     exportGif = Self.loadOptional("erika_export_gif", from: libraryHandle, as: ExportGifFn.self)
+    exportFrame = Self.loadOptional("erika_export_frame", from: libraryHandle, as: ExportFrameFn.self)
+    frameExportResultFree = Self.loadOptional(
+      "erika_frame_export_result_free",
+      from: libraryHandle,
+      as: FrameExportResultFreeFn.self
+    )
     pollEvent = try Self.load("erika_presenter_poll_event", from: libraryHandle, as: PollEventFn.self)
     setOutputHeadroom = Self.loadOptional("erika_presenter_set_output_headroom", from: libraryHandle, as: SetOutputHeadroomFn.self)
     lastErrorMessage = try Self.load("erika_last_error_message", from: libraryHandle, as: LastErrorMessageFn.self)
@@ -968,6 +1005,70 @@ private final class ErikaNativeLibrary {
       return createWithOutputMode(config.outputMode, config.edrHeadroom)
     }
     return create()
+  }
+
+  /// One picture through liberika's headless frame export, copied out of the
+  /// native buffer, which is released before returning. Runs on the calling
+  /// thread: call it from a worker queue.
+  func exportFrame(
+    inputUri: String,
+    positionMillis: UInt64,
+    maxWidth: UInt32,
+    maxHeight: UInt32,
+    format: Int32,
+    httpHeaders: [String: String],
+    httpReadAheadBytes: UInt64
+  ) throws -> [String: Any] {
+    guard let exportFrame, let frameExportResultFree else {
+      throw ErikaPluginError.diagnosticsUnsupported("erika_export_frame")
+    }
+    let names = httpHeaders.keys.map { strdup($0) }
+    let values = httpHeaders.values.map { strdup($0) }
+    defer {
+      names.forEach { free($0) }
+      values.forEach { free($0) }
+    }
+    let headers = zip(names, values).map { ErikaHttpHeader(name: $0.0, value: $0.1) }
+    return try inputUri.withCString { inputPtr in
+      try headers.withUnsafeBufferPointer { buffer in
+        var options = ErikaFrameExportOptionsC(
+          inputUri: inputPtr,
+          headers: buffer.baseAddress.map(UnsafeRawPointer.init),
+          headerCount: UInt(headers.count),
+          positionMillis: positionMillis,
+          httpReadAheadBytes: httpReadAheadBytes,
+          maxWidth: maxWidth,
+          maxHeight: maxHeight,
+          format: format
+        )
+        var exported = ErikaFrameExportResultC()
+        let status = withUnsafePointer(to: &options) { optionsPtr in
+          withUnsafeMutablePointer(to: &exported) { resultPtr in
+            exportFrame(UnsafeRawPointer(optionsPtr), UnsafeMutableRawPointer(resultPtr))
+          }
+        }
+        if status != 0 {
+          let detail = currentEventMessage() ?? "ErikaStatus \(status)"
+          throw ErikaPluginError.diagnosticsFailed("Frame export failed: \(detail)")
+        }
+        defer {
+          withUnsafeMutablePointer(to: &exported) { resultPtr in
+            frameExportResultFree(UnsafeMutableRawPointer(resultPtr))
+          }
+        }
+        let bytes = exported.data.map { Data(bytes: $0, count: Int(exported.dataLen)) } ?? Data()
+        return [
+          "width": Int(exported.width),
+          "height": Int(exported.height),
+          "format": Int(exported.format),
+          "bytes": FlutterStandardTypedData(bytes: bytes),
+          "timestampMicros": Int64(clamping: exported.timestampMicros),
+          "durationMicros": Int64(clamping: exported.durationMicros),
+          "sourceWidth": Int(exported.sourceWidth),
+          "sourceHeight": Int(exported.sourceHeight),
+        ]
+      }
+    }
   }
 
   /// Copies and frees a JSON string returned by a diagnostics function.
@@ -3211,6 +3312,40 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
                 "fileSize": Int64(exported.fileSize),
               ])
             }
+          } catch {
+            DispatchQueue.main.async { result(self.flutterError(error)) }
+          }
+        }
+      case "exportFrame":
+        let args = try dictionaryArgs(call.arguments)
+        guard let inputUri = args["uri"] as? String, !inputUri.isEmpty else {
+          throw ErikaPluginError.invalidArguments("uri is required.")
+        }
+        let positionMillis = try requiredUInt64(args["positionMillis"], name: "positionMillis")
+        guard let maxWidth = UInt32(exactly: int64Value(args["width"]) ?? 0),
+              let maxHeight = UInt32(exactly: int64Value(args["height"]) ?? 0),
+              let format = Int32(exactly: int64Value(args["format"]) ?? 1) else {
+          throw ErikaPluginError.invalidArguments("Frame export numeric arguments are out of range.")
+        }
+        let httpHeaders = (args["httpHeaders"] as? [String: String]) ?? [:]
+        let httpReadAheadBytes = try optionalReadAheadBytes(args["httpReadAheadBytes"])
+        // Decoding (a 4K keyframe interval) takes up to a second or so: never
+        // on the main thread.
+        DispatchQueue.global(qos: .userInitiated).async {
+          do {
+            guard let library = ErikaNativeLibrary.shared else {
+              throw ErikaPluginError.libraryNotFound([])
+            }
+            let exported = try library.exportFrame(
+              inputUri: inputUri,
+              positionMillis: positionMillis,
+              maxWidth: maxWidth,
+              maxHeight: maxHeight,
+              format: format,
+              httpHeaders: httpHeaders,
+              httpReadAheadBytes: httpReadAheadBytes
+            )
+            DispatchQueue.main.async { result(exported) }
           } catch {
             DispatchQueue.main.async { result(self.flutterError(error)) }
           }

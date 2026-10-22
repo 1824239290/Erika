@@ -72,6 +72,37 @@ ErikaStatus status = erika_export_gif(&options, &result);
 `-1` 不循环、`0` 无限循环、正数表示循环次数。HTTP 输入可使用与
 `ErikaOpenOptions` 相同的请求头和 read-ahead 覆盖参数。
 
+## Headless 单帧导出
+
+`erika_export_frame` 同样独立于两个 handle 族。它创建私有的 demuxer 和多线程软件解码器，
+跳到 `position_millis` 之前的关键帧后向前解码，返回该媒体时间显示的画面：时间不晚于它的最后一帧
+（位置早于第一帧时为第一帧）。
+
+```c
+ErikaFrameExportOptions options = {
+    .input_uri = "/path/input.mkv",
+    .position_millis = 60000,
+    .max_width = 640,
+    .max_height = 640,
+    .format = ErikaFrameExportFormat_Png,
+};
+ErikaFrameExportResult result = {0};
+if (erika_export_frame(&options, &result) == ErikaStatus_Ok) {
+    /* result.data 中是 result.data_len 字节的 PNG 文件。 */
+    erika_frame_export_result_free(&result);
+}
+```
+
+该调用是同步的；UI 宿主必须把它放到 worker thread 或 isolate 中执行。`max_width` 与
+`max_height` 限定画面尺寸（0 表示该边不限）：保持显示宽高比，且不会大于视频本身，两者都为 0
+时返回视频原尺寸。`ErikaFrameExportFormat_Rgba` 返回每行恰好 `width * 4` 字节、alpha 为 255
+的像素；`ErikaFrameExportFormat_Png` 返回 8 位 RGB 的 PNG 文件。色彩转换按帧的色彩空间与范围；
+未标注的 YUV 源在高清及以上按 BT.709、其余按 BT.601。HDR 源不做色调映射。结果给出画面所在时间
+（`timestamp_micros`）、解码后的视频尺寸与媒体时长（未知为 0）。位置不早于已知时长时返回
+`ErikaStatus_PlayerError`。HTTP 输入可使用与 `ErikaOpenOptions` 相同的请求头和 read-ahead
+覆盖参数。`data` 归 liberika 所有，直到调用 `erika_frame_export_result_free`；该函数会清空结果，
+可重复调用。
+
 ## 约定
 
 ### 状态码

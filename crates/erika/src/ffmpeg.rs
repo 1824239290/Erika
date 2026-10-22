@@ -1114,11 +1114,36 @@ impl Decoder {
         )
     }
 
+    /// Opens a software decoder that decodes on several threads (FFmpeg
+    /// picks the count), for one-off work such as a frame export. Playback
+    /// decoders keep FFmpeg's single-threaded default.
+    pub fn open_software_threaded(parameters: CodecParameters<'_>) -> Result<Self> {
+        Self::open_raw_with_threads(
+            parameters.ptr,
+            parameters.stream_index,
+            parameters.time_base,
+            DecoderConfig::software(),
+            Some(0),
+        )
+    }
+
     fn open_raw(
         parameters_ptr: *const sys::AVCodecParameters,
         stream_index: i32,
         time_base: TimeBase,
         config: DecoderConfig,
+    ) -> Result<Self> {
+        Self::open_raw_with_threads(parameters_ptr, stream_index, time_base, config, None)
+    }
+
+    /// `threads`: the codec context's thread count; `None` keeps FFmpeg's
+    /// default of one.
+    fn open_raw_with_threads(
+        parameters_ptr: *const sys::AVCodecParameters,
+        stream_index: i32,
+        time_base: TimeBase,
+        config: DecoderConfig,
+        threads: Option<i32>,
     ) -> Result<Self> {
         configure_ffmpeg_debug_logging();
         let codec_id = unsafe { (*parameters_ptr).codec_id };
@@ -1189,6 +1214,10 @@ impl Decoder {
         // of an undefined base.
         unsafe {
             (*decoder.context).pkt_timebase = time_base.to_av_rational();
+        }
+        if let Some(threads) = threads {
+            // 0: as many threads as FFmpeg finds useful for this codec.
+            unsafe { (*decoder.context).thread_count = threads };
         }
         let mut decoder = decoder;
         match config.backend {

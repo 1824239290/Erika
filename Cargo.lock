@@ -668,6 +668,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "pkg-config",
+ "png",
  "pollster",
  "regex",
  "reqwest",
