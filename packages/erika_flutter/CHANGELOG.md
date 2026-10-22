@@ -15,6 +15,8 @@
   the FFI platforms).
 - Large JSON documents from `getLogs()`, `getDiagnosticsSnapshot()` and
   `invokeJson()` are decoded on a background isolate.
+- The macOS build phase checks that an `ERIKA_MACOS_CAPI_DYLIB` override has
+  every architecture being built and says which library it bundles.
 
 ## 0.2.1
 
