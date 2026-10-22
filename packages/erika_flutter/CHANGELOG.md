@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added `ErikaPlayer.getDiagnosticsSnapshot()`, `getLogs()` and
+  `invokeJson()`. They return JSON maps from the native engine for automated
+  troubleshooting; `invokeJson('listMethods')` lists every native method.
+  macOS, iOS and tvOS resolve the new native symbols optionally, Linux,
+  HarmonyOS and Android use the shared JSON bridge, and Windows (or an older
+  native library) throws `UnsupportedError`. Requires native artifacts from
+  the matching release.
+
 ## 0.2.1
 
 - Added `httpBackBufferBytes` to `open`, forwarding the HTTP(S) rewind budget

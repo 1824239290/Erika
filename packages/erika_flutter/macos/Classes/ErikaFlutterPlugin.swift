@@ -556,6 +556,8 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
   case presenterCreateFailed
   case erikaStatus(String, Int32)
   case libraryLoadFailed(String, String?)
+  case diagnosticsUnsupported(String)
+  case diagnosticsFailed(String)
 
   var description: String {
     switch self {
@@ -584,6 +586,10 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
         return "\(path) (\(detail))"
       }
       return path
+    case .diagnosticsUnsupported(let symbol):
+      return "The loaded Erika native library does not export \(symbol). Update the bundled native library to use this method."
+    case .diagnosticsFailed(let message):
+      return message
     }
   }
 }
@@ -679,6 +685,23 @@ private final class ErikaNativeLibrary {
   typealias PollEventFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias LastErrorMessageFn = @convention(c) () -> UnsafeMutablePointer<CChar>?
   typealias StringFreeFn = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
+  // Diagnostics return caller-owned JSON strings (no mirrored structs), so
+  // both symbols are optional: older native libraries simply lack them.
+  typealias GetDiagnosticsJsonFn = @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+  ) -> Int32
+  typealias InvokeJsonFn = @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?
+  ) -> UnsafeMutablePointer<CChar>?
+  typealias LogReadJsonFn = @convention(c) (
+    UInt32,
+    Int32,
+    UInt64,
+    UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+  ) -> Int32
 
   static let shared = try? ErikaNativeLibrary()
 
@@ -744,6 +767,9 @@ private final class ErikaNativeLibrary {
   let setOutputHeadroom: SetOutputHeadroomFn?
   let lastErrorMessage: LastErrorMessageFn
   let stringFree: StringFreeFn
+  let getDiagnosticsJson: GetDiagnosticsJsonFn?
+  let logReadJson: LogReadJsonFn?
+  let invokeJson: InvokeJsonFn?
 
   private let libraryHandle: UnsafeMutableRawPointer
 
@@ -817,6 +843,9 @@ private final class ErikaNativeLibrary {
     setOutputHeadroom = Self.loadOptional("erika_presenter_set_output_headroom", from: libraryHandle, as: SetOutputHeadroomFn.self)
     lastErrorMessage = try Self.load("erika_last_error_message", from: libraryHandle, as: LastErrorMessageFn.self)
     stringFree = try Self.load("erika_string_free", from: libraryHandle, as: StringFreeFn.self)
+    getDiagnosticsJson = Self.loadOptional("erika_presenter_get_diagnostics_json", from: libraryHandle, as: GetDiagnosticsJsonFn.self)
+    logReadJson = Self.loadOptional("erika_log_read_json", from: libraryHandle, as: LogReadJsonFn.self)
+    invokeJson = Self.loadOptional("erika_presenter_invoke_json", from: libraryHandle, as: InvokeJsonFn.self)
   }
 
   deinit {
@@ -939,6 +968,31 @@ private final class ErikaNativeLibrary {
       return createWithOutputMode(config.outputMode, config.edrHeadroom)
     }
     return create()
+  }
+
+  /// Copies and frees a JSON string returned by a diagnostics function.
+  func takeJsonString(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
+    guard let pointer else {
+      return nil
+    }
+    defer { stringFree(pointer) }
+    return String(validatingUTF8: pointer)
+  }
+
+  func readLogsJson(limit: UInt32, minLevel: Int32, sinceSeq: UInt64) throws -> String {
+    guard let logReadJson else {
+      throw ErikaPluginError.diagnosticsUnsupported("erika_log_read_json")
+    }
+    var output: UnsafeMutablePointer<CChar>?
+    let status = logReadJson(limit, minLevel, sinceSeq, &output)
+    guard status == 0 else {
+      let detail = currentEventMessage() ?? "ErikaStatus \(status)"
+      throw ErikaPluginError.diagnosticsFailed("erika_log_read_json failed: \(detail)")
+    }
+    guard let json = takeJsonString(output) else {
+      throw ErikaPluginError.diagnosticsFailed("erika_log_read_json returned no JSON")
+    }
+    return json
   }
 
   func currentEventMessage() -> String? {
@@ -1395,6 +1449,42 @@ private final class ErikaPlayerHost {
     }
     try check(result, operation: "get_resource_status")
     return status.toFlutterMap()
+  }
+
+  /// Generic pass-through into liberika's JSON method table. Returns the
+  /// response envelope (`{"ok":…}`) as JSON text for Dart to decode.
+  func invokeJson(method: String, argumentsJson: String) throws -> String {
+    guard let invoke = library.invokeJson else {
+      throw ErikaPluginError.diagnosticsUnsupported("erika_presenter_invoke_json")
+    }
+    let response = withNativeCall {
+      method.withCString { methodPointer in
+        argumentsJson.withCString { argumentsPointer in
+          invoke(handle, methodPointer, argumentsPointer)
+        }
+      }
+    }
+    guard let json = library.takeJsonString(response) else {
+      throw ErikaPluginError.diagnosticsFailed("erika_presenter_invoke_json returned no JSON")
+    }
+    return json
+  }
+
+  /// Diagnostics snapshot JSON (schema 1). Returned to Dart as a string and
+  /// decoded there, so new fields need no plugin change.
+  func diagnosticsSnapshotJson() throws -> String {
+    guard let getDiagnostics = library.getDiagnosticsJson else {
+      throw ErikaPluginError.diagnosticsUnsupported("erika_presenter_get_diagnostics_json")
+    }
+    var output: UnsafeMutablePointer<CChar>?
+    let result = withNativeCall {
+      getDiagnostics(handle, &output)
+    }
+    try check(result, operation: "get_diagnostics_json")
+    guard let json = library.takeJsonString(output) else {
+      throw ErikaPluginError.diagnosticsFailed("erika_presenter_get_diagnostics_json returned no JSON")
+    }
+    return json
   }
 
   func presenterStats() -> [String: Any] {
@@ -2903,6 +2993,35 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       case "getResourceStatus":
         let args = try dictionaryArgs(call.arguments)
         result(try playerHost(from: args).resourceStatus())
+      case "getDiagnosticsSnapshot":
+        let args = try dictionaryArgs(call.arguments)
+        result(try playerHost(from: args).diagnosticsSnapshotJson())
+      case "invokeJson":
+        let args = try dictionaryArgs(call.arguments)
+        guard let method = args["method"] as? String, !method.isEmpty else {
+          throw ErikaPluginError.invalidArguments("method is required.")
+        }
+        let rawArguments = args["arguments"]
+        let arguments: [String: Any]
+        if rawArguments == nil || rawArguments is NSNull {
+          arguments = [:]
+        } else if let dictionary = rawArguments as? [String: Any] {
+          arguments = dictionary
+        } else {
+          throw ErikaPluginError.invalidArguments("arguments must be a map.")
+        }
+        guard JSONSerialization.isValidJSONObject(arguments) else {
+          throw ErikaPluginError.invalidArguments("arguments must be JSON-compatible.")
+        }
+        let data = try JSONSerialization.data(withJSONObject: arguments)
+        result(try playerHost(from: args).invokeJson(
+          method: method,
+          argumentsJson: String(decoding: data, as: UTF8.self)
+        ))
+      case "getLogs":
+        // The log ring is process-wide; playerId is accepted but not needed.
+        let args = try dictionaryArgs(call.arguments)
+        result(try readLogsJson(arguments: args))
       case "getPresenterStats":
         let args = try dictionaryArgs(call.arguments)
         result(try playerHost(from: args).presenterStats())
@@ -3967,8 +4086,51 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     throw ErikaPluginError.invalidArguments("\(name) is required.")
   }
 
+  private func readLogsJson(arguments args: [String: Any]) throws -> String {
+    guard let library = ErikaNativeLibrary.shared else {
+      throw ErikaPluginError.libraryNotFound([])
+    }
+    let limit = try diagnosticsCount(args["limit"], name: "limit", defaultValue: 200)
+    let sinceSeq = try diagnosticsCount(args["sinceSeq"], name: "sinceSeq", defaultValue: 0)
+    return try library.readLogsJson(
+      limit: UInt32(min(limit, UInt64(UInt32.max))),
+      minLevel: try diagnosticsLogLevel(args["minLevel"]),
+      sinceSeq: sinceSeq
+    )
+  }
+
+  private func diagnosticsCount(_ value: Any?, name: String, defaultValue: UInt64) throws -> UInt64 {
+    if value == nil || value is NSNull {
+      return defaultValue
+    }
+    if let number = value as? NSNumber, number.int64Value >= 0 {
+      return number.uint64Value
+    }
+    throw ErikaPluginError.invalidArguments("\(name) must be a non-negative integer.")
+  }
+
+  private func diagnosticsLogLevel(_ value: Any?) throws -> Int32 {
+    if value == nil || value is NSNull {
+      return -1
+    }
+    let names = ["trace", "debug", "info", "warn", "error"]
+    if let name = value as? String {
+      let lowered = name.lowercased()
+      if let index = names.firstIndex(of: lowered == "warning" ? "warn" : lowered) {
+        return Int32(index)
+      }
+    } else if let number = value as? NSNumber, (0...4).contains(number.intValue) {
+      return Int32(number.intValue)
+    }
+    throw ErikaPluginError.invalidArguments("minLevel must be one of \(names.joined(separator: ", ")).")
+  }
+
   private func flutterError(_ error: Error) -> FlutterError {
-    FlutterError(
+    if let pluginError = error as? ErikaPluginError,
+       case .diagnosticsUnsupported = pluginError {
+      return FlutterError(code: "ERIKA_UNSUPPORTED", message: String(describing: error), details: nil)
+    }
+    return FlutterError(
       code: "ERIKA_ERROR",
       message: String(describing: error),
       details: nil

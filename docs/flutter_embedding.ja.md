@@ -204,6 +204,27 @@ output negotiation、danmaku item count を表示します。FPS は隣接 sampl
 その他の frame/failure counter は presenter lifetime 中の累積値です。HUD は
 `screenshot()` の off-screen capture には含まれません。
 
+## ホストとエージェント向けの診断
+
+3 つのメソッドが自動トラブルシューティング（カクつき、映像破損、デコード失敗、音ズレ）の
+ためにエンジン自身の視点を提供します。
+
+- `getDiagnosticsSnapshot()` は 1 つの JSON map（schema 1）を返します: デコーダと
+  ハードウェア経路・フォールバック、presenter カウンタ、出力/HDR、リソース、
+  アップスケーラ、オーディオ、バッファ深さ、タイミング（スケジューラの遅延ドロップ、
+  表示間隔とジッタ、クロックのドリフトと補正）。不明な値は `null` です。
+- `getLogs({limit, minLevel, sinceSeq})` はプロセス全体のマスク済みログリング
+  （liberika の運用診断と FFmpeg の警告・エラー）を読みます。
+- `invokeJson(method, [arguments])` はネイティブ JSON メソッド table の任意の項目を呼び、
+  envelope（`{ok, status, value | error, code?}`）を返します。
+  `invokeJson('listMethods')` で table を列挙できるので、新機能に Dart の変更は不要です。
+
+フィールドは [capi_reference.ja.md](capi_reference.ja.md) の「エージェント向け診断
+（JSON）」と「JSON ブリッジ」を参照してください。プラットフォームプラグインまたは同梱の
+ネイティブライブラリにメソッドが無い場合は `UnsupportedError` を投げます。本リリースの
+状況: macOS・iOS・tvOS は新シンボルをオプションで解決、Linux・HarmonyOS・Android は共有
+JSON table を経由、Windows は `UnsupportedError`。
+
 ## Neural Upscaler Status
 
 `setUpscaler` はモードを要求するだけで、kernel は background thread で compile されます。そのため host は `getUpscalerStatus` を poll して UI を更新する必要があります。
