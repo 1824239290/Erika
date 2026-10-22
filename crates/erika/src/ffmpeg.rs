@@ -8,6 +8,7 @@ use std::slice;
 use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::time::Duration;
 
 use crate::core::{
@@ -937,6 +938,79 @@ struct HardwareDecoderState {
     device_ref: *mut sys::AVBufferRef,
     frames_ref: *mut sys::AVBufferRef,
     pixel_format: sys::AVPixelFormat,
+    /// What FFmpeg's pixel-format negotiation last chose; see [`HardwareRoute`].
+    route: HardwareRoute,
+}
+
+impl HardwareDecoderState {
+    fn new(
+        device_ref: *mut sys::AVBufferRef,
+        frames_ref: *mut sys::AVBufferRef,
+        pixel_format: sys::AVPixelFormat,
+    ) -> Self {
+        Self {
+            device_ref,
+            frames_ref,
+            pixel_format,
+            route: HardwareRoute::default(),
+        }
+    }
+}
+
+/// FFmpeg negotiates a hardware decoder's output format in `get_format`,
+/// again after every stream parameter change. When the hwaccel fails to
+/// initialise (or is not offered for the stream), FFmpeg asks once more
+/// without the hardware format and, for VideoToolbox and D3D11VA, decodes in
+/// software from then on while `avcodec_open2` had succeeded. The callback
+/// records each choice here so the decoder reports the backend that is
+/// actually decoding.
+#[derive(Default)]
+struct HardwareRoute {
+    /// `ROUTE_*`: nothing negotiated yet, hardware, or software.
+    state: AtomicU8,
+    /// The hardware format was handed to FFmpeg by the previous call.
+    hardware_offered: AtomicBool,
+    /// The previous call returned the hardware format and FFmpeg then asked
+    /// without it: its hwaccel failed to initialise.
+    init_failed: AtomicBool,
+    software_format: AtomicI32,
+}
+
+const ROUTE_UNKNOWN: u8 = 0;
+const ROUTE_HARDWARE: u8 = 1;
+const ROUTE_SOFTWARE: u8 = 2;
+
+impl HardwareRoute {
+    fn chose_hardware(&self) {
+        self.hardware_offered.store(true, Ordering::Relaxed);
+        self.init_failed.store(false, Ordering::Relaxed);
+        self.state.store(ROUTE_HARDWARE, Ordering::Release);
+    }
+
+    fn chose_software(&self, format: sys::AVPixelFormat) {
+        let after_hardware = self.hardware_offered.swap(false, Ordering::Relaxed);
+        self.init_failed.store(after_hardware, Ordering::Relaxed);
+        self.software_format.store(format, Ordering::Relaxed);
+        self.state.store(ROUTE_SOFTWARE, Ordering::Release);
+    }
+
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+}
+
+/// A change in how a hardware decoder is actually decoding, seen after FFmpeg
+/// renegotiated its output format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderRouteChange {
+    /// The backend the decoder was opened with.
+    pub configured: DecoderBackend,
+    /// The backend decoding now: `configured`, or `Software`.
+    pub active: DecoderBackend,
+    /// The software pixel format FFmpeg chose instead, when it fell back.
+    pub pixel_format: Option<String>,
+    /// Why, when it fell back.
+    pub reason: Option<String>,
 }
 
 #[cfg(target_os = "android")]
@@ -969,6 +1043,9 @@ pub struct Decoder {
     eof_sent: bool,
     end_of_stream: bool,
     hw_state: Option<Box<HardwareDecoderState>>,
+    /// The negotiated route last returned by [`Decoder::take_route_change`];
+    /// opening reports the configured backend.
+    reported_route: u8,
     #[cfg(target_os = "android")]
     mediacodec_source: Option<Arc<AndroidMediaCodecFrameSource>>,
     #[cfg(target_env = "ohos")]
@@ -1086,6 +1163,7 @@ impl Decoder {
             eof_sent: false,
             end_of_stream: false,
             hw_state: None,
+            reported_route: ROUTE_HARDWARE,
             #[cfg(target_os = "android")]
             mediacodec_source: None,
             #[cfg(target_env = "ohos")]
@@ -1304,8 +1382,63 @@ impl Decoder {
         self.time_base
     }
 
+    /// The backend the decoder was opened with. See [`Decoder::active_backend`]
+    /// for the one decoding now.
     pub fn backend(&self) -> DecoderBackend {
         self.backend
+    }
+
+    /// The backend actually decoding: the configured one, or `Software` when
+    /// FFmpeg's last format negotiation dropped the hardware format (its
+    /// hwaccel failed to initialise or does not take this stream).
+    pub fn active_backend(&self) -> DecoderBackend {
+        match &self.hw_state {
+            Some(state) if state.route.state() == ROUTE_SOFTWARE => DecoderBackend::Software,
+            _ => self.backend,
+        }
+    }
+
+    /// Returns the route FFmpeg settled on when it differs from the one last
+    /// returned here (opening counts as the configured hardware backend):
+    /// a fallback to software, or hardware again after one.
+    pub fn take_route_change(&mut self) -> Option<DecoderRouteChange> {
+        let state = self.hw_state.as_ref()?;
+        let route = state.route.state();
+        if route == ROUTE_UNKNOWN || route == self.reported_route {
+            return None;
+        }
+        self.reported_route = route;
+        if route == ROUTE_HARDWARE {
+            return Some(DecoderRouteChange {
+                configured: self.backend,
+                active: self.backend,
+                pixel_format: unsafe { pixel_format_name(state.pixel_format) },
+                reason: None,
+            });
+        }
+        let software =
+            unsafe { pixel_format_name(state.route.software_format.load(Ordering::Relaxed)) };
+        let hardware = unsafe { pixel_format_name(state.pixel_format) }
+            .unwrap_or_else(|| self.backend.as_str().to_string());
+        let reason = if state.route.init_failed.load(Ordering::Relaxed) {
+            format!(
+                "FFmpeg could not initialise the {} hwaccel ({hardware}) for this stream and decodes it in software ({}); its log has the cause",
+                self.backend.as_str(),
+                software.as_deref().unwrap_or("unknown format"),
+            )
+        } else {
+            format!(
+                "FFmpeg did not offer the {} hwaccel ({hardware}) for this stream and decodes it in software ({})",
+                self.backend.as_str(),
+                software.as_deref().unwrap_or("unknown format"),
+            )
+        };
+        Some(DecoderRouteChange {
+            configured: self.backend,
+            active: DecoderBackend::Software,
+            pixel_format: software,
+            reason: Some(reason),
+        })
     }
 
     pub fn uses_mediacodec_surface(&self) -> bool {
@@ -1527,6 +1660,7 @@ impl Decoder {
             eof_sent: false,
             end_of_stream: false,
             hw_state: None,
+            reported_route: ROUTE_HARDWARE,
             #[cfg(target_os = "android")]
             mediacodec_source: None,
             ohos_decoder: Some(ohos_decoder),
@@ -1638,11 +1772,11 @@ impl Decoder {
                     "av_buffer_ref(MediaCodec hw_device_ctx)",
                 ));
             }
-            let mut hw_state = Box::new(HardwareDecoderState {
+            let mut hw_state = Box::new(HardwareDecoderState::new(
                 device_ref,
-                frames_ref: ptr::null_mut(),
+                ptr::null_mut(),
                 pixel_format,
-            });
+            ));
             unsafe {
                 (*self.context).hw_device_ctx = context_device_ref;
                 (*self.context).opaque = (&mut *hw_state) as *mut HardwareDecoderState as *mut _;
@@ -1713,11 +1847,11 @@ impl Decoder {
             return Err(FfmpegError::NullPointer("av_buffer_ref(hw_device_ctx)"));
         }
 
-        let mut hw_state = Box::new(HardwareDecoderState {
+        let mut hw_state = Box::new(HardwareDecoderState::new(
             device_ref,
-            frames_ref: ptr::null_mut(),
+            ptr::null_mut(),
             pixel_format,
-        });
+        ));
 
         unsafe {
             (*self.context).hw_device_ctx = context_device_ref;
@@ -5453,6 +5587,7 @@ unsafe extern "C" fn select_hw_format(
                 break;
             }
             if format == target {
+                unsafe { (*state).route.chose_hardware() };
                 #[cfg(target_os = "windows")]
                 if target == sys::AVPixelFormat_AV_PIX_FMT_D3D11 {
                     unsafe { ensure_d3d11va_frames_for_context(context, state.cast_mut()) };
@@ -5479,6 +5614,17 @@ unsafe extern "C" fn select_hw_format(
             sys::AVPixelFormat_AV_PIX_FMT_CUDA | sys::AVPixelFormat_AV_PIX_FMT_VAAPI
         ) {
             return sys::AVPixelFormat_AV_PIX_FMT_NONE;
+        }
+        // VideoToolbox and D3D11VA continue in software. Record it: the
+        // decoder was opened as hardware and must not keep reporting so.
+        // (MediaCodec's own decoders stay MediaCodec whatever they output.)
+        if matches!(
+            target,
+            sys::AVPixelFormat_AV_PIX_FMT_VIDEOTOOLBOX | sys::AVPixelFormat_AV_PIX_FMT_D3D11
+        ) {
+            let chosen = unsafe { sys::avcodec_default_get_format(context, formats) };
+            unsafe { (*state).route.chose_software(chosen) };
+            return chosen;
         }
     }
     unsafe { sys::avcodec_default_get_format(context, formats) }
@@ -5586,6 +5732,53 @@ mod tests {
             1,
             "the audio track stays discoverable"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decoder_reports_the_route_ffmpeg_negotiated() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/playback/playback-fixture.mkv");
+        let mut demuxer = Demuxer::open_path(&fixture).unwrap();
+        demuxer
+            .set_stream_selection(StreamSelection::only([0]))
+            .unwrap();
+        let mut decoder = Decoder::open_with_config(
+            demuxer.codec_parameters(0).unwrap(),
+            DecoderConfig::videotoolbox(),
+        )
+        .unwrap();
+        assert_eq!(decoder.backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.active_backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.take_route_change(), None);
+
+        let mut frame = None;
+        while frame.is_none() {
+            let packet = demuxer.read_packet().unwrap().expect("a video packet");
+            if packet.stream_index() != 0 {
+                continue;
+            }
+            decoder.send_packet(&packet).unwrap();
+            if let DecoderOutputFrame::Frame(decoded) = decoder.receive_frame().unwrap() {
+                frame = Some(decoded);
+            }
+        }
+        // MPEG-4 Part 2 at 160x90: FFmpeg offers videotoolbox_vld, its
+        // hwaccel fails to initialise, and FFmpeg decodes in software.
+        assert!(!frame.unwrap().is_videotoolbox());
+        assert_eq!(decoder.backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.active_backend(), DecoderBackend::Software);
+        let change = decoder.take_route_change().expect("a route change");
+        assert_eq!(change.configured, DecoderBackend::VideoToolbox);
+        assert_eq!(change.active, DecoderBackend::Software);
+        assert_eq!(change.pixel_format.as_deref(), Some("yuv420p"));
+        assert!(
+            change
+                .reason
+                .unwrap()
+                .contains("could not initialise the videotoolbox hwaccel")
+        );
+        assert_eq!(decoder.take_route_change(), None);
     }
 
     #[test]

@@ -53,6 +53,14 @@
   `setOutputHeadroom`, `trackSelection`, `getDanmakuConfig`,
   `setSubtitleFont` and `setSubtitleStyle`; Android's JSON bridge falls back to
   it for methods it does not implement itself.
+- Fixed decoder reporting when FFmpeg drops VideoToolbox or D3D11VA after the
+  decoder opened: when the hwaccel fails to initialise (or is not offered for
+  the stream), FFmpeg renegotiates and decodes in software, while liberika kept
+  reporting the hardware backend with no fallback. The format negotiation is
+  now recorded; the playback session emits a decoder change
+  (`hwaccel_<backend>_to_software`, or `…_restored` when the hardware returns)
+  with the software pixel format and the reason, counts the fallback, and tags
+  frames with the backend that actually decoded them.
 
 ## 0.2.1 - 2026-10-02
 
