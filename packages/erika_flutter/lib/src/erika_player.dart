@@ -1399,7 +1399,7 @@ class ErikaPlayer {
   /// native library does not provide diagnostics.
   Future<Map<String, Object?>> getDiagnosticsSnapshot() async {
     final playerId = await ensureCreated();
-    return _decodeJsonDocument(
+    return _decodeJsonDocumentOffUi(
       await _invokeOptional('getDiagnosticsSnapshot', <String, Object?>{
         'playerId': playerId,
       }),
@@ -1438,7 +1438,7 @@ class ErikaPlayer {
       throw ArgumentError.value(sinceSeq, 'sinceSeq', 'must be zero or positive');
     }
     final playerId = await ensureCreated();
-    return _decodeJsonDocument(
+    return _decodeJsonDocumentOffUi(
       await _invokeOptional('getLogs', <String, Object?>{
         'playerId': playerId,
         'limit': limit,
@@ -1486,7 +1486,7 @@ class ErikaPlayer {
         'error': error.message ?? error.code,
       };
     }
-    return _decodeJsonDocument(raw, 'invokeJson');
+    return _decodeJsonDocumentOffUi(raw, 'invokeJson');
   }
 
   Future<Object?> _invokeOptional(
@@ -1513,6 +1513,23 @@ class ErikaPlayer {
       rethrow;
     }
   }
+
+  /// JSON text at least this long is decoded on a background isolate: a
+  /// full log ring is up to 512 KiB, more than the UI isolate should parse.
+  static const int _backgroundDecodeChars = 64 * 1024;
+
+  static Future<Map<String, Object?>> _decodeJsonDocumentOffUi(
+    Object? raw,
+    String method,
+  ) async {
+    if (raw is String && raw.length >= _backgroundDecodeChars) {
+      return compute(_decodeJsonDocumentMessage, <String>[raw, method]);
+    }
+    return _decodeJsonDocument(raw, method);
+  }
+
+  static Map<String, Object?> _decodeJsonDocumentMessage(List<String> message) =>
+      _decodeJsonDocument(message[0], message[1]);
 
   static Map<String, Object?> _decodeJsonDocument(Object? raw, String method) {
     final Object? decoded = raw is String ? jsonDecode(raw) : raw;

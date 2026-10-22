@@ -13,6 +13,8 @@
   position of a media URI as RGBA or PNG through the native headless frame
   export, off the UI thread (a native worker on macOS, a background isolate on
   the FFI platforms).
+- Large JSON documents from `getLogs()`, `getDiagnosticsSnapshot()` and
+  `invokeJson()` are decoded on a background isolate.
 
 ## 0.2.1
 
