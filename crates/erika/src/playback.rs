@@ -635,28 +635,28 @@ impl VideoDecodePreference {
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
-        Self::VideoToolbox
+        software_forced_by_env().unwrap_or(Self::VideoToolbox)
     }
 }
 
 #[cfg(target_os = "windows")]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
-        Self::D3d11va
+        software_forced_by_env().unwrap_or(Self::D3d11va)
     }
 }
 
 #[cfg(target_os = "android")]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
-        Self::MediaCodec
+        software_forced_by_env().unwrap_or(Self::MediaCodec)
     }
 }
 
 #[cfg(target_env = "ohos")]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
-        Self::AvCodec
+        software_forced_by_env().unwrap_or(Self::AvCodec)
     }
 }
 
@@ -688,6 +688,24 @@ impl Default for VideoDecodePreference {
             _ => Self::LinuxAuto,
         }
     }
+}
+
+/// `ERIKA_HWDEC=software` (or `none`) makes software decoding the default
+/// video decoder on every platform, as it already does on Linux; for
+/// measuring the software path on hardware that would otherwise decode.
+#[cfg_attr(all(target_os = "linux", not(target_env = "ohos")), allow(dead_code))]
+fn software_forced_by_env() -> Option<VideoDecodePreference> {
+    software_forced_by(std::env::var("ERIKA_HWDEC").ok().as_deref())
+}
+
+fn software_forced_by(value: Option<&str>) -> Option<VideoDecodePreference> {
+    matches!(
+        value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("software" | "none")
+    )
+    .then_some(VideoDecodePreference::Software)
 }
 
 fn require_hardware_decode() -> bool {
@@ -6381,6 +6399,19 @@ mod tests {
     use std::{fs, path::PathBuf, thread};
 
     const FIXTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn hwdec_software_forces_the_software_decoder() {
+        for value in ["software", " Software ", "none"] {
+            assert_eq!(
+                software_forced_by(Some(value)),
+                Some(VideoDecodePreference::Software)
+            );
+        }
+        for value in [None, Some(""), Some("auto"), Some("cuda")] {
+            assert_eq!(software_forced_by(value), None);
+        }
+    }
 
     #[test]
     fn dropping_async_demuxer_waits_for_source_resources() {

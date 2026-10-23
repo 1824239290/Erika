@@ -110,13 +110,51 @@ two zeros return the video's own size. `ErikaFrameExportFormat_Rgba` returns
 rows of exactly `width * 4` bytes with alpha 255; `ErikaFrameExportFormat_Png`
 returns an 8-bit RGB PNG file. Colour conversion follows the frame's colour
 space and range; an unlabelled YUV source is taken as BT.709 when it is HD or
-larger and BT.601 otherwise. HDR sources are converted without tone mapping.
+larger and BT.601 otherwise. HDR sources (PQ, HLG, Dolby Vision) are tone
+mapped to SDR with the arithmetic Erika's renderer uses for an SDR display
+(ITU-R BT.2390 EETF against a 203-nit target, BT.2020 to BT.709 gamut mapping,
+gamma 2.2), and `ERIKA_FRAME_EXPORT_TONE_MAPPED` is set in
+`result.reserved_flags`; SDR sources keep the plain colour conversion.
 The result reports where the picture is (`timestamp_micros`), the decoded video
 size and the media duration (0 when unknown). A position at or past a known
 duration fails with `ErikaStatus_PlayerError`. HTTP inputs accept the same
 headers and read-ahead override as `ErikaOpenOptions`. `data` stays owned by
 liberika until `erika_frame_export_result_free`, which clears the result and
 may be called again.
+
+### Taking many pictures
+
+`erika_export_frame` opens the media and seeks for every picture. For several
+pictures of one media, open an `ErikaFrameExportSession` once and ask it for
+each picture; the demuxer and decoder stay open.
+
+```c
+ErikaFrameExportSessionOptions open = { .input_uri = "/path/input.mkv" };
+ErikaFrameExportSession *session = NULL;
+if (erika_frame_export_session_open(&open, &session) == ErikaStatus_Ok) {
+    for (uint64_t ms = 60000; ms < 66000; ms += 100) {
+        ErikaFrameExportRequest request = {
+            .position_millis = ms, .max_width = 640, .max_height = 640,
+            .format = ErikaFrameExportFormat_Png,
+        };
+        ErikaFrameExportResult result = {0};
+        if (erika_frame_export_session_frame(session, &request, &result) == ErikaStatus_Ok) {
+            erika_frame_export_result_free(&result);
+        }
+    }
+    erika_frame_export_session_close(session);
+}
+```
+
+A request after the previous one continues decoding from where the decoder
+stopped when no keyframe lies between that point and the request (the demuxer's
+seek index tells; without an index, when the request is within two seconds or
+half the longest keyframe interval seen), and seeks to the keyframe before it
+otherwise. Requests may come in any order; ascending order is the cheapest.
+Results, sizing, formats and tone mapping are those of `erika_export_frame`.
+A failed request leaves the session usable. Calls on one session are
+serialised; all calls are synchronous. `erika_frame_export_session_close`
+accepts `NULL`; no call on the session may be running or follow it.
 
 ## Conventions
 
@@ -743,12 +781,20 @@ the diagnostics below (`getDiagnosticsSnapshot`, `getLogs`).
 `erika_presenter_invoke_json` doubles as the generic pass-through into the
 engine:
 
-- `listMethods` returns the table itself — `{schema: 1, methods: [{name, scope,
-  summary, arguments: [{name, type, required}], returns}]}` — so a host (or an
+- `listMethods` returns the table itself — `{schema: 1, fields, methods: [{name, scope,
+  summary, arguments: [{name, type, required}], returns, blocking, writesFiles}]}` — so a host (or an
   agent behind it) can discover and forward capabilities without code changes.
   Registering a capability means adding a `match` arm in `invoke` and an entry
   in `JSON_METHODS`; a unit test fails if the two disagree.
-- Methods whose `scope` is `global` (`listMethods`, `getLogs`) accept a `NULL`
+- Each entry also carries `blocking` (the call returns when the work is done,
+  on the calling thread, and the work grows with its input: media length, file
+  size) and `writesFiles` (the call creates files on disk and its result lists
+  their paths); `fields` at the top level states both. `exportFrame` and
+  `exportFrames` take pictures from a media with the frame export above: with
+  `outputPath` / `outputDir` they write PNG or RGBA files and return the paths,
+  and `exportFrame` without `outputPath` returns the bytes base64 encoded.
+- Methods whose `scope` is `global` (`listMethods`, `getLogs`, `exportFrame`,
+  `exportFrames`) accept a `NULL`
   handle.
 - `invokeJson` (`{method, arguments}`) calls another table method and returns
   its full envelope as `value`. Platform plugins that unwrap envelopes

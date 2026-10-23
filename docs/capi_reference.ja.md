@@ -97,7 +97,24 @@ void erika_frame_export_result_free(ErikaFrameExportResult *result);
 マルチスレッドのソフトウェアデコーダで取り出し、RGBA（1 行 `width * 4` バイト、alpha 255）または
 PNG（8 bit RGB）で返します。handle 不要の同期処理なので UI では worker から呼びます。
 `max_width`/`max_height` は上限（0 は無制限）で、表示アスペクト比を保ち、動画より大きくはしません。
-`data` は `erika_frame_export_result_free` まで liberika が所有します。HDR はトーンマッピングしません。
+`data` は `erika_frame_export_result_free` まで liberika が所有します。HDR ソース（PQ、HLG、Dolby Vision）は
+Erika のレンダラが SDR ディスプレイ向けに使う演算（ITU-R BT.2390 EETF、目標 203 nit、BT.2020 から BT.709 への
+gamut mapping、gamma 2.2）で SDR にトーンマッピングし、`result.reserved_flags` に
+`ERIKA_FRAME_EXPORT_TONE_MAPPED` を立てます。SDR ソースは通常の色変換のままです。
+
+複数枚を取るときは `ErikaFrameExportSession` を一度だけ開き、1 枚ずつ要求します。demuxer とデコーダは開いたままです。
+
+```c
+ErikaStatus erika_frame_export_session_open(const ErikaFrameExportSessionOptions *options, ErikaFrameExportSession **out_session);
+ErikaStatus erika_frame_export_session_frame(ErikaFrameExportSession *session, const ErikaFrameExportRequest *request, ErikaFrameExportResult *out_result);
+void erika_frame_export_session_close(ErikaFrameExportSession *session);
+```
+
+前回のデコード位置と今回の要求の間にキーフレームがなければ続きをデコードし（demuxer の seek index で判定。index がなければ
+2 秒以内、または見たキーフレーム間隔の最大値の半分以内）、あれば直前のキーフレームへ seek します。順序は任意ですが、
+時刻の昇順が最も安価です。結果・サイズ・形式・トーンマッピングは `erika_export_frame` と同じです。失敗した要求の後も
+セッションは使えます。同一セッションの呼び出しは直列化され、すべて同期です。`erika_frame_export_session_close` は
+`NULL` を受け付け、実行中の呼び出しがあってはならず、閉じた後に呼んでもいけません。
 
 ## 規約
 
@@ -687,12 +704,16 @@ char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 
 `erika_presenter_invoke_json` はエンジンへの汎用パススルーも兼ねます。
 
-- `listMethods` は table 自体（`{schema: 1, methods: [{name, scope, summary,
-  arguments: [{name, type, required}], returns}]}`）を返すので、ホスト（とその先の
+- `listMethods` は table 自体（`{schema: 1, fields, methods: [{name, scope, summary,
+  arguments: [{name, type, required}], returns, blocking, writesFiles}]}`）を返すので、ホスト（とその先の
   エージェント）はコード変更なしに機能を発見・転送できます。機能の登録は `invoke` の
   `match` 分岐と `JSON_METHODS` の項目を追加するだけで、両者が食い違うと単体テストが
   失敗します。
-- `scope` が `global` のメソッド（`listMethods`、`getLogs`）は `NULL` ハンドルを
+- 各項目は `blocking`（呼び出しスレッド上で処理が終わってから返り、時間が入力（メディア長、ファイルサイズ）に応じて増える）と
+  `writesFiles`（ディスク上にファイルを作り、結果にパスを列挙する）も持ち、最上位の `fields` が両方を説明します。
+  `exportFrame`、`exportFrames` は上のフレーム書き出しでメディアから画像を取ります。`outputPath` / `outputDir` を
+  指定すると PNG または RGBA ファイルを書いてパスを返し、`outputPath` なしの `exportFrame` は base64 のバイト列を返します。
+- `scope` が `global` のメソッド（`listMethods`、`getLogs`、`exportFrame`、`exportFrames`）は `NULL` ハンドルを
   受け付けます。
 - `invokeJson`（`{method, arguments}`）は table の別メソッドを呼び、その envelope 全体を
   `value` として返します。envelope をネイティブ側で外すプラグイン（Linux、HarmonyOS、

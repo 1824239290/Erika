@@ -1598,8 +1598,13 @@ impl Player {
         self.send_playback_command(PlaybackCommand::SelectAudioTrack(track_id))
     }
 
+    /// Selects a subtitle track, or none. Asking for none while no media is
+    /// open succeeds and changes nothing: no subtitle is shown then.
     pub fn select_subtitle_track(&self, track_id: Option<i64>) -> Result<()> {
         self.ensure_not_closed()?;
+        if track_id.is_none() && self.optional_playback_commands().is_none() {
+            return Ok(());
+        }
         self.send_playback_command(PlaybackCommand::SelectSubtitleTrack(track_id))
     }
 
@@ -1975,6 +1980,11 @@ impl Player {
             .ok_or_else(|| PlayerError::Playback("no media is open".to_string()))?
             .commands
             .clone())
+    }
+
+    /// Whether a media is open (opening counts): a playback worker exists.
+    pub fn has_open_media(&self) -> bool {
+        self.optional_playback_commands().is_some()
     }
 
     fn optional_playback_commands(&self) -> Option<Sender<PlaybackCommand>> {
@@ -3901,6 +3911,22 @@ mod tests {
     fn frame_output_barrier_is_a_noop_without_open_media() {
         let player = Player::new(PlayerConfig::default());
         assert!(!player.set_frame_output_quiesced(true).unwrap());
+    }
+
+    #[test]
+    fn selecting_no_subtitle_without_open_media_succeeds_and_a_track_does_not() {
+        let player = Player::new(PlayerConfig::default());
+        assert!(!player.has_open_media());
+        player.select_subtitle_track(None).unwrap();
+        let error = player.select_subtitle_track(Some(3)).unwrap_err();
+        assert!(error.to_string().contains("no media is open"), "{error}");
+        let receiver = install_test_runtime(&player, 2);
+        assert!(player.has_open_media());
+        player.select_subtitle_track(None).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            PlaybackCommand::SelectSubtitleTrack(None)
+        ));
     }
 
     #[test]

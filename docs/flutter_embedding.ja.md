@@ -225,6 +225,26 @@ output negotiation、danmaku item count を表示します。FPS は隣接 sampl
 状況: macOS・iOS・tvOS は新シンボルをオプションで解決、Linux・HarmonyOS・Android は共有
 JSON table を経由、Windows は `UnsupportedError`。
 
+macOS と iOS では、プラグインがこの 3 つの呼び出しをバックグラウンドキューで実行し、メインスレッドで
+応答するため、時間のかかる呼び出し（大きな字幕ファイルの `addExternalSubtitle`、`exportFrame`）が
+メインスレッドを占有しません。presenter メソッドの実行中、プラグインのメインスレッドのタイマー
+（統計、イベントのポーリング、macOS の描画）はプレーヤーのロックを待たずに 1 周期を飛ばします。
+`scope` が `global` のメソッド（`exportFrame`、`exportFrames`、`getLogs`、`listMethods`）はそのロックを
+取りません。`listMethods` は各メソッドに `blocking`（処理が終わってから返り、時間が入力に応じて増える）と
+`writesFiles`（ファイルを作り、結果にパスを列挙する）を付けます。
+
+## プレーヤーなしで画像を取る
+
+`ErikaPlayer.exportFrame(uri, position: ...)` は、独自の demuxer とマルチスレッドのソフトウェアデコーダで、
+あるメディア時刻に表示される画像を RGBA または PNG で返します。プレーヤーは関与しません。HDR ソース
+（PQ、HLG、Dolby Vision）は、プレーヤーが SDR ディスプレイ向けに使う演算で SDR にトーンマッピングされ、
+`ErikaExportedFrame.toneMapped` で分かります。同じメディアから複数枚取るには `ErikaFrameExportSession`
+（または `ErikaPlayer.exportFrames`）を使います: メディアは一度だけ開かれ、時刻の昇順の要求は seek し直さず
+続きをデコードします。処理は UI スレッドの外で行われ、macOS はネイティブのワーカーキュー、FFI
+プラットフォーム（iOS、tvOS、Android、Windows、Linux、HarmonyOS）はセッションごとのバックグラウンド
+isolate です。セッションは `close()` で閉じます。`ERIKA_FLUTTER_LIBRARY` にライブラリのパスを設定すると、
+FFI の書き出しを検証中のビルドに向けられます。
+
 ## Neural Upscaler Status
 
 `setUpscaler` はモードを要求するだけで、kernel は background thread で compile されます。そのため host は `getUpscalerStatus` を poll して UI を更新する必要があります。

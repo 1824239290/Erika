@@ -438,6 +438,24 @@ private struct ErikaFrameExportResultC {
   var reserved: (UInt64, UInt64) = (0, 0)
 }
 
+private struct ErikaFrameExportSessionOptionsC {
+  var inputUri: UnsafePointer<CChar>?
+  var headers: UnsafeRawPointer?
+  var headerCount: UInt
+  var httpReadAheadBytes: UInt64
+  var reservedFlags: UInt32 = 0
+  var reserved: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
+}
+
+private struct ErikaFrameExportRequestC {
+  var positionMillis: UInt64
+  var maxWidth: UInt32
+  var maxHeight: UInt32
+  var format: Int32
+  var reservedFlags: UInt32 = 0
+  var reserved: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
+}
+
 private struct ErikaEventC {
   var kind: Int32 = 0
   var status: Int32 = 0
@@ -711,6 +729,16 @@ private final class ErikaNativeLibrary {
   typealias ExportGifFn = @convention(c) (UnsafeRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias ExportFrameFn = @convention(c) (UnsafeRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias FrameExportResultFreeFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
+  typealias FrameExportSessionOpenFn = @convention(c) (
+    UnsafeRawPointer?,
+    UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+  ) -> Int32
+  typealias FrameExportSessionFrameFn = @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafeRawPointer?,
+    UnsafeMutableRawPointer?
+  ) -> Int32
+  typealias FrameExportSessionCloseFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
   typealias PollEventFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias LastErrorMessageFn = @convention(c) () -> UnsafeMutablePointer<CChar>?
   typealias StringFreeFn = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
@@ -794,6 +822,11 @@ private final class ErikaNativeLibrary {
   let exportGif: ExportGifFn?
   let exportFrame: ExportFrameFn?
   let frameExportResultFree: FrameExportResultFreeFn?
+  let frameExportSessionOpen: FrameExportSessionOpenFn?
+  let frameExportSessionFrame: FrameExportSessionFrameFn?
+  let frameExportSessionClose: FrameExportSessionCloseFn?
+  private let globalJsonMethodsLock = NSLock()
+  private var globalJsonMethods: Set<String>?
   let pollEvent: PollEventFn
   let setOutputHeadroom: SetOutputHeadroomFn?
   let lastErrorMessage: LastErrorMessageFn
@@ -875,6 +908,21 @@ private final class ErikaNativeLibrary {
       "erika_frame_export_result_free",
       from: libraryHandle,
       as: FrameExportResultFreeFn.self
+    )
+    frameExportSessionOpen = Self.loadOptional(
+      "erika_frame_export_session_open",
+      from: libraryHandle,
+      as: FrameExportSessionOpenFn.self
+    )
+    frameExportSessionFrame = Self.loadOptional(
+      "erika_frame_export_session_frame",
+      from: libraryHandle,
+      as: FrameExportSessionFrameFn.self
+    )
+    frameExportSessionClose = Self.loadOptional(
+      "erika_frame_export_session_close",
+      from: libraryHandle,
+      as: FrameExportSessionCloseFn.self
     )
     pollEvent = try Self.load("erika_presenter_poll_event", from: libraryHandle, as: PollEventFn.self)
     setOutputHeadroom = Self.loadOptional("erika_presenter_set_output_headroom", from: libraryHandle, as: SetOutputHeadroomFn.self)
@@ -1056,19 +1104,133 @@ private final class ErikaNativeLibrary {
             frameExportResultFree(UnsafeMutableRawPointer(resultPtr))
           }
         }
-        let bytes = exported.data.map { Data(bytes: $0, count: Int(exported.dataLen)) } ?? Data()
-        return [
-          "width": Int(exported.width),
-          "height": Int(exported.height),
-          "format": Int(exported.format),
-          "bytes": FlutterStandardTypedData(bytes: bytes),
-          "timestampMicros": Int64(clamping: exported.timestampMicros),
-          "durationMicros": Int64(clamping: exported.durationMicros),
-          "sourceWidth": Int(exported.sourceWidth),
-          "sourceHeight": Int(exported.sourceHeight),
-        ]
+        return frameExportMap(exported)
       }
     }
+  }
+
+  /// A result of the frame export calls as the map Dart reads; the bytes are
+  /// copied out of the native buffer, which the caller releases afterwards.
+  private func frameExportMap(_ exported: ErikaFrameExportResultC) -> [String: Any] {
+    let bytes = exported.data.map { Data(bytes: $0, count: Int(exported.dataLen)) } ?? Data()
+    return [
+      "width": Int(exported.width),
+      "height": Int(exported.height),
+      "format": Int(exported.format),
+      "bytes": FlutterStandardTypedData(bytes: bytes),
+      "timestampMicros": Int64(clamping: exported.timestampMicros),
+      "durationMicros": Int64(clamping: exported.durationMicros),
+      "sourceWidth": Int(exported.sourceWidth),
+      "sourceHeight": Int(exported.sourceHeight),
+      "toneMapped": exported.reservedFlags & 1 != 0,
+    ]
+  }
+
+  /// Opens a frame export session. Runs on the calling thread (the container
+  /// header is read): call it from the session's queue.
+  func openFrameExportSession(
+    inputUri: String,
+    httpHeaders: [String: String],
+    httpReadAheadBytes: UInt64
+  ) throws -> UnsafeMutableRawPointer {
+    guard let open = frameExportSessionOpen,
+          frameExportSessionFrame != nil,
+          frameExportSessionClose != nil,
+          frameExportResultFree != nil else {
+      throw ErikaPluginError.diagnosticsUnsupported("erika_frame_export_session_open")
+    }
+    let names = httpHeaders.keys.map { strdup($0) }
+    let values = httpHeaders.values.map { strdup($0) }
+    defer {
+      names.forEach { free($0) }
+      values.forEach { free($0) }
+    }
+    let headers = zip(names, values).map { ErikaHttpHeader(name: $0.0, value: $0.1) }
+    return try inputUri.withCString { inputPtr in
+      try headers.withUnsafeBufferPointer { buffer in
+        var options = ErikaFrameExportSessionOptionsC(
+          inputUri: inputPtr,
+          headers: buffer.baseAddress.map(UnsafeRawPointer.init),
+          headerCount: UInt(headers.count),
+          httpReadAheadBytes: httpReadAheadBytes
+        )
+        var session: UnsafeMutableRawPointer?
+        let status = withUnsafePointer(to: &options) { optionsPtr in
+          open(UnsafeRawPointer(optionsPtr), &session)
+        }
+        guard status == 0, let session else {
+          let detail = currentEventMessage() ?? "ErikaStatus \(status)"
+          throw ErikaPluginError.diagnosticsFailed("Frame export failed: \(detail)")
+        }
+        return session
+      }
+    }
+  }
+
+  /// One picture from an open session, on the calling thread (the session's
+  /// queue).
+  func exportSessionFrame(
+    session: UnsafeMutableRawPointer,
+    positionMillis: UInt64,
+    maxWidth: UInt32,
+    maxHeight: UInt32,
+    format: Int32
+  ) throws -> [String: Any] {
+    guard let frame = frameExportSessionFrame, let frameExportResultFree else {
+      throw ErikaPluginError.diagnosticsUnsupported("erika_frame_export_session_frame")
+    }
+    var request = ErikaFrameExportRequestC(
+      positionMillis: positionMillis,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      format: format
+    )
+    var exported = ErikaFrameExportResultC()
+    let status = withUnsafePointer(to: &request) { requestPtr in
+      withUnsafeMutablePointer(to: &exported) { resultPtr in
+        frame(session, UnsafeRawPointer(requestPtr), UnsafeMutableRawPointer(resultPtr))
+      }
+    }
+    if status != 0 {
+      let detail = currentEventMessage() ?? "ErikaStatus \(status)"
+      throw ErikaPluginError.diagnosticsFailed("Frame export failed: \(detail)")
+    }
+    defer {
+      withUnsafeMutablePointer(to: &exported) { resultPtr in
+        frameExportResultFree(UnsafeMutableRawPointer(resultPtr))
+      }
+    }
+    return frameExportMap(exported)
+  }
+
+  func closeFrameExportSession(_ session: UnsafeMutableRawPointer) {
+    frameExportSessionClose?(session)
+  }
+
+  /// Whether a JSON table method takes no presenter (scope `global`), read
+  /// once from the table itself so the plugin keeps no copy of it. Such a
+  /// method is called with a NULL handle and without the player's native
+  /// call lock: a long export must not hold up rendering.
+  func isGlobalJsonMethod(_ method: String) -> Bool {
+    globalJsonMethodsLock.lock()
+    defer { globalJsonMethodsLock.unlock() }
+    if globalJsonMethods == nil {
+      var global: Set<String> = ["listMethods", "getLogs"]
+      if let invokeJson,
+         let response = "listMethods".withCString({ name in
+           "{}".withCString { invokeJson(nil, name, $0) }
+         }),
+         let json = takeJsonString(response),
+         let envelope = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+         let value = envelope["value"] as? [String: Any],
+         let methods = value["methods"] as? [[String: Any]] {
+        global = Set(methods.compactMap { entry in
+          entry["scope"] as? String == "global" ? entry["name"] as? String : nil
+        })
+      }
+      globalJsonMethods = global
+    }
+    return globalJsonMethods?.contains(method) ?? false
   }
 
   /// Copies and frees a JSON string returned by a diagnostics function.
@@ -1169,6 +1331,10 @@ private final class ErikaPlayerHost {
   private let library: ErikaNativeLibrary
   private let handle: UnsafeMutableRawPointer
   private let renderQueue: DispatchQueue
+  /// Diagnostics and JSON pass-through calls run here, never on the main
+  /// thread: they can take as long as the work they ask for (a subtitle file
+  /// parsed, a frame export decoded).
+  let jsonQueue: DispatchQueue
   private let nativeCallLock = NSRecursiveLock()
   private weak var attachedView: ErikaMetalSurfaceView?
   private weak var attachedTexture: ErikaFlutterTextureSurface?
@@ -1210,6 +1376,10 @@ private final class ErikaPlayerHost {
       label: "dev.aimesoft.erika.render.\(id)",
       qos: .userInteractive
     )
+    jsonQueue = DispatchQueue(
+      label: "dev.aimesoft.erika.json.\(id)",
+      qos: .userInitiated
+    )
     guard let handle = library.createPresenter(config: config) else {
       throw ErikaPluginError.presenterCreateFailed
     }
@@ -1227,6 +1397,17 @@ private final class ErikaPlayerHost {
 
   private func withNativeCall<T>(_ operation: () throws -> T) rethrows -> T {
     nativeCallLock.lock()
+    defer { nativeCallLock.unlock() }
+    return try operation()
+  }
+
+  /// Like [withNativeCall], but gives up (nil) when a call on another queue
+  /// holds the lock, instead of making the calling thread wait for it. The
+  /// timers that run on the main thread use this: a long call (a big
+  /// subtitle file parsed) must not freeze the app's interface, and what
+  /// those timers do is repeated at the next tick anyway.
+  private func tryWithNativeCall<T>(_ operation: () throws -> T) rethrows -> T? {
+    guard nativeCallLock.try() else { return nil }
     defer { nativeCallLock.unlock() }
     return try operation()
   }
@@ -1558,13 +1739,18 @@ private final class ErikaPlayerHost {
     guard let invoke = library.invokeJson else {
       throw ErikaPluginError.diagnosticsUnsupported("erika_presenter_invoke_json")
     }
-    let response = withNativeCall {
+    let call = { (target: UnsafeMutableRawPointer?) in
       method.withCString { methodPointer in
         argumentsJson.withCString { argumentsPointer in
-          invoke(handle, methodPointer, argumentsPointer)
+          invoke(target, methodPointer, argumentsPointer)
         }
       }
     }
+    // Methods that need no presenter run without the native call lock, so a
+    // long one does not hold up the calls rendering makes under it.
+    let response = library.isGlobalJsonMethod(method)
+      ? call(nil)
+      : withNativeCall { call(handle) }
     guard let json = library.takeJsonString(response) else {
       throw ErikaPluginError.diagnosticsFailed("erika_presenter_invoke_json returned no JSON")
     }
@@ -1589,9 +1775,10 @@ private final class ErikaPlayerHost {
   }
 
   func presenterStats() -> [String: Any] {
-    withNativeCall {
-      latestPresenterStats.toFlutterMap()
-    }
+    // The last stats the render tick stored; while another queue is inside a
+    // long call the previous copy is returned instead of waiting for it.
+    tryWithNativeCall { latestPresenterStats.toFlutterMap() }
+      ?? latestPresenterStats.toFlutterMap()
   }
 
   func addExternalSubtitle(uri: String) throws -> Int64 {
@@ -2015,7 +2202,7 @@ private final class ErikaPlayerHost {
     }
     let previousStats = latestPresenterStats
     var stats = ErikaPresenterStatsC()
-    let status = withNativeCall {
+    let tickStatus = tryWithNativeCall { () -> Int32 in
       if let preparedFrame {
         let rawTexture = UInt64(UInt(bitPattern: Unmanaged.passUnretained(
           preparedFrame.metalTexture as AnyObject
@@ -2038,6 +2225,11 @@ private final class ErikaPlayerHost {
       }
       return status
     }
+    // Nil: another queue is inside a long call on this player; this tick is
+    // skipped and the next one renders.
+    guard let status = tickStatus else {
+      return
+    }
     if status != 0 {
       NSLog("ErikaFlutterPlugin: render_tick failed with status \(status)")
     } else if let textureSurface, let preparedFrame {
@@ -2054,7 +2246,9 @@ private final class ErikaPlayerHost {
   }
 
   func pollEvents(sendEvent: (([String: Any]) -> Void)?) {
-    withNativeCall {
+    // Skipped while another queue is inside a long call on this player; the
+    // events wait in the engine and the next poll takes them.
+    _ = tryWithNativeCall {
       while true {
         var event = ErikaEventC()
         let status = withUnsafeMutablePointer(to: &event) { pointer in
@@ -2802,6 +2996,69 @@ private extension NSWindow {
   }
 }
 
+/// One frame export session of the plugin. Every call on the native session
+/// runs on `queue`, so the session is used by one thread at a time and calls
+/// come out in the order they were made.
+private final class ErikaFrameExportSessionBox {
+  let id: Int64
+  let queue: DispatchQueue
+  private var library: ErikaNativeLibrary?
+  private var session: UnsafeMutableRawPointer?
+
+  init(id: Int64) {
+    self.id = id
+    queue = DispatchQueue(
+      label: "dev.aimesoft.erika.frame-export.\(id)",
+      qos: .userInitiated
+    )
+  }
+
+  deinit {
+    if let library, let session {
+      library.closeFrameExportSession(session)
+    }
+  }
+
+  func open(
+    library: ErikaNativeLibrary,
+    inputUri: String,
+    httpHeaders: [String: String],
+    httpReadAheadBytes: UInt64
+  ) throws {
+    session = try library.openFrameExportSession(
+      inputUri: inputUri,
+      httpHeaders: httpHeaders,
+      httpReadAheadBytes: httpReadAheadBytes
+    )
+    self.library = library
+  }
+
+  func frame(
+    positionMillis: UInt64,
+    maxWidth: UInt32,
+    maxHeight: UInt32,
+    format: Int32
+  ) throws -> [String: Any] {
+    guard let library, let session else {
+      throw ErikaPluginError.invalidArguments("Frame export session \(id) is closed.")
+    }
+    return try library.exportSessionFrame(
+      session: session,
+      positionMillis: positionMillis,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      format: format
+    )
+  }
+
+  func close() {
+    if let library, let session {
+      library.closeFrameExportSession(session)
+    }
+    session = nil
+  }
+}
+
 public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
   static var sharedEventSink: FlutterEventSink?
 
@@ -2819,6 +3076,9 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   private var requestedSecondaryWindow = false
   private var windowOverlayPlayerIds: Set<Int64> = []
   private var nextPlayerId: Int64 = 1
+  private let logQueue = DispatchQueue(label: "dev.aimesoft.erika.logs", qos: .utility)
+  private var frameExportSessions: [Int64: ErikaFrameExportSessionBox] = [:]
+  private var nextFrameExportSessionId: Int64 = 1
   private var pollTimer: Timer?
   private var activePlayerId: Int64?
   private var remoteCommandTargets: [(MPRemoteCommand, Any)] = []
@@ -3096,7 +3356,10 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         result(try playerHost(from: args).resourceStatus())
       case "getDiagnosticsSnapshot":
         let args = try dictionaryArgs(call.arguments)
-        result(try playerHost(from: args).diagnosticsSnapshotJson())
+        let host = try playerHost(from: args)
+        respondOffMain(queue: host.jsonQueue, keeping: host, result: result) {
+          try host.diagnosticsSnapshotJson()
+        }
       case "invokeJson":
         let args = try dictionaryArgs(call.arguments)
         guard let method = args["method"] as? String, !method.isEmpty else {
@@ -3115,14 +3378,27 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
           throw ErikaPluginError.invalidArguments("arguments must be JSON-compatible.")
         }
         let data = try JSONSerialization.data(withJSONObject: arguments)
-        result(try playerHost(from: args).invokeJson(
-          method: method,
-          argumentsJson: String(decoding: data, as: UTF8.self)
-        ))
+        let argumentsJson = String(decoding: data, as: UTF8.self)
+        let host = try playerHost(from: args)
+        respondOffMain(queue: host.jsonQueue, keeping: host, result: result) {
+          try host.invokeJson(method: method, argumentsJson: argumentsJson)
+        }
       case "getLogs":
         // The log ring is process-wide; playerId is accepted but not needed.
         let args = try dictionaryArgs(call.arguments)
-        result(try readLogsJson(arguments: args))
+        let limit = try diagnosticsCount(args["limit"], name: "limit", defaultValue: 200)
+        let sinceSeq = try diagnosticsCount(args["sinceSeq"], name: "sinceSeq", defaultValue: 0)
+        let minLevel = try diagnosticsLogLevel(args["minLevel"])
+        respondOffMain(queue: logQueue, keeping: nil, result: result) {
+          guard let library = ErikaNativeLibrary.shared else {
+            throw ErikaPluginError.libraryNotFound([])
+          }
+          return try library.readLogsJson(
+            limit: UInt32(min(limit, UInt64(UInt32.max))),
+            minLevel: minLevel,
+            sinceSeq: sinceSeq
+          )
+        }
       case "getPresenterStats":
         let args = try dictionaryArgs(call.arguments)
         result(try playerHost(from: args).presenterStats())
@@ -3349,6 +3625,68 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
           } catch {
             DispatchQueue.main.async { result(self.flutterError(error)) }
           }
+        }
+      case "openFrameExportSession":
+        let args = try dictionaryArgs(call.arguments)
+        guard let inputUri = args["uri"] as? String, !inputUri.isEmpty else {
+          throw ErikaPluginError.invalidArguments("uri is required.")
+        }
+        let httpHeaders = (args["httpHeaders"] as? [String: String]) ?? [:]
+        let httpReadAheadBytes = try optionalReadAheadBytes(args["httpReadAheadBytes"])
+        let sessionId = nextFrameExportSessionId
+        nextFrameExportSessionId += 1
+        let box = ErikaFrameExportSessionBox(id: sessionId)
+        // Opening reads the container header, which for a network source takes
+        // a round trip: off the main thread.
+        box.queue.async {
+          do {
+            guard let library = ErikaNativeLibrary.shared else {
+              throw ErikaPluginError.libraryNotFound([])
+            }
+            try box.open(
+              library: library,
+              inputUri: inputUri,
+              httpHeaders: httpHeaders,
+              httpReadAheadBytes: httpReadAheadBytes
+            )
+            DispatchQueue.main.async {
+              self.frameExportSessions[sessionId] = box
+              result(sessionId)
+            }
+          } catch {
+            DispatchQueue.main.async { result(self.flutterError(error)) }
+          }
+        }
+      case "exportSessionFrame":
+        let args = try dictionaryArgs(call.arguments)
+        let sessionId = try requiredInt64(args["sessionId"], name: "sessionId")
+        guard let box = frameExportSessions[sessionId] else {
+          throw ErikaPluginError.invalidArguments("Frame export session \(sessionId) is not open.")
+        }
+        let positionMillis = try requiredUInt64(args["positionMillis"], name: "positionMillis")
+        guard let maxWidth = UInt32(exactly: int64Value(args["width"]) ?? 0),
+              let maxHeight = UInt32(exactly: int64Value(args["height"]) ?? 0),
+              let format = Int32(exactly: int64Value(args["format"]) ?? 1) else {
+          throw ErikaPluginError.invalidArguments("Frame export numeric arguments are out of range.")
+        }
+        respondOffMain(queue: box.queue, keeping: box, result: result) {
+          try box.frame(
+            positionMillis: positionMillis,
+            maxWidth: maxWidth,
+            maxHeight: maxHeight,
+            format: format
+          )
+        }
+      case "closeFrameExportSession":
+        let args = try dictionaryArgs(call.arguments)
+        let sessionId = try requiredInt64(args["sessionId"], name: "sessionId")
+        guard let box = frameExportSessions.removeValue(forKey: sessionId) else {
+          result(nil)
+          return
+        }
+        respondOffMain(queue: box.queue, keeping: box, result: result) {
+          box.close()
+          return Optional<Int>.none
         }
       case "attachView":
         let args = try dictionaryArgs(call.arguments)
@@ -4221,17 +4559,28 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     throw ErikaPluginError.invalidArguments("\(name) is required.")
   }
 
-  private func readLogsJson(arguments args: [String: Any]) throws -> String {
-    guard let library = ErikaNativeLibrary.shared else {
-      throw ErikaPluginError.libraryNotFound([])
+  /// Runs `work` on `queue`, then answers on the main thread, which is where
+  /// Flutter wants results. `keeping` stays referenced until the answer, so
+  /// the last reference to a player never drops on a background queue (its
+  /// teardown touches the display driver).
+  private func respondOffMain<T>(
+    queue: DispatchQueue,
+    keeping owner: AnyObject?,
+    result: @escaping FlutterResult,
+    work: @escaping () throws -> T
+  ) {
+    queue.async {
+      let outcome = Result { try work() }
+      DispatchQueue.main.async {
+        withExtendedLifetime(owner) {}
+        switch outcome {
+        case .success(let value):
+          result(value)
+        case .failure(let error):
+          result(self.flutterError(error))
+        }
+      }
     }
-    let limit = try diagnosticsCount(args["limit"], name: "limit", defaultValue: 200)
-    let sinceSeq = try diagnosticsCount(args["sinceSeq"], name: "sinceSeq", defaultValue: 0)
-    return try library.readLogsJson(
-      limit: UInt32(min(limit, UInt64(UInt32.max))),
-      minLevel: try diagnosticsLogLevel(args["minLevel"]),
-      sinceSeq: sinceSeq
-    )
   }
 
   private func diagnosticsCount(_ value: Any?, name: String, defaultValue: UInt64) throws -> UInt64 {

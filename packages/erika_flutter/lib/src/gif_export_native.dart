@@ -6,3 +6,5 @@ Future<Map<String, Object?>> exportGifNative(Map<String, Object?> options) =>
 
 Future<Map<String, Object?>> exportFrameNative(Map<String, Object?> options) =>
     implementation.exportFrameNative(options);
+
+typedef NativeFrameExportSession = implementation.NativeFrameExportSession;

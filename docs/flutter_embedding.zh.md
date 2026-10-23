@@ -233,6 +233,23 @@ HUD 的驱动机制，数据新鲜度取决于已挂载 surface 的显示循环�
 macOS、iOS、tvOS 以可选方式加载新符号；Linux、鸿蒙、Android 走共享 JSON 方法表；
 Windows 抛出 `UnsupportedError`。
 
+在 macOS 和 iOS 上，插件把这三个调用放到后台队列执行，再回到主线程应答，因此耗时的调用
+（大字幕文件的 `addExternalSubtitle`、`exportFrame`）不会占用主线程。presenter 方法执行期间，
+插件在主线程上的定时器（统计、事件轮询、macOS 的渲染）跳过一轮，而不是等播放器的锁；
+`scope` 为 `global` 的方法（`exportFrame`、`exportFrames`、`getLogs`、`listMethods`）不持有该锁。
+`listMethods` 为每个方法标出 `blocking`（做完才返回，耗时随输入增长）与 `writesFiles`
+（会创建文件，结果列出路径）。
+
+## 不经播放器取画面
+
+`ErikaPlayer.exportFrame(uri, position: ...)` 用自己的 demuxer 和多线程软件解码器取出某个媒体时间
+显示的画面，格式为 RGBA 或 PNG，不涉及播放器。HDR 源（PQ、HLG、杜比视界）按播放器在 SDR 显示器上
+使用的运算做色调映射到 SDR，`ErikaExportedFrame.toneMapped` 会标明。要从同一个媒体取多张时，
+打开一个 `ErikaFrameExportSession`（或调用 `ErikaPlayer.exportFrames`）：媒体只打开一次，按时间
+递增的请求接着解码而不是重新 seek。工作都在 UI 线程之外：macOS 用原生工作队列，FFI 平台（iOS、
+tvOS、Android、Windows、Linux、鸿蒙）每个会话一个后台 isolate。用 `close()` 关闭会话。设置
+`ERIKA_FLUTTER_LIBRARY` 为某个库路径，可让 FFI 导出走待测的构建。
+
 ## Neural Upscaler Status
 
 `setUpscaler` 只是在请求一个模式；kernel 会在后台线程编译，所以宿主应该轮询 `getUpscalerStatus` 来驱动 UI：

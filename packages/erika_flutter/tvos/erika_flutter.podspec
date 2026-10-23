@@ -1,6 +1,17 @@
 Pod::Spec.new do |s|
   erika_cabi_symbols = %w[
     erika_danmaku_track_info_free
+    erika_export_frame
+    erika_export_gif
+    erika_frame_export_result_free
+    erika_frame_export_session_close
+    erika_frame_export_session_frame
+    erika_frame_export_session_open
+    erika_last_error_message
+    erika_log_read_json
+    erika_presenter_get_diagnostics_json
+    erika_presenter_invoke_json
+    erika_string_free
     erika_presenter_add_danmaku_track_file
     erika_presenter_add_danmaku_track_json
     erika_presenter_add_external_subtitle

@@ -535,6 +535,48 @@ impl Demuxer {
         Ok(())
     }
 
+    /// Media time of the last keyframe at or before `position` on the
+    /// selected video stream, from the demuxer's seek index. `None` when the
+    /// index has no entry there (no index, or not read yet: Matroska reads
+    /// its cues at the first seek). Times are relative to the timeline origin,
+    /// like packet and frame timestamps.
+    pub fn keyframe_at_or_before(&self, position: Duration) -> Option<Duration> {
+        let stream_index = self.selected_video_seek_stream()?;
+        let time_base = self.stream_time_base(stream_index)?;
+        let raw = self.context.as_ptr();
+        let stream = unsafe { *(*raw).streams.add(usize::try_from(stream_index).ok()?) };
+        if stream.is_null() || unsafe { sys::avformat_index_get_entries_count(stream) } <= 0 {
+            return None;
+        }
+        let relative = position.as_micros().min(i64::MAX as u128) as i64;
+        let target = rescale_microseconds_to_time_base(
+            absolute_seek_target_micros(relative, self.timeline_origin_micros),
+            time_base,
+        );
+        let index = unsafe {
+            sys::av_index_search_timestamp(stream, target, sys::AVSEEK_FLAG_BACKWARD as i32)
+        };
+        if index < 0 {
+            return None;
+        }
+        let entry = unsafe { sys::avformat_index_get_entry(stream, index) };
+        if entry.is_null() {
+            return None;
+        }
+        let micros = unsafe {
+            sys::av_rescale_q(
+                (*entry).timestamp,
+                time_base.to_av_rational(),
+                sys::AVRational {
+                    num: 1,
+                    den: sys::AV_TIME_BASE as i32,
+                },
+            )
+        }
+        .saturating_sub(self.timeline_origin_micros);
+        Some(Duration::from_micros(micros.max(0) as u64))
+    }
+
     fn selected_video_seek_stream(&self) -> Option<i32> {
         self.probe
             .tracks
@@ -1115,8 +1157,9 @@ impl Decoder {
     }
 
     /// Opens a software decoder that decodes on several threads (FFmpeg
-    /// picks the count), for one-off work such as a frame export. Playback
-    /// decoders keep FFmpeg's single-threaded default.
+    /// picks the count), for one-off work such as a frame export. Software
+    /// video decoders opened for playback follow
+    /// [`software_video_decode_threads`].
     pub fn open_software_threaded(parameters: CodecParameters<'_>) -> Result<Self> {
         Self::open_raw_with_threads(
             parameters.ptr,
@@ -1215,6 +1258,12 @@ impl Decoder {
         unsafe {
             (*decoder.context).pkt_timebase = time_base.to_av_rational();
         }
+        let threads = threads.or_else(|| {
+            let video =
+                unsafe { (*parameters_ptr).codec_type } == sys::AVMediaType_AVMEDIA_TYPE_VIDEO;
+            (video && config.backend == DecoderBackend::Software)
+                .then(software_video_decode_threads)
+        });
         if let Some(threads) = threads {
             // 0: as many threads as FFmpeg finds useful for this codec.
             unsafe { (*decoder.context).thread_count = threads };
@@ -1388,6 +1437,25 @@ impl Decoder {
             }
         }
         open_result?;
+        if threads.is_some() {
+            let (count, kind) = unsafe {
+                (
+                    (*decoder.context).thread_count,
+                    (*decoder.context).active_thread_type,
+                )
+            };
+            crate::trace::diagnostic(
+                serde_json::json!({
+                    "event": "video_decoder",
+                    "stage": "software_threads",
+                    "codec": codec_name_for_id(codec_id),
+                    "requestedThreads": threads,
+                    "threads": count,
+                    "threadType": thread_type_label(kind),
+                })
+                .to_string(),
+            );
+        }
         if config.backend == DecoderBackend::Software && codec_id == sys::AVCodecID_AV_CODEC_ID_AV1
         {
             crate::trace::diagnostic(
@@ -1890,6 +1958,50 @@ impl Decoder {
         self.hw_state = Some(hw_state);
         Ok(())
     }
+}
+
+/// Environment override for [`software_video_decode_threads`]: a positive
+/// thread count, or `0`/`auto` for FFmpeg's choice.
+pub const VIDEO_DECODE_THREADS_ENV: &str = "ERIKA_VIDEO_DECODE_THREADS";
+
+/// Thread count for software video decoders, playback included.
+///
+/// FFmpeg's own default is one thread, which leaves a 4K stream that falls
+/// back to software short of real time. `0` lets libavcodec pick: frame plus
+/// slice threading with one thread per core plus one, capped at 16 (its
+/// `MAX_AUTO_THREADS`); libdav1d takes 1.5 threads per core. mpv's
+/// `vd-lavc-threads` defaults to the same. Frame threading delays the first
+/// picture after open or seek by up to that many packets, which a local file
+/// or a buffered stream supplies at once. `ERIKA_VIDEO_DECODE_THREADS`
+/// overrides it (`1` restores single-threaded decoding).
+pub fn software_video_decode_threads() -> i32 {
+    software_video_decode_threads_from(std::env::var(VIDEO_DECODE_THREADS_ENV).ok().as_deref())
+}
+
+/// [`software_video_decode_threads`] for a given override value.
+pub(crate) fn software_video_decode_threads_from(value: Option<&str>) -> i32 {
+    match value.map(str::trim) {
+        Some(value) if !value.is_empty() && !value.eq_ignore_ascii_case("auto") => value
+            .parse::<i32>()
+            .ok()
+            .filter(|threads| (0..=64).contains(threads))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn thread_type_label(active_thread_type: i32) -> &'static str {
+    if active_thread_type & sys::FF_THREAD_FRAME as i32 != 0 {
+        "frame"
+    } else if active_thread_type & sys::FF_THREAD_SLICE as i32 != 0 {
+        "slice"
+    } else {
+        "none"
+    }
+}
+
+fn codec_name_for_id(codec_id: sys::AVCodecID) -> Option<String> {
+    unsafe { codec_name(codec_id) }
 }
 
 fn software_decoder(codec_id: sys::AVCodecID) -> (*const sys::AVCodec, &'static str) {
