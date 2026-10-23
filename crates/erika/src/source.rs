@@ -2862,12 +2862,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let named = dir.join("影 #1 100%.mkv");
         std::fs::write(&named, b"named").unwrap();
-        let encoded = format!(
-            "file://{}/%E5%BD%B1%20%231%20100%25.mkv",
+        let encoded = format!("file://{}/%E5%BD%B1%20%231%20100%25.mkv", dir.display());
+        assert_eq!(read_uri_to_end(&encoded).unwrap(), b"named");
+        let local = format!(
+            "file://localhost{}/%E5%BD%B1%20%231%20100%25.mkv",
             dir.display()
         );
-        assert_eq!(read_uri_to_end(&encoded).unwrap(), b"named");
-        let local = format!("file://localhost{}/%E5%BD%B1%20%231%20100%25.mkv", dir.display());
         assert_eq!(read_uri_to_end(&local).unwrap(), b"named");
         // A raw path written into a URI keeps working, also when it
         // contains what looks like an escape.

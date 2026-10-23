@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use crate::audio::AudioClockSnapshot;
 use crate::core::{
-    MediaRequest, MediaSourceHint, TrackInfo, TrackKind, TrackSelection, VideoDecoderEvent,
-    VideoFrameImportFailure, VideoParams,
+    ChapterInfo, MediaRequest, MediaSourceHint, TrackInfo, TrackKind, TrackSelection,
+    VideoDecoderEvent, VideoFrameImportFailure, VideoParams,
 };
 use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
@@ -733,6 +733,7 @@ pub struct OpenedMediaInfo {
     pub uri: String,
     pub duration: Option<Duration>,
     pub tracks: Vec<TrackInfo>,
+    pub chapters: Vec<ChapterInfo>,
     pub video_params: Option<VideoParams>,
     pub selected_video_track: Option<i64>,
     pub selected_audio_track: Option<i64>,
@@ -1321,6 +1322,7 @@ impl PlaybackSession {
             uri: probe.uri,
             duration: probe.duration,
             tracks: probe.tracks,
+            chapters: probe.chapters,
             video_params,
             selected_video_track: selected_video_track.map(i64::from),
             selected_audio_track: selected_audio_track.map(i64::from),
@@ -6991,6 +6993,7 @@ mod tests {
             uri: "file:///tmp/test.mp4".to_string(),
             duration: Some(Duration::from_secs(12)),
             tracks: vec![video_track],
+            chapters: Vec::new(),
             video_params: Some(VideoParams {
                 width: 3840,
                 height: 2160,
