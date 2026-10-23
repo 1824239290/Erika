@@ -345,6 +345,14 @@ impl TrackInfo {
     }
 }
 
+/// A container chapter on the same zero-based timeline as playback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterInfo {
+    pub title: String,
+    pub start: Duration,
+    pub end: Option<Duration>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TrackSelection {
     pub video: Option<i64>,
@@ -986,6 +994,7 @@ struct PlayerInner {
     audio_output_epoch: u64,
     surface: Option<PlatformSurface>,
     tracks: Vec<TrackInfo>,
+    chapters: Vec<ChapterInfo>,
     track_selection: TrackSelection,
     subscribers: Vec<Sender<PlayerEvent>>,
     video_frame_sender: Option<Sender<PlayerVideoFrame>>,
@@ -1175,6 +1184,7 @@ impl Player {
                 audio_output_epoch: 1,
                 surface: None,
                 tracks: Vec::new(),
+                chapters: Vec::new(),
                 track_selection: TrackSelection::default(),
                 subscribers: Vec::new(),
                 video_frame_sender: None,
@@ -1211,7 +1221,8 @@ impl Player {
         self.inner.lock().expect("player mutex poisoned").state
     }
 
-    pub(crate) fn is_stopped_at_end(&self) -> bool {
+    /// Playback stopped because the media ended, as opposed to `stop()`.
+    pub fn is_stopped_at_end(&self) -> bool {
         let inner = self.inner.lock().expect("player mutex poisoned");
         inner.state == PlayerState::Stopped && inner.ended
     }
@@ -1381,6 +1392,7 @@ impl Player {
             inner.pending_play_sequence = None;
             inner.ended = false;
             inner.tracks = info.tracks.clone();
+            inner.chapters = info.chapters.clone();
             inner.track_selection = info.track_selection();
             generation
         };
@@ -1595,6 +1607,15 @@ impl Player {
             .lock()
             .expect("player mutex poisoned")
             .track_selection
+    }
+
+    /// Chapters read while opening the current media; empty when absent.
+    pub fn chapters(&self) -> Vec<ChapterInfo> {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .chapters
+            .clone()
     }
 
     pub fn stop(&self) -> Result<()> {
@@ -1887,6 +1908,7 @@ impl Player {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             inner.media = None;
             inner.tracks.clear();
+            inner.chapters.clear();
             inner.track_selection = TrackSelection::default();
             inner.duration = None;
             inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
@@ -1979,6 +2001,7 @@ impl Player {
     fn transition_to_opening(&self) {
         let previous = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.chapters.clear();
             // A racing Play may have cloned the old worker sender before this
             // Open took the lifecycle lock, then queued behind Shutdown. The
             // old worker is joined above, so invalidate that orphaned intent
@@ -5498,6 +5521,47 @@ mod tests {
             events.recv().unwrap(),
             PlayerEvent::StateChanged(PlayerState::Ready)
         );
+    }
+
+    #[test]
+    fn container_chapters_reach_player_and_clear_on_reopen_or_failure() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let chapter_file = root.join("chapters/chapters.mkv");
+        let player = Player::new(PlayerConfig::default());
+        player
+            .open(MediaRequest::new(chapter_file.to_string_lossy()))
+            .unwrap();
+        let chapters = player.chapters();
+        assert_eq!(chapters.len(), 6);
+        assert_eq!(
+            chapters[1],
+            ChapterInfo {
+                title: "OP".into(),
+                start: Duration::from_secs(10),
+                end: Some(Duration::from_secs(20)),
+            }
+        );
+        assert_eq!(chapters[4].title, "ED");
+        assert_eq!(chapters[4].end, Some(Duration::from_secs(50)));
+        player
+            .open(MediaRequest::new(
+                root.join("playback/playback-fixture.mkv").to_string_lossy(),
+            ))
+            .unwrap();
+        assert!(player.chapters().is_empty());
+        player
+            .open(MediaRequest::new(chapter_file.to_string_lossy()))
+            .unwrap();
+        assert!(
+            player
+                .open(MediaRequest::new(
+                    root.join("missing.mkv").to_string_lossy()
+                ))
+                .is_err()
+        );
+        assert!(player.chapters().is_empty());
+        player.close().unwrap();
+        assert!(player.chapters().is_empty());
     }
 
     #[test]
