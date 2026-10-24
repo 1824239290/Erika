@@ -53,6 +53,7 @@ const SCROLL_DURATION_MIN_WIDTH_SCALE: f32 = 0.9;
 const SCROLL_DURATION_MAX_WIDTH_SCALE: f32 = 1.3;
 const DEFAULT_DANMAKU_TRACK_ID: u64 = 1;
 const MAX_CUSTOM_DANMAKU_FONT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RESIDENT_FALLBACK_FACES: usize = 8;
 pub const DANMAKU_DEBUG_BUCKETS: usize = 16;
 
 #[derive(Debug, Error)]
@@ -1234,11 +1235,40 @@ impl DanmakuFontFace {
     }
 }
 
+const PREFERRED_FALLBACK_FAMILIES: &[&str] = &[
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Hiragino Sans",
+    "Apple SD Gothic Neo",
+    "Songti SC",
+    "STHeiti",
+    "Microsoft YaHei",
+    "SimHei",
+    "Noto Sans CJK SC",
+    "Noto Sans CJK JP",
+    "Noto Sans CJK",
+    "Source Han Sans SC",
+    "Source Han Sans",
+    "Arial Unicode MS",
+    "Arial Unicode",
+    "Segoe UI Symbol",
+    // Platform emoji fonts: resolve emoji during the preferred stage instead
+    // of walking every system face.
+    "Apple Color Emoji",
+    "Segoe UI Emoji",
+    "Noto Color Emoji",
+];
+
 #[derive(Debug)]
 struct SystemFontFallback {
     db: fontdb::Database,
     faces: Vec<fontdb::ID>,
     loaded: HashMap<fontdb::ID, Option<DanmakuFontFace>>,
+    // GlyphCacheKey and kerning bake DanmakuFontFace::id in, so a face evicted
+    // from the resident set must reuse its id when reloaded.
+    face_ids: HashMap<fontdb::ID, u32>,
+    resident: VecDeque<u32>,
+    resident_cap: usize,
     char_cache: HashMap<char, Option<u32>>,
     next_font_id: u32,
 }
@@ -1247,26 +1277,12 @@ impl SystemFontFallback {
     fn new(next_font_id: u32) -> Self {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
-        let preferred = [
-            "PingFang SC",
-            "Hiragino Sans GB",
-            "Hiragino Sans",
-            "Apple SD Gothic Neo",
-            "Songti SC",
-            "STHeiti",
-            "Microsoft YaHei",
-            "SimHei",
-            "Noto Sans CJK SC",
-            "Noto Sans CJK JP",
-            "Noto Sans CJK",
-            "Source Han Sans SC",
-            "Source Han Sans",
-            "Arial Unicode MS",
-            "Arial Unicode",
-            "Segoe UI Symbol",
-        ];
+        Self::with_database(db, next_font_id)
+    }
+
+    fn with_database(db: fontdb::Database, next_font_id: u32) -> Self {
         let mut faces = Vec::new();
-        for family in preferred {
+        for family in PREFERRED_FALLBACK_FAMILIES {
             let query = fontdb::Query {
                 families: &[fontdb::Family::Name(family)],
                 weight: fontdb::Weight::NORMAL,
@@ -1296,17 +1312,29 @@ impl SystemFontFallback {
             db,
             faces,
             loaded: HashMap::new(),
+            face_ids: HashMap::new(),
+            resident: VecDeque::new(),
+            resident_cap: MAX_RESIDENT_FALLBACK_FACES,
             char_cache: HashMap::new(),
             next_font_id,
         }
     }
 
     fn resolve(&mut self, ch: char) -> Option<DanmakuFontFace> {
-        if let Some(font_id) = self.char_cache.get(&ch).copied() {
-            return font_id.and_then(|font_id| self.loaded_font_by_id(font_id));
+        if let Some(cached) = self.char_cache.get(&ch).copied() {
+            let font_id = cached?;
+            if let Some(face) = self.loaded_font_by_id(font_id) {
+                self.touch_resident(font_id);
+                return Some(face);
+            }
+            // The cached face was evicted; resolve from scratch so the same
+            // face (and id) becomes resident again.
         }
         let faces = self.faces.clone();
         for face_id in faces {
+            if !self.face_covers(face_id, ch) {
+                continue;
+            }
             let Some(face) = self.load_face(face_id) else {
                 continue;
             };
@@ -1319,6 +1347,21 @@ impl SystemFontFallback {
         None
     }
 
+    // Borrowed cmap lookup over fontdb's memory-mapped face data: faces that
+    // do not cover `ch` are skipped without copying the font file. The
+    // whitespace shortcut mirrors DanmakuFontFace::has_glyph.
+    fn face_covers(&self, id: fontdb::ID, ch: char) -> bool {
+        ch.is_whitespace()
+            || self
+                .db
+                .with_face_data(id, |data, face_index| {
+                    FontRef::try_from_slice_and_index(data, face_index)
+                        .map(|face| face.glyph_id(ch).0 != 0)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+    }
+
     fn loaded_font_by_id(&self, font_id: u32) -> Option<DanmakuFontFace> {
         self.loaded
             .values()
@@ -1328,8 +1371,11 @@ impl SystemFontFallback {
     }
 
     fn load_face(&mut self, id: fontdb::ID) -> Option<DanmakuFontFace> {
-        if let Some(face) = self.loaded.get(&id) {
-            return face.clone();
+        if let Some(face) = self.loaded.get(&id).cloned() {
+            if let Some(face) = &face {
+                self.touch_resident(face.id);
+            }
+            return face;
         }
         let font = self
             .db
@@ -1340,12 +1386,53 @@ impl SystemFontFallback {
             })
             .flatten();
         let face = font.map(|font| {
-            let id = self.next_font_id;
-            self.next_font_id = self.next_font_id.saturating_add(1).max(1);
-            DanmakuFontFace::new(id, font)
+            let local_id = self.stable_face_id(id);
+            DanmakuFontFace::new(local_id, font)
         });
-        self.loaded.insert(id, face.clone());
+        // A zero cap disables caching entirely: the face is handed out without
+        // ever entering the resident set, so the loaded/resident invariant
+        // (every cached face is resident) still holds.
+        if self.resident_cap > 0 {
+            if let Some(face) = &face {
+                self.evict_over_cap();
+                self.resident.push_back(face.id);
+            }
+            self.loaded.insert(id, face.clone());
+        }
         face
+    }
+
+    fn stable_face_id(&mut self, id: fontdb::ID) -> u32 {
+        if let Some(local_id) = self.face_ids.get(&id) {
+            return *local_id;
+        }
+        let local_id = self.next_font_id;
+        self.next_font_id = self.next_font_id.saturating_add(1);
+        self.face_ids.insert(id, local_id);
+        local_id
+    }
+
+    fn evict_over_cap(&mut self) {
+        while self.resident.len() >= self.resident_cap {
+            let Some(evicted_id) = self.resident.pop_front() else {
+                return;
+            };
+            let evicted_key = self
+                .loaded
+                .iter()
+                .find(|(_, face)| face.as_ref().is_some_and(|f| f.id == evicted_id))
+                .map(|(key, _)| *key);
+            if let Some(key) = evicted_key {
+                self.loaded.remove(&key);
+            }
+        }
+    }
+
+    fn touch_resident(&mut self, font_id: u32) {
+        if let Some(index) = self.resident.iter().position(|id| *id == font_id) {
+            self.resident.remove(index);
+            self.resident.push_back(font_id);
+        }
     }
 }
 
@@ -4250,5 +4337,113 @@ mod tests {
         assert_eq!(fonts.len(), 2);
         assert_eq!(fonts[0].font.font_data().as_ptr(), attachment.data.as_ptr());
         assert_eq!(fonts[1].font.font_data().as_ptr(), attachment.data.as_ptr());
+    }
+
+    #[test]
+    fn fallback_miss_loads_no_faces() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        db.load_font_data(NIPAPLAY_FALLBACK_FONT.to_vec());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+
+        assert!(fallback.resolve('\u{1F389}').is_none());
+
+        assert!(
+            fallback.loaded.is_empty(),
+            "a character no face covers must not load any font file"
+        );
+    }
+
+    #[test]
+    fn fallback_hit_loads_only_covering_face() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+
+        let face = fallback.resolve('A').unwrap();
+
+        assert!(face.has_glyph('A'));
+        let loaded = fallback
+            .loaded
+            .values()
+            .filter_map(|face| face.as_ref())
+            .count();
+        assert_eq!(loaded, 1);
+    }
+
+    #[test]
+    fn fallback_lru_evicts_least_recently_used_face() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        db.load_font_data(NIPAPLAY_FALLBACK_FONT.to_vec());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+        fallback.resident_cap = 2;
+        let (a, b, c) = (fallback.faces[0], fallback.faces[1], fallback.faces[2]);
+
+        fallback.load_face(a).unwrap();
+        fallback.load_face(b).unwrap();
+        fallback.load_face(a).unwrap(); // touch: a becomes most recently used
+        fallback.load_face(c).unwrap(); // evicts b, not a
+
+        assert!(!fallback.loaded.contains_key(&b));
+        assert!(fallback.loaded.get(&a).unwrap().is_some());
+        assert!(fallback.loaded.get(&c).unwrap().is_some());
+    }
+
+    #[test]
+    fn fallback_evicted_face_reuses_its_stable_id() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+        fallback.resident_cap = 1;
+        let (a, b) = (fallback.faces[0], fallback.faces[1]);
+
+        let first = fallback.load_face(a).unwrap();
+        let second = fallback.load_face(b).unwrap();
+        assert_ne!(first.id, second.id);
+
+        let reloaded = fallback.load_face(a).unwrap();
+
+        assert_eq!(
+            reloaded.id, first.id,
+            "a reloaded face must reuse its id because glyph caches key on it"
+        );
+    }
+
+    #[test]
+    fn fallback_resolve_recovers_after_eviction() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+        fallback.resident_cap = 1;
+
+        let first = fallback.resolve('A').unwrap();
+        fallback.load_face(fallback.faces[1]).unwrap(); // evicts the resolved face
+
+        let again = fallback.resolve('A').unwrap();
+
+        assert_eq!(again.id, first.id);
+    }
+
+    #[test]
+    fn preferred_fallback_families_cover_platform_emoji_fonts() {
+        for family in ["Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"] {
+            assert!(PREFERRED_FALLBACK_FAMILIES.contains(&family));
+        }
+    }
+
+    #[test]
+    fn fallback_cap_zero_disables_caching() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+        fallback.resident_cap = 0;
+
+        let first = fallback.resolve('A').unwrap();
+        let again = fallback.resolve('A').unwrap();
+
+        assert_eq!(again.id, first.id);
+        assert!(fallback.loaded.is_empty());
+        assert!(fallback.resident.is_empty());
     }
 }
