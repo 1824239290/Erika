@@ -88,6 +88,17 @@ ErikaStatus erika_export_gif( const ErikaGifExportOptions *options, ErikaGifExpo
 handle を必要としない同期処理です。UI では worker から呼びます。時刻はミリ秒、サイズは出力ピクセルです。
 品質 Normal は bilinear、High は Lanczos。loop_count は -1 がループなし、0 が無限です。
 
+```c
+ErikaStatus erika_export_frame(const ErikaFrameExportOptions *options, ErikaFrameExportResult *out_result);
+void erika_frame_export_result_free(ErikaFrameExportResult *result);
+```
+
+`position_millis` の時刻に表示される 1 枚（その時刻以前の最後のフレーム）を、独立した demuxer と
+マルチスレッドのソフトウェアデコーダで取り出し、RGBA（1 行 `width * 4` バイト、alpha 255）または
+PNG（8 bit RGB）で返します。handle 不要の同期処理なので UI では worker から呼びます。
+`max_width`/`max_height` は上限（0 は無制限）で、表示アスペクト比を保ち、動画より大きくはしません。
+`data` は `erika_frame_export_result_free` まで liberika が所有します。HDR はトーンマッピングしません。
+
 ## 規約
 
 ### ステータスコード

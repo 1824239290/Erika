@@ -2883,7 +2883,11 @@ impl PlaybackSession {
             &mut self.video_frames,
             self.dolby_vision_profile,
             &mut self.dovi_rpu_diagnostics,
-        )?;
+        );
+        // Report a route FFmpeg changed while decoding, also when the decode
+        // then failed: the fallback below starts from the backend in use.
+        self.observe_video_decoder_route();
+        let status = status?;
         let video_frame_limit = self.active_video_frame_queue_limit();
         if demand != PlaybackPumpDemand::BufferingAudio {
             trim_video_queue(&mut self.video_frames, video_frame_limit);
@@ -2926,6 +2930,46 @@ impl PlaybackSession {
 
     fn active_video_decoder_backend(&self) -> Option<DecoderBackend> {
         self.video_decoder.as_ref().map(Decoder::backend)
+    }
+
+    /// A hardware decoder whose hwaccel FFmpeg dropped in format negotiation
+    /// (it failed to initialise or does not take the stream) keeps decoding
+    /// in software, or a later negotiation took the hardware again. Reports
+    /// that as a decoder change, so the backend Erika reports is the one
+    /// decoding and the fallback is counted.
+    fn observe_video_decoder_route(&mut self) {
+        let Some(decoder) = self.video_decoder.as_mut() else {
+            return;
+        };
+        let Some(change) = decoder.take_route_change() else {
+            return;
+        };
+        let codec = codec_parameters_for(&self.codec_parameters, decoder.stream_index())
+            .ok()
+            .and_then(|parameters| parameters.codec_name());
+        let software = change.active == DecoderBackend::Software;
+        if software {
+            self.video_decoder_fallbacks = self.video_decoder_fallbacks.saturating_add(1);
+        }
+        let previous_backend = self.info.video_decode_backend.unwrap_or(change.configured);
+        self.info.video_decode_backend = Some(change.active);
+        let event = VideoDecoderEvent {
+            stage: if software {
+                format!("hwaccel_{}_to_software", change.configured.as_str())
+            } else {
+                format!("hwaccel_{}_restored", change.configured.as_str())
+            },
+            requested_backend: change.configured,
+            previous_backend: Some(previous_backend),
+            active_backend: change.active,
+            fallback_count: self.video_decoder_fallbacks,
+            codec,
+            pixel_format: change.pixel_format,
+            line_sizes: None,
+            reason: change.reason,
+        };
+        trace::diagnostic(event.structured_message());
+        self.video_decoder_events.push_back(event);
     }
 
     fn active_video_codec_is_av1(&self) -> bool {
@@ -5957,11 +6001,13 @@ fn drain_video_frames(
     dolby_vision_profile: Option<u8>,
     dovi_rpu_diagnostics: &mut DoviRpuDiagnostics,
 ) -> Result<DecoderDrainStatus> {
-    let decode_backend = decoder.backend();
     let mut status = DecoderDrainStatus::default();
     loop {
         match decoder.receive_frame()? {
             DecoderOutputFrame::Frame(frame) => {
+                // The backend that produced this frame: FFmpeg may have
+                // dropped the hardware format during negotiation.
+                let decode_backend = decoder.active_backend();
                 diagnose_dovi_frame(
                     dolby_vision_profile,
                     dovi_rpu_diagnostics,
@@ -6886,6 +6932,68 @@ mod tests {
             let replay = next_fixture_video_at(&mut engine, seek_at);
             assert_eq!(replay.pts, Some(Duration::from_millis(46)));
         }
+    }
+
+    /// FFmpeg opens the VideoToolbox decoder for the MPEG-4 Part 2 fixture,
+    /// then fails to initialise its hwaccel and decodes in software. The
+    /// engine must report that fallback instead of an active VideoToolbox.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn videotoolbox_dropped_by_ffmpeg_is_reported_as_software_fallback() {
+        let mut engine = VideoPlaybackEngine::open(
+            &MediaRequest::new(playback_fixture_path().to_string_lossy()),
+            PlaybackSessionConfig {
+                video_decode: VideoDecodePreference::VideoToolbox,
+                ..PlaybackSessionConfig::default()
+            },
+        )
+        .unwrap();
+        let opened = engine.take_video_decoder_events();
+        assert_eq!(opened.last().unwrap().stage, "open");
+        assert_eq!(
+            opened.last().unwrap().active_backend,
+            DecoderBackend::VideoToolbox
+        );
+
+        let started = Instant::now();
+        engine.play_at(started);
+        let video = next_fixture_video_at(&mut engine, started);
+        assert!(!video.frame.is_videotoolbox());
+        assert_eq!(video.decode_backend, DecoderBackend::Software);
+        assert_eq!(
+            engine.info().video_decode_backend,
+            Some(DecoderBackend::Software)
+        );
+        let events = engine.take_video_decoder_events();
+        let fallback = events
+            .iter()
+            .find(|event| event.stage == "hwaccel_videotoolbox_to_software")
+            .expect("software fallback event");
+        assert_eq!(fallback.requested_backend, DecoderBackend::VideoToolbox);
+        assert_eq!(
+            fallback.previous_backend,
+            Some(DecoderBackend::VideoToolbox)
+        );
+        assert_eq!(fallback.active_backend, DecoderBackend::Software);
+        assert_eq!(fallback.fallback_count, 1);
+        assert_eq!(fallback.codec.as_deref(), Some("mpeg4"));
+        assert_eq!(fallback.pixel_format.as_deref(), Some("yuv420p"));
+        assert!(
+            fallback
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("could not initialise")),
+            "{:?}",
+            fallback.reason
+        );
+        // Reported once, not per frame.
+        let _ = next_fixture_video_at(&mut engine, started + Duration::from_millis(100));
+        assert!(
+            engine
+                .take_video_decoder_events()
+                .iter()
+                .all(|event| !event.stage.starts_with("hwaccel_"))
+        );
     }
 
     #[test]

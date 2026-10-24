@@ -80,6 +80,44 @@ uses FFmpeg GIF semantics: `-1` disables looping, `0` loops forever, and a
 positive value is the loop count. HTTP inputs accept the same headers and
 read-ahead override as `ErikaOpenOptions`.
 
+## Headless frame export
+
+`erika_export_frame` is independent of both handle families too. It opens a
+private demuxer and a multi-threaded software decoder, seeks to the keyframe
+before `position_millis`, decodes forward and returns the picture shown at that
+media time: the last frame at or before it (the first frame when the position
+precedes it).
+
+```c
+ErikaFrameExportOptions options = {
+    .input_uri = "/path/input.mkv",
+    .position_millis = 60000,
+    .max_width = 640,
+    .max_height = 640,
+    .format = ErikaFrameExportFormat_Png,
+};
+ErikaFrameExportResult result = {0};
+if (erika_export_frame(&options, &result) == ErikaStatus_Ok) {
+    /* result.data holds result.data_len bytes of a PNG file. */
+    erika_frame_export_result_free(&result);
+}
+```
+
+The call is synchronous; UI hosts must run it on a worker thread or isolate.
+`max_width` and `max_height` bound the picture (0 leaves a side unbounded): the
+display aspect ratio is kept and the picture is never larger than the video, so
+two zeros return the video's own size. `ErikaFrameExportFormat_Rgba` returns
+rows of exactly `width * 4` bytes with alpha 255; `ErikaFrameExportFormat_Png`
+returns an 8-bit RGB PNG file. Colour conversion follows the frame's colour
+space and range; an unlabelled YUV source is taken as BT.709 when it is HD or
+larger and BT.601 otherwise. HDR sources are converted without tone mapping.
+The result reports where the picture is (`timestamp_micros`), the decoded video
+size and the media duration (0 when unknown). A position at or past a known
+duration fails with `ErikaStatus_PlayerError`. HTTP inputs accept the same
+headers and read-ahead override as `ErikaOpenOptions`. `data` stays owned by
+liberika until `erika_frame_export_result_free`, which clears the result and
+may be called again.
+
 ## Conventions
 
 ### Status codes

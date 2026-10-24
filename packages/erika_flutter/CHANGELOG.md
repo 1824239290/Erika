@@ -9,6 +9,14 @@
   HarmonyOS and Android use the shared JSON bridge, and Windows (or an older
   native library) throws `UnsupportedError`. Requires native artifacts from
   the matching release.
+- Added `ErikaPlayer.exportFrame()`, which returns the picture shown at a
+  position of a media URI as RGBA or PNG through the native headless frame
+  export, off the UI thread (a native worker on macOS, a background isolate on
+  the FFI platforms).
+- Large JSON documents from `getLogs()`, `getDiagnosticsSnapshot()` and
+  `invokeJson()` are decoded on a background isolate.
+- The macOS build phase checks that an `ERIKA_MACOS_CAPI_DYLIB` override has
+  every architecture being built and says which library it bundles.
 
 ## 0.2.1
 

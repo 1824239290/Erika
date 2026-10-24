@@ -89,6 +89,70 @@ class ErikaGifExportResult {
   }
 }
 
+/// What [ErikaPlayer.exportFrame] returns the picture as.
+enum ErikaFrameFormat {
+  /// RGBA rows of exactly `width * 4` bytes, top row first; alpha is 255.
+  rgba(0),
+
+  /// The bytes of a PNG file (8-bit RGB).
+  png(1);
+
+  const ErikaFrameFormat(this.nativeValue);
+
+  final int nativeValue;
+}
+
+/// One picture exported by [ErikaPlayer.exportFrame].
+@immutable
+class ErikaExportedFrame {
+  const ErikaExportedFrame({
+    required this.width,
+    required this.height,
+    required this.format,
+    required this.bytes,
+    required this.timestamp,
+    required this.sourceWidth,
+    required this.sourceHeight,
+    this.duration,
+  });
+
+  final int width;
+  final int height;
+  final ErikaFrameFormat format;
+  final Uint8List bytes;
+
+  /// Where in the media the picture is: the last frame at or before the
+  /// requested position (the first frame when the position precedes it).
+  final Duration timestamp;
+
+  /// The video's decoded size.
+  final int sourceWidth;
+  final int sourceHeight;
+
+  /// The media's duration, when its container reports one.
+  final Duration? duration;
+
+  factory ErikaExportedFrame.fromMap(Map<dynamic, dynamic> map) {
+    final format = (map['format'] as num?)?.toInt() ?? 1;
+    final durationMicros = (map['durationMicros'] as num?)?.toInt() ?? 0;
+    return ErikaExportedFrame(
+      width: (map['width'] as num?)?.toInt() ?? 0,
+      height: (map['height'] as num?)?.toInt() ?? 0,
+      format: ErikaFrameFormat.values.firstWhere(
+        (value) => value.nativeValue == format,
+        orElse: () => ErikaFrameFormat.png,
+      ),
+      bytes: map['bytes'] as Uint8List? ?? Uint8List(0),
+      timestamp: Duration(
+        microseconds: (map['timestampMicros'] as num?)?.toInt() ?? 0,
+      ),
+      sourceWidth: (map['sourceWidth'] as num?)?.toInt() ?? 0,
+      sourceHeight: (map['sourceHeight'] as num?)?.toInt() ?? 0,
+      duration: durationMicros > 0 ? Duration(microseconds: durationMicros) : null,
+    );
+  }
+}
+
 @immutable
 class ErikaMediaMetadata {
   const ErikaMediaMetadata({
@@ -1335,7 +1399,7 @@ class ErikaPlayer {
   /// native library does not provide diagnostics.
   Future<Map<String, Object?>> getDiagnosticsSnapshot() async {
     final playerId = await ensureCreated();
-    return _decodeJsonDocument(
+    return _decodeJsonDocumentOffUi(
       await _invokeOptional('getDiagnosticsSnapshot', <String, Object?>{
         'playerId': playerId,
       }),
@@ -1374,7 +1438,7 @@ class ErikaPlayer {
       throw ArgumentError.value(sinceSeq, 'sinceSeq', 'must be zero or positive');
     }
     final playerId = await ensureCreated();
-    return _decodeJsonDocument(
+    return _decodeJsonDocumentOffUi(
       await _invokeOptional('getLogs', <String, Object?>{
         'playerId': playerId,
         'limit': limit,
@@ -1422,7 +1486,7 @@ class ErikaPlayer {
         'error': error.message ?? error.code,
       };
     }
-    return _decodeJsonDocument(raw, 'invokeJson');
+    return _decodeJsonDocumentOffUi(raw, 'invokeJson');
   }
 
   Future<Object?> _invokeOptional(
@@ -1449,6 +1513,23 @@ class ErikaPlayer {
       rethrow;
     }
   }
+
+  /// JSON text at least this long is decoded on a background isolate: a
+  /// full log ring is up to 512 KiB, more than the UI isolate should parse.
+  static const int _backgroundDecodeChars = 64 * 1024;
+
+  static Future<Map<String, Object?>> _decodeJsonDocumentOffUi(
+    Object? raw,
+    String method,
+  ) async {
+    if (raw is String && raw.length >= _backgroundDecodeChars) {
+      return compute(_decodeJsonDocumentMessage, <String>[raw, method]);
+    }
+    return _decodeJsonDocument(raw, method);
+  }
+
+  static Map<String, Object?> _decodeJsonDocumentMessage(List<String> message) =>
+      _decodeJsonDocument(message[0], message[1]);
 
   static Map<String, Object?> _decodeJsonDocument(Object? raw, String method) {
     final Object? decoded = raw is String ? jsonDecode(raw) : raw;
@@ -1531,6 +1612,78 @@ class ErikaPlayer {
       throw StateError('Erika GIF export returned no result.');
     }
     return ErikaGifExportResult.fromMap(result);
+  }
+
+  /// Decodes the picture shown at [position] of [uri] (a local path or
+  /// HTTP(S) URL) through liberika's independent headless pipeline, its own
+  /// demuxer and multi-threaded software decoder, and returns it as [format].
+  ///
+  /// [width] and [height] bound the picture in pixels (0 leaves that side
+  /// unbounded); the display aspect ratio is kept and the picture is never
+  /// larger than the video, so the result can be smaller than asked. No
+  /// player is involved and playback may continue meanwhile; the work runs
+  /// off the UI thread (a native worker on macOS, a background isolate
+  /// elsewhere).
+  ///
+  /// Throws [UnsupportedError] where the bundled native library or platform
+  /// has no frame export, and [StateError] with liberika's message when the
+  /// media cannot be read, has no video, or [position] is not before its end.
+  static Future<ErikaExportedFrame> exportFrame(
+    String uri, {
+    required Duration position,
+    int width = 0,
+    int height = 0,
+    ErikaFrameFormat format = ErikaFrameFormat.png,
+    Map<String, String> httpHeaders = const <String, String>{},
+    int httpReadAheadBytes = 0,
+  }) async {
+    if (uri.trim().isEmpty) {
+      throw ArgumentError.value(uri, 'uri', 'must not be empty');
+    }
+    if (position.isNegative) {
+      throw ArgumentError.value(position, 'position', 'must not be negative');
+    }
+    if (width < 0 || height < 0 || width > 16384 || height > 16384) {
+      throw ArgumentError('width and height must be in 0..=16384.');
+    }
+    if (httpReadAheadBytes < 0) {
+      throw ArgumentError.value(
+        httpReadAheadBytes,
+        'httpReadAheadBytes',
+        'must not be negative',
+      );
+    }
+    final arguments = <String, Object?>{
+      'uri': uri,
+      'positionMillis': position.inMilliseconds,
+      'width': width,
+      'height': height,
+      'format': format.nativeValue,
+      if (httpHeaders.isNotEmpty) 'httpHeaders': httpHeaders,
+      if (httpReadAheadBytes > 0) 'httpReadAheadBytes': httpReadAheadBytes,
+    };
+    final Map<dynamic, dynamic>? result;
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.macOS) {
+      try {
+        result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+          'exportFrame',
+          arguments,
+        );
+      } on MissingPluginException {
+        throw UnsupportedError('Erika frame export is not available here.');
+      } on PlatformException catch (error) {
+        if (error.code == 'ERIKA_UNSUPPORTED') {
+          throw UnsupportedError(error.message ?? 'Erika frame export is unsupported.');
+        }
+        throw StateError(error.message ?? error.code);
+      }
+    } else {
+      result = await exportFrameNative(arguments);
+    }
+    if (result == null) {
+      throw StateError('Erika frame export returned no result.');
+    }
+    return ErikaExportedFrame.fromMap(result);
   }
 
   Future<int> addExternalSubtitle(String uri) async {

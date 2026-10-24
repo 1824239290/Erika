@@ -1,4 +1,4 @@
-//! Headless media export jobs.
+//! Headless media export jobs: animated GIFs and single frames.
 //!
 //! This module deliberately does not construct a [`crate::Player`] or attach a
 //! presentation surface. It owns a separate demuxer, software decoder and
@@ -17,7 +17,7 @@ use libc::EAGAIN;
 use thiserror::Error;
 
 use crate::core::{MediaRequest, TrackKind};
-use crate::ffmpeg::{DecoderOutputFrame, Demuxer, Frame, StreamSelection};
+use crate::ffmpeg::{Decoder, DecoderOutputFrame, Demuxer, Frame, StreamSelection};
 use crate::source::source_from_uri_with_options;
 
 const AVERROR_EOF: i32 = -541_478_725;
@@ -102,6 +102,17 @@ pub enum ExportError {
     Ffmpeg(String),
     #[error("I/O error for {path}: {message}")]
     Io { path: PathBuf, message: String },
+    #[error("invalid frame export options: {0}")]
+    InvalidFrameOptions(String),
+    #[error("position {position:?} is not before the end of the media ({duration:?})")]
+    PastEnd {
+        position: Duration,
+        duration: Duration,
+    },
+    #[error("the video has no picture at or after the start")]
+    NoPicture,
+    #[error("PNG encoding failed: {0}")]
+    Png(String),
 }
 
 pub type Result<T> = std::result::Result<T, ExportError>;
@@ -256,6 +267,358 @@ pub fn export_gif(options: &GifExportOptions) -> Result<GifExportResult> {
         frame_count,
         file_size,
     })
+}
+
+/// What [`export_frame`] returns the picture as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameExportFormat {
+    /// RGBA8 rows of exactly `width * 4` bytes, top row first; alpha is 255.
+    Rgba,
+    /// A PNG file (8-bit RGB).
+    Png,
+}
+
+impl FrameExportFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rgba => "rgba",
+            Self::Png => "png",
+        }
+    }
+}
+
+/// Largest side [`export_frame`] accepts as a bound.
+pub const FRAME_EXPORT_MAX_DIMENSION: u32 = 16_384;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameExportOptions {
+    pub input: MediaRequest,
+    /// The picture shown at this media time is exported.
+    pub position: Duration,
+    /// Largest output width in pixels; zero leaves the width unbounded.
+    pub max_width: u32,
+    /// Largest output height in pixels; zero leaves the height unbounded.
+    /// The picture keeps the video's display aspect ratio and is never larger
+    /// than the video, so two zeros give the video's own size.
+    pub max_height: u32,
+    pub format: FrameExportFormat,
+}
+
+impl FrameExportOptions {
+    pub fn new(input_uri: impl Into<String>, position: Duration) -> Self {
+        Self {
+            input: MediaRequest::new(input_uri),
+            position,
+            max_width: 0,
+            max_height: 0,
+            format: FrameExportFormat::Png,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub format: FrameExportFormat,
+    /// RGBA rows or a PNG file, as `format` says.
+    pub data: Vec<u8>,
+    /// Presentation time of the picture: the last frame at or before the
+    /// requested position (the first frame when the position precedes it).
+    pub timestamp: Duration,
+    /// The video's decoded size.
+    pub source_width: u32,
+    pub source_height: u32,
+    /// The media's duration when the container reports one.
+    pub duration: Option<Duration>,
+}
+
+/// Decodes the picture shown at `options.position` and returns it scaled to
+/// the requested bounds as RGBA or PNG.
+///
+/// Like [`export_gif`] it opens its own demuxer and a (multi-threaded)
+/// software decoder, seeks to the keyframe before the position and decodes
+/// forward, so it never touches a player. The operation is synchronous; UI
+/// integrations must call it on a worker thread or isolate.
+pub fn export_frame(options: &FrameExportOptions) -> Result<ExportedFrame> {
+    validate_frame_options(options)?;
+    let source = source_from_uri_with_options(
+        &options.input.uri,
+        options.input.source_hint,
+        options.input.http_headers.clone(),
+        options.input.http_read_ahead_bytes,
+        None,
+    )
+    .map_err(|error| ExportError::Source(error.to_string()))?;
+    let mut demuxer = Demuxer::open_source(source).map_err(ffmpeg_error)?;
+    let duration = demuxer.probe().duration;
+    if let Some(duration) = duration
+        && options.position >= duration
+    {
+        return Err(ExportError::PastEnd {
+            position: options.position,
+            duration,
+        });
+    }
+    let video = demuxer
+        .probe()
+        .video
+        .first()
+        .cloned()
+        .ok_or(ExportError::NoVideoTrack)?;
+    let stream_index = i32::try_from(video.track_id)
+        .map_err(|_| ExportError::Ffmpeg("video stream index exceeds i32".to_string()))?;
+    demuxer
+        .set_stream_selection(StreamSelection::only([stream_index]))
+        .map_err(ffmpeg_error)?;
+    let mut decoder = Decoder::open_software_threaded(
+        demuxer
+            .codec_parameters(stream_index)
+            .map_err(ffmpeg_error)?,
+    )
+    .map_err(ffmpeg_error)?;
+    demuxer.seek(options.position).map_err(ffmpeg_error)?;
+    decoder.flush();
+
+    let picture = picture_at(&mut demuxer, &mut decoder, options.position)?;
+    let (width, height) = frame_output_size(&picture, options.max_width, options.max_height)?;
+    let rgba = scale_frame_to_rgba(&picture, width, height)?;
+    let data = match options.format {
+        FrameExportFormat::Rgba => rgba,
+        FrameExportFormat::Png => encode_png_rgb(&rgba, width, height)?,
+    };
+    Ok(ExportedFrame {
+        width,
+        height,
+        format: options.format,
+        data,
+        timestamp: picture
+            .pts()
+            .and_then(|pts| pts.as_duration())
+            .unwrap_or_default(),
+        source_width: picture.width(),
+        source_height: picture.height(),
+        duration,
+    })
+}
+
+fn validate_frame_options(options: &FrameExportOptions) -> Result<()> {
+    if options.input.uri.is_empty() {
+        return Err(ExportError::InvalidFrameOptions(
+            "input URI must not be empty".to_string(),
+        ));
+    }
+    if options.max_width > FRAME_EXPORT_MAX_DIMENSION
+        || options.max_height > FRAME_EXPORT_MAX_DIMENSION
+    {
+        return Err(ExportError::InvalidFrameOptions(format!(
+            "width and height must not exceed {FRAME_EXPORT_MAX_DIMENSION}"
+        )));
+    }
+    Ok(())
+}
+
+/// The frame displayed at `position`: decodes forward from the keyframe the
+/// demuxer sought to and keeps the last frame whose time is not after it.
+fn picture_at(demuxer: &mut Demuxer, decoder: &mut Decoder, position: Duration) -> Result<Frame> {
+    // Half a millisecond absorbs time-base rounding of a frame exactly at the
+    // position.
+    let target = position.as_secs_f64() + 0.000_5;
+    let mut shown: Option<Frame> = None;
+    let mut eof_sent = false;
+    loop {
+        loop {
+            match decoder.receive_frame().map_err(ffmpeg_error)? {
+                DecoderOutputFrame::Frame(frame) => {
+                    let Some(seconds) = frame.pts().map(|pts| pts.seconds()) else {
+                        continue;
+                    };
+                    if seconds <= target {
+                        shown = Some(frame);
+                        continue;
+                    }
+                    return Ok(shown.unwrap_or(frame));
+                }
+                DecoderOutputFrame::NeedMoreInput => break,
+                DecoderOutputFrame::EndOfStream => {
+                    return shown.ok_or(ExportError::NoPicture);
+                }
+            }
+        }
+        if eof_sent {
+            return shown.ok_or(ExportError::NoPicture);
+        }
+        match demuxer.read_packet().map_err(ffmpeg_error)? {
+            Some(packet) => decoder.send_packet(&packet).map_err(ffmpeg_error)?,
+            None => {
+                decoder.send_eof().map_err(ffmpeg_error)?;
+                eof_sent = true;
+            }
+        }
+    }
+}
+
+/// The output size: the frame's display size (sample aspect ratio applied)
+/// fitted into the bounds, never enlarged.
+fn frame_output_size(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u32, u32)> {
+    let (coded_width, coded_height) = (frame.width(), frame.height());
+    if coded_width == 0 || coded_height == 0 {
+        return Err(ExportError::Ffmpeg(
+            "decoded frame reported zero dimensions".to_string(),
+        ));
+    }
+    let aspect = unsafe { (*frame.as_ptr()).sample_aspect_ratio };
+    let display_width = if aspect.num > 0 && aspect.den > 0 && aspect.num != aspect.den {
+        (coded_width as f64 * aspect.num as f64 / aspect.den as f64).round()
+    } else {
+        coded_width as f64
+    };
+    Ok(fit_within(
+        display_width,
+        coded_height as f64,
+        max_width,
+        max_height,
+    ))
+}
+
+fn fit_within(width: f64, height: f64, max_width: u32, max_height: u32) -> (u32, u32) {
+    let mut scale = 1.0_f64;
+    if max_width > 0 {
+        scale = scale.min(max_width as f64 / width);
+    }
+    if max_height > 0 {
+        scale = scale.min(max_height as f64 / height);
+    }
+    (
+        ((width * scale).round() as u32).max(1),
+        ((height * scale).round() as u32).max(1),
+    )
+}
+
+/// Converts with swscale's frame API, which reads the source's colour space
+/// and range from the frame. An unlabelled YUV source is taken as BT.709
+/// when it is HD or larger and BT.601 otherwise, as players do.
+fn scale_frame_to_rgba(frame: &Frame, width: u32, height: u32) -> Result<Vec<u8>> {
+    let source = OwnedAvFrame::alloc()?;
+    let output = OwnedAvFrame::alloc()?;
+    let scaler = OwnedSwsContext::alloc()?;
+    unsafe {
+        check(
+            sys::av_frame_ref(source.0, frame.as_ptr()),
+            "av_frame_ref(frame export)",
+        )?;
+        let descriptor = sys::av_pix_fmt_desc_get((*source.0).format);
+        let rgb_source =
+            !descriptor.is_null() && (*descriptor).flags & sys::AV_PIX_FMT_FLAG_RGB as u64 != 0;
+        if !rgb_source {
+            if (*source.0).colorspace == sys::AVColorSpace_AVCOL_SPC_UNSPECIFIED {
+                (*source.0).colorspace = if (*source.0).width >= 1280 || (*source.0).height > 576 {
+                    sys::AVColorSpace_AVCOL_SPC_BT709
+                } else {
+                    sys::AVColorSpace_AVCOL_SPC_SMPTE170M
+                };
+            }
+            if (*source.0).color_range == sys::AVColorRange_AVCOL_RANGE_UNSPECIFIED {
+                (*source.0).color_range = sys::AVColorRange_AVCOL_RANGE_MPEG;
+            }
+        }
+        (*output.0).format = sys::AVPixelFormat_AV_PIX_FMT_RGBA;
+        (*output.0).width = width as i32;
+        (*output.0).height = height as i32;
+        (*output.0).color_range = sys::AVColorRange_AVCOL_RANGE_JPEG;
+        check(
+            sys::av_frame_get_buffer(output.0, 0),
+            "av_frame_get_buffer(frame export)",
+        )?;
+        (*scaler.0).flags = (sys::SwsFlags_SWS_BICUBIC
+            | sys::SwsFlags_SWS_ACCURATE_RND
+            | sys::SwsFlags_SWS_FULL_CHR_H_INT) as _;
+        // 0: one thread per core.
+        (*scaler.0).threads = 0;
+        check(
+            sys::sws_scale_frame(scaler.0, output.0, source.0),
+            "sws_scale_frame(frame export)",
+        )?;
+        let row_bytes = width as usize * 4;
+        let stride = (*output.0).linesize[0];
+        if stride < row_bytes as i32 {
+            return Err(ExportError::Ffmpeg(format!(
+                "RGBA output stride {stride} is shorter than a row of {row_bytes} bytes"
+            )));
+        }
+        let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+        let base = (*output.0).data[0];
+        for row in 0..height as usize {
+            rgba.extend_from_slice(std::slice::from_raw_parts(
+                base.add(row * stride as usize),
+                row_bytes,
+            ));
+        }
+        Ok(rgba)
+    }
+}
+
+fn encode_png_rgb(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let rgb: Vec<u8> = rgba
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect();
+    let mut encoded = Vec::new();
+    let mut encoder = png::Encoder::new(&mut encoded, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| ExportError::Png(error.to_string()))?;
+    writer
+        .write_image_data(&rgb)
+        .map_err(|error| ExportError::Png(error.to_string()))?;
+    writer
+        .finish()
+        .map_err(|error| ExportError::Png(error.to_string()))?;
+    Ok(encoded)
+}
+
+struct OwnedAvFrame(*mut sys::AVFrame);
+
+impl OwnedAvFrame {
+    fn alloc() -> Result<Self> {
+        let frame = unsafe { sys::av_frame_alloc() };
+        if frame.is_null() {
+            return Err(ExportError::Ffmpeg(
+                "av_frame_alloc returned null".to_string(),
+            ));
+        }
+        Ok(Self(frame))
+    }
+}
+
+impl Drop for OwnedAvFrame {
+    fn drop(&mut self) {
+        unsafe { sys::av_frame_free(&mut self.0) };
+    }
+}
+
+struct OwnedSwsContext(*mut sys::SwsContext);
+
+impl OwnedSwsContext {
+    fn alloc() -> Result<Self> {
+        let context = unsafe { sys::sws_alloc_context() };
+        if context.is_null() {
+            return Err(ExportError::Ffmpeg(
+                "sws_alloc_context returned null".to_string(),
+            ));
+        }
+        Ok(Self(context))
+    }
+}
+
+impl Drop for OwnedSwsContext {
+    fn drop(&mut self) {
+        unsafe { sys::sws_free_context(&mut self.0) };
+    }
 }
 
 fn validate_options(options: &GifExportOptions) -> Result<()> {
@@ -780,6 +1143,83 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("test directory should be created");
         directory
+    }
+
+    fn playback_fixture() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/playback/playback-fixture.mkv")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn frame_bounds_keep_the_aspect_ratio_and_never_enlarge() {
+        assert_eq!(fit_within(4096.0, 1744.0, 640, 640), (640, 273));
+        assert_eq!(fit_within(4096.0, 1744.0, 0, 360), (846, 360));
+        assert_eq!(fit_within(4096.0, 1744.0, 0, 0), (4096, 1744));
+        assert_eq!(fit_within(160.0, 90.0, 3840, 0), (160, 90));
+        assert_eq!(fit_within(90.0, 160.0, 64, 64), (36, 64));
+    }
+
+    #[test]
+    fn exports_the_frame_shown_at_a_position_as_png() {
+        let mut options = FrameExportOptions::new(playback_fixture(), Duration::from_millis(2_500));
+        options.max_width = 80;
+        let frame = export_frame(&options).unwrap();
+        assert_eq!((frame.width, frame.height), (80, 45));
+        assert_eq!((frame.source_width, frame.source_height), (160, 90));
+        assert_eq!(frame.format, FrameExportFormat::Png);
+        assert_eq!(frame.duration, Some(Duration::from_secs(8)));
+        // The last frame at or before 2.5 s (30 fps).
+        assert!(
+            frame.timestamp <= Duration::from_millis(2_500),
+            "{:?}",
+            frame.timestamp
+        );
+        assert!(
+            frame.timestamp > Duration::from_millis(2_450),
+            "{:?}",
+            frame.timestamp
+        );
+        let decoder = png::Decoder::new(std::io::Cursor::new(&frame.data));
+        let reader = decoder.read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (80, 45));
+        assert_eq!(reader.info().color_type, png::ColorType::Rgb);
+    }
+
+    #[test]
+    fn exports_rgba_at_the_video_size_and_differs_between_times() {
+        let start = export_frame(&FrameExportOptions {
+            format: FrameExportFormat::Rgba,
+            ..FrameExportOptions::new(playback_fixture(), Duration::ZERO)
+        })
+        .unwrap();
+        assert_eq!((start.width, start.height), (160, 90));
+        assert_eq!(start.data.len(), 160 * 90 * 4);
+        assert!(start.data.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        let later = export_frame(&FrameExportOptions {
+            format: FrameExportFormat::Rgba,
+            ..FrameExportOptions::new(playback_fixture(), Duration::from_secs(6))
+        })
+        .unwrap();
+        assert!(later.timestamp > start.timestamp);
+        assert_ne!(start.data, later.data);
+    }
+
+    #[test]
+    fn frame_export_refuses_positions_past_the_end_and_oversized_bounds() {
+        let error = export_frame(&FrameExportOptions::new(
+            playback_fixture(),
+            Duration::from_secs(8),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, ExportError::PastEnd { .. }), "{error}");
+        let mut options = FrameExportOptions::new(playback_fixture(), Duration::ZERO);
+        options.max_width = FRAME_EXPORT_MAX_DIMENSION + 1;
+        assert!(matches!(
+            export_frame(&options).unwrap_err(),
+            ExportError::InvalidFrameOptions(_)
+        ));
     }
 
     #[test]

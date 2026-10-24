@@ -101,6 +101,47 @@ typedef struct ErikaGifExportResult {
   uint64_t file_size;
 } ErikaGifExportResult;
 
+/* Headless single-frame export: the picture shown at position_millis (a
+ * media time) as RGBA or PNG. max_width/max_height bound the output (0 =
+ * unbounded); the display aspect ratio is kept and the picture is never
+ * larger than the video. Synchronous; UI integrations must call it from a
+ * worker thread. Owns an independent demux/decode pipeline (multi-threaded
+ * software decoding) and requires no player or presenter handle. */
+typedef enum ErikaFrameExportFormat {
+  ErikaFrameExportFormat_Rgba = 0, /* rows of width * 4 bytes, alpha 255 */
+  ErikaFrameExportFormat_Png = 1,  /* PNG file bytes, 8-bit RGB */
+} ErikaFrameExportFormat;
+
+typedef struct ErikaFrameExportOptions {
+  const char *input_uri;
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t position_millis;
+  uint64_t http_read_ahead_bytes;
+  uint32_t max_width;
+  uint32_t max_height;
+  int32_t format;
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportOptions;
+
+/* data stays owned by liberika until erika_frame_export_result_free. Times
+ * are microseconds: timestamp_micros is where the picture is, duration_micros
+ * the media duration (0 when the container reports none). */
+typedef struct ErikaFrameExportResult {
+  uint8_t *data;
+  uintptr_t data_len;
+  uint64_t timestamp_micros;
+  uint64_t duration_micros;
+  uint32_t width;
+  uint32_t height;
+  uint32_t source_width;
+  uint32_t source_height;
+  int32_t format;
+  uint32_t reserved_flags;
+  uint64_t reserved[2];
+} ErikaFrameExportResult;
+
 typedef enum ErikaStatus {
   ErikaStatus_Ok = 0,
   ErikaStatus_NullPointer = 1,
@@ -476,6 +517,10 @@ void erika_string_free(char *value);
 ErikaStatus erika_export_gif(
     const ErikaGifExportOptions *options,
     ErikaGifExportResult *out_result);
+ErikaStatus erika_export_frame(
+    const ErikaFrameExportOptions *options,
+    ErikaFrameExportResult *out_result);
+void erika_frame_export_result_free(ErikaFrameExportResult *result);
 
 /* Playback control. uri is a local path or HTTP(S) URL; times are microseconds.
  * open() synchronously probes streams and transitions to Ready. */
