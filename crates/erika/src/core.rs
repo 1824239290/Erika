@@ -1164,6 +1164,7 @@ pub struct Player {
     decoder_resources: PlaybackDecoderResources,
     inner: Arc<Mutex<PlayerInner>>,
     lifecycle: Arc<Mutex<PlayerLifecycle>>,
+    timing_counters: Arc<crate::diagnostics::PlaybackTimingCounters>,
 }
 
 impl Player {
@@ -1196,7 +1197,14 @@ impl Player {
                 epoch: 1,
                 playback: None,
             })),
+            timing_counters: Arc::new(crate::diagnostics::PlaybackTimingCounters::new()),
         }
+    }
+
+    /// Scheduler, clock-discipline, buffering and queue counters of the
+    /// current media. Lock-free to read from any thread.
+    pub fn timing_counters(&self) -> &crate::diagnostics::PlaybackTimingCounters {
+        &self.timing_counters
     }
 
     #[cfg(target_env = "ohos")]
@@ -1396,6 +1404,7 @@ impl Player {
             inner.track_selection = info.track_selection();
             generation
         };
+        engine.attach_timing_counters(Arc::clone(&self.timing_counters));
         lifecycle.playback = Some(PlaybackRuntime::spawn(
             engine,
             Arc::clone(&self.inner),
@@ -2232,10 +2241,12 @@ fn run_playback_worker(
         let after_av = std::time::Instant::now();
 
         if let Some(buffering) = buffering_event {
+            engine.timing_counters().record_buffering(buffering);
             emit_from_worker(&inner, PlayerEvent::BufferingChanged(buffering));
         }
 
         emit_video_decoder_events_from_worker(engine, &inner);
+        engine.publish_queue_depths();
 
         if last_position_event.is_some_and(|(generation, _)| generation != playback_generation) {
             last_position_event = None;

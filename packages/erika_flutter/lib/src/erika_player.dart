@@ -1313,6 +1313,165 @@ class ErikaPlayer {
     return ErikaPresenterStats.fromMap(stats);
   }
 
+  /// Log levels accepted by [getLogs], from least to most severe.
+  static const List<String> logLevels = <String>[
+    'trace',
+    'debug',
+    'info',
+    'warn',
+    'error',
+  ];
+
+  /// One-call diagnostics snapshot of this player (schema 1).
+  ///
+  /// Sections: `playback`, `media`, `decoder` (requested/active backend,
+  /// hardware, fallbacks), `video`, `presenter`, `output`, `hdr`,
+  /// `resources`, `upscaler`, `audio`, `buffers` and `timing` (scheduler late
+  /// drops, presentation cadence and jitter, clock drift and corrections).
+  /// Values that are not known are `null`. See `docs/capi_reference.md`,
+  /// "Diagnostics", for every field.
+  ///
+  /// Throws [UnsupportedError] when this platform plugin or the bundled
+  /// native library does not provide diagnostics.
+  Future<Map<String, Object?>> getDiagnosticsSnapshot() async {
+    final playerId = await ensureCreated();
+    return _decodeJsonDocument(
+      await _invokeOptional('getDiagnosticsSnapshot', <String, Object?>{
+        'playerId': playerId,
+      }),
+      'getDiagnosticsSnapshot',
+    );
+  }
+
+  /// Recent entries of liberika's process-wide log ring (schema 1): its own
+  /// operational diagnostics plus FFmpeg warnings and errors, oldest first.
+  /// Text is redacted (URL query strings and user info, credentials, the
+  /// user's home directory).
+  ///
+  /// [limit] keeps the newest entries after filtering (`0` returns every
+  /// retained entry). [minLevel] is one of [logLevels]. Pass the previous
+  /// result's `nextSeq` as [sinceSeq] to read incrementally. The ring is
+  /// shared by every player; any live player returns the same log.
+  ///
+  /// Throws [UnsupportedError] when unavailable, like
+  /// [getDiagnosticsSnapshot].
+  Future<Map<String, Object?>> getLogs({
+    int limit = 200,
+    String? minLevel,
+    int? sinceSeq,
+  }) async {
+    if (limit < 0) {
+      throw ArgumentError.value(limit, 'limit', 'must be zero or positive');
+    }
+    if (minLevel != null && !logLevels.contains(minLevel)) {
+      throw ArgumentError.value(
+        minLevel,
+        'minLevel',
+        'must be one of ${logLevels.join(', ')}',
+      );
+    }
+    if (sinceSeq != null && sinceSeq < 0) {
+      throw ArgumentError.value(sinceSeq, 'sinceSeq', 'must be zero or positive');
+    }
+    final playerId = await ensureCreated();
+    return _decodeJsonDocument(
+      await _invokeOptional('getLogs', <String, Object?>{
+        'playerId': playerId,
+        'limit': limit,
+        if (minLevel != null) 'minLevel': minLevel,
+        if (sinceSeq != null) 'sinceSeq': sinceSeq,
+      }),
+      'getLogs',
+    );
+  }
+
+  /// Calls any method of liberika's JSON method table directly.
+  ///
+  /// Returns liberika's response envelope unchanged:
+  /// `{ok: true, status: 0, value: …}` or
+  /// `{ok: false, status: …, error: '…', code?: 'unknown_method' | …}`.
+  /// Native failures are reported in the envelope, not thrown. Call
+  /// `invokeJson('listMethods')` for the table: every method with its
+  /// arguments and result. New engine capabilities become reachable here
+  /// without plugin or Dart changes.
+  ///
+  /// Throws [UnsupportedError] when this platform plugin or the bundled
+  /// native library has no pass-through.
+  Future<Map<String, Object?>> invokeJson(
+    String method, [
+    Map<String, Object?> arguments = const <String, Object?>{},
+  ]) async {
+    if (method.isEmpty) {
+      throw ArgumentError.value(method, 'method', 'must not be empty');
+    }
+    final playerId = await ensureCreated();
+    final Object? raw;
+    try {
+      raw = await _invokeOptional('invokeJson', <String, Object?>{
+        'playerId': playerId,
+        'method': method,
+        'arguments': arguments,
+      });
+    } on PlatformException catch (error) {
+      // Platforms that unwrap envelopes natively report failures of the
+      // pass-through itself (bad arguments) as exceptions; keep the
+      // envelope contract.
+      return <String, Object?>{
+        'ok': false,
+        'status': 3,
+        'error': error.message ?? error.code,
+      };
+    }
+    return _decodeJsonDocument(raw, 'invokeJson');
+  }
+
+  Future<Object?> _invokeOptional(
+    String method,
+    Map<String, Object?> arguments,
+  ) async {
+    try {
+      return await _channel.invokeMethod<Object?>(method, arguments);
+    } on MissingPluginException {
+      throw UnsupportedError(
+        'Erika $method is not supported by the $defaultTargetPlatform plugin.',
+      );
+    } on PlatformException catch (error) {
+      final message = error.message ?? '';
+      if (error.code == 'ERIKA_UNSUPPORTED' ||
+          message.contains('unsupported Erika presenter method: $method') ||
+          message.contains('unsupported Erika Android method: $method')) {
+        throw UnsupportedError(
+          message.isEmpty
+              ? 'Erika $method is not supported by the bundled native library.'
+              : message,
+        );
+      }
+      rethrow;
+    }
+  }
+
+  static Map<String, Object?> _decodeJsonDocument(Object? raw, String method) {
+    final Object? decoded = raw is String ? jsonDecode(raw) : raw;
+    final Object? normalized = _normalizeJson(decoded);
+    if (normalized is! Map<String, Object?>) {
+      throw StateError('Erika $method returned no JSON object.');
+    }
+    return normalized;
+  }
+
+  static Object? _normalizeJson(Object? value) {
+    if (value is Map) {
+      return <String, Object?>{
+        for (final entry in value.entries)
+          entry.key.toString(): _normalizeJson(entry.value),
+      };
+    }
+    if (value is List) {
+      return <Object?>[for (final item in value) _normalizeJson(item)];
+    }
+    return value;
+  }
+
   Future<void> setDebugHudEnabled(bool enabled) async {
     final playerId = await ensureCreated();
     await _channel.invokeMethod<void>('setDebugHudEnabled', <String, Object?>{

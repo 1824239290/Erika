@@ -34,20 +34,463 @@ pub unsafe extern "C" fn erika_presenter_copy_flutter_frame_rgba(
     })
 }
 
+/// Generic JSON pass-through into liberika. `method` is looked up in
+/// [`JSON_METHODS`]; `listMethods` returns that table so hosts and agents can
+/// discover capabilities without code changes. Methods with `"scope":
+/// "global"` (`listMethods`, `getLogs`) accept a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn erika_presenter_invoke_json(
     handle: *mut ErikaPresenterHandle,
     method: *const c_char,
     arguments_json: *const c_char,
 ) -> *mut c_char {
-    let result = catch_unwind(AssertUnwindSafe(|| {
+    let parsed = catch_unwind(AssertUnwindSafe(|| {
         let method = read_c_string(method, "method")?;
         let arguments_json = read_c_string(arguments_json, "arguments_json")?;
         let arguments: Value = serde_json::from_str(&arguments_json)
             .map_err(|error| format!("invalid presenter JSON arguments: {error}"))?;
-        unsafe { invoke(handle, &method, &arguments) }
+        Ok::<_, String>((method, arguments))
     }));
-    response_string(result)
+    let response = match parsed {
+        Ok(Ok((method, arguments))) => unsafe { dispatch_envelope(handle, &method, &arguments) },
+        Ok(Err(error)) => coded_error_response("invalid_arguments", error),
+        Err(_) => error_response("panic in Erika presenter JSON bridge"),
+    };
+    owned_json(response)
+}
+
+/// Runs one table method and wraps the outcome in the response envelope:
+/// `{"ok":true,"status":0,"value":…}` or
+/// `{"ok":false,"status":…,"error":"…"[,"code":"unknown_method","method":…]}`.
+pub(crate) unsafe fn dispatch_envelope(
+    handle: *mut ErikaPresenterHandle,
+    method: &str,
+    arguments: &Value,
+) -> Value {
+    if json_method_spec(method).is_none() {
+        let mut response = coded_error_response(
+            "unknown_method",
+            format!("unsupported Erika presenter method: {method}"),
+        );
+        if let Value::Object(map) = &mut response {
+            map.insert("method".to_string(), Value::String(method.to_string()));
+        }
+        return response;
+    }
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        invoke(handle, method, arguments)
+    })) {
+        Ok(Ok(value)) => success_response(value),
+        Ok(Err(error)) => error_response(error),
+        Err(_) => error_response("panic in Erika presenter JSON bridge"),
+    }
+}
+
+/// One argument of a JSON pass-through method.
+pub(crate) struct JsonArgSpec {
+    pub name: &'static str,
+    /// `string`, `integer`, `number`, `boolean`, `object` or `array`.
+    pub kind: &'static str,
+    pub required: bool,
+}
+
+/// One entry of the pass-through dispatch table. Adding a capability means
+/// adding an arm to `invoke` and an entry here; `listMethods` publishes it and
+/// a unit test keeps the two in sync.
+pub(crate) struct JsonMethodSpec {
+    pub name: &'static str,
+    /// `presenter` needs a presenter handle; `global` accepts NULL.
+    pub scope: &'static str,
+    pub summary: &'static str,
+    pub arguments: &'static [JsonArgSpec],
+    pub returns: &'static str,
+}
+
+const fn arg(name: &'static str, kind: &'static str, required: bool) -> JsonArgSpec {
+    JsonArgSpec {
+        name,
+        kind,
+        required,
+    }
+}
+
+const fn method(
+    name: &'static str,
+    scope: &'static str,
+    summary: &'static str,
+    arguments: &'static [JsonArgSpec],
+    returns: &'static str,
+) -> JsonMethodSpec {
+    JsonMethodSpec {
+        name,
+        scope,
+        summary,
+        arguments,
+        returns,
+    }
+}
+
+const P: &str = "presenter";
+const G: &str = "global";
+const NONE: &[JsonArgSpec] = &[];
+
+pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
+    method(
+        "listMethods",
+        G,
+        "This table: every method with its arguments and result.",
+        NONE,
+        "{schema, methods:[{name, scope, summary, arguments:[{name,type,required}], returns}]}",
+    ),
+    method(
+        "invokeJson",
+        P,
+        "Calls another table method and returns its full response envelope.",
+        &[
+            arg("method", "string", true),
+            arg("arguments", "object", false),
+        ],
+        "{ok, status, value?|error?, code?}",
+    ),
+    method(
+        "open",
+        P,
+        "Opens a local path or HTTP(S) URL.",
+        &[
+            arg("uri", "string", true),
+            arg("httpHeaders", "object", false),
+            arg("httpReadAheadBytes", "integer", false),
+            arg("httpBackBufferBytes", "integer", false),
+        ],
+        "null",
+    ),
+    method("play", P, "Starts or resumes playback.", NONE, "null"),
+    method("pause", P, "Pauses playback.", NONE, "null"),
+    method("stop", P, "Stops playback and rewinds.", NONE, "null"),
+    method("close", P, "Closes the media.", NONE, "null"),
+    method(
+        "seek",
+        P,
+        "Seeks to a position.",
+        &[arg("positionMicros", "integer", true)],
+        "null",
+    ),
+    method(
+        "setPlaybackRate",
+        P,
+        "Sets the playback rate.",
+        &[arg("rate", "number", true)],
+        "null",
+    ),
+    method(
+        "setVolume",
+        P,
+        "Sets the output volume (0..1).",
+        &[arg("volume", "number", true)],
+        "null",
+    ),
+    method(
+        "setUpscaler",
+        P,
+        "Selects the luma upscaler: 0 off, 1 ArtCNN C4F16, 2 C4F32, 3 C4F16 DS.",
+        &[arg("mode", "integer", true)],
+        "null",
+    ),
+    method(
+        "getUpscalerStatus",
+        P,
+        "Requested upscaler and active backend.",
+        NONE,
+        "{requestedMode, activeBackend, fallbackCount, upscaledFrames, lastEncodeMicros, lastGpuMicros}",
+    ),
+    method(
+        "setDebugHudEnabled",
+        P,
+        "Shows or hides the on-video debug HUD.",
+        &[arg("enabled", "boolean", true)],
+        "null",
+    ),
+    method(
+        "setOutputHeadroom",
+        P,
+        "Reports the display EDR/HDR headroom.",
+        &[
+            arg("headroom", "number", true),
+            arg("known", "boolean", true),
+        ],
+        "null",
+    ),
+    method(
+        "getOutputStatus",
+        P,
+        "Requested and active output encoding, headroom and fallback reason.",
+        NONE,
+        "{requestedMode, activeEncoding, surfaceFormat, …, fallbackReason, fallbackCount}",
+    ),
+    method(
+        "getPresenterStats",
+        P,
+        "Cumulative presenter counters.",
+        NONE,
+        "{decodedVideoFrames, renderedVideoFrames, …}",
+    ),
+    method(
+        "getResourceStatus",
+        P,
+        "Renderer and presenter memory.",
+        NONE,
+        "{deviceCurrentAllocatedBytes, …, outputModeSwitches}",
+    ),
+    method(
+        "getDiagnosticsSnapshot",
+        P,
+        "One-call diagnostics document (decoder, output/HDR, audio, buffers, timing).",
+        NONE,
+        "diagnostics schema 1 object",
+    ),
+    method(
+        "getLogs",
+        G,
+        "Recent entries of the process-wide, redacted log ring.",
+        &[
+            arg("limit", "integer", false),
+            arg("minLevel", "string", false),
+            arg("sinceSeq", "integer", false),
+        ],
+        "log export schema 1 object",
+    ),
+    method(
+        "tracks",
+        P,
+        "Every track with codec and format details.",
+        NONE,
+        "[track]",
+    ),
+    method(
+        "trackSelection",
+        P,
+        "Selected track ids.",
+        NONE,
+        "{video, audio, subtitle} (null when none)",
+    ),
+    method(
+        "selectAudioTrack",
+        P,
+        "Selects an audio track (omit or -1 for none).",
+        &[arg("trackId", "integer", false)],
+        "null",
+    ),
+    method(
+        "selectSubtitleTrack",
+        P,
+        "Selects a subtitle track (omit or -1 for none).",
+        &[arg("trackId", "integer", false)],
+        "null",
+    ),
+    method(
+        "addExternalSubtitle",
+        P,
+        "Adds an external subtitle file or URL.",
+        &[arg("uri", "string", true)],
+        "trackId (integer)",
+    ),
+    method(
+        "removeSubtitleTrack",
+        P,
+        "Removes an external subtitle track.",
+        &[arg("trackId", "integer", true)],
+        "null",
+    ),
+    method(
+        "setSubtitleScale",
+        P,
+        "Scales subtitle rendering.",
+        &[arg("scale", "number", true)],
+        "null",
+    ),
+    method(
+        "setSubtitleFont",
+        P,
+        "Selects the subtitle font family and/or file.",
+        &[
+            arg("fontFamily", "string", false),
+            arg("fontFilePath", "string", false),
+        ],
+        "null",
+    ),
+    method(
+        "setSubtitleStyle",
+        P,
+        "Applies a subtitle style; fields follow ErikaSubtitleStyle.",
+        &[
+            arg("fontFamily", "string", false),
+            arg("fontFilePath", "string", false),
+            arg("primaryColorRgba", "integer", false),
+            arg("outlineColorRgba", "integer", false),
+            arg("fontSize", "number", false),
+            arg("outlineWidth", "number", false),
+            arg("bold", "boolean", false),
+            arg("italic", "boolean", false),
+            arg("underline", "boolean", false),
+            arg("strikeOut", "boolean", false),
+            arg("spacing", "number", false),
+            arg("scaleXPercent", "number", false),
+            arg("scaleYPercent", "number", false),
+            arg("borderStyle", "integer", false),
+            arg("shadowDepth", "number", false),
+            arg("blur", "number", false),
+            arg("alignment", "integer", false),
+            arg("marginLeft", "integer", false),
+            arg("marginRight", "integer", false),
+            arg("marginVertical", "integer", false),
+            arg("overrideMask", "integer", false),
+        ],
+        "null",
+    ),
+    method(
+        "selectSubtitleMemoryFonts",
+        P,
+        "Selects registered in-memory subtitle fonts.",
+        &[arg("fontIds", "array", true)],
+        "null",
+    ),
+    method(
+        "clearSubtitleMemoryFonts",
+        P,
+        "Clears in-memory subtitle font selection.",
+        NONE,
+        "null",
+    ),
+    method(
+        "getSubtitleMemoryFontStatus",
+        P,
+        "In-memory subtitle font registry.",
+        NONE,
+        "{registeredCount, registeredBytes, selectedCount, generation, selectedIds}",
+    ),
+    method(
+        "loadDanmakuFile",
+        P,
+        "Replaces danmaku with one Bilibili XML file or URL.",
+        &[arg("uri", "string", true)],
+        "null",
+    ),
+    method(
+        "loadDanmakuJson",
+        P,
+        "Replaces danmaku with inline JSON.",
+        &[arg("json", "string", true)],
+        "null",
+    ),
+    method(
+        "addDanmakuTrackFile",
+        P,
+        "Adds a named danmaku track from a file or URL.",
+        &[
+            arg("uri", "string", true),
+            arg("name", "string", false),
+            arg("offsetMicros", "integer", false),
+        ],
+        "trackId (integer)",
+    ),
+    method(
+        "addDanmakuTrackJson",
+        P,
+        "Adds a named danmaku track from inline JSON.",
+        &[
+            arg("json", "string", true),
+            arg("name", "string", false),
+            arg("offsetMicros", "integer", false),
+        ],
+        "trackId (integer)",
+    ),
+    method(
+        "removeDanmakuTrack",
+        P,
+        "Removes a danmaku track.",
+        &[arg("trackId", "integer", true)],
+        "null",
+    ),
+    method(
+        "setDanmakuTrackEnabled",
+        P,
+        "Enables or disables one danmaku track.",
+        &[
+            arg("trackId", "integer", true),
+            arg("enabled", "boolean", false),
+        ],
+        "null",
+    ),
+    method(
+        "setDanmakuTrackOffset",
+        P,
+        "Shifts one danmaku track's timeline.",
+        &[
+            arg("trackId", "integer", true),
+            arg("offsetMicros", "integer", false),
+        ],
+        "null",
+    ),
+    method(
+        "setDanmakuGlobalOffset",
+        P,
+        "Shifts every danmaku track.",
+        &[arg("offsetMicros", "integer", false)],
+        "null",
+    ),
+    method(
+        "danmakuTracks",
+        P,
+        "Danmaku tracks with item counts.",
+        NONE,
+        "[{id, enabled, offsetMicros, itemCount, name, source}]",
+    ),
+    method("clearDanmaku", P, "Removes all danmaku.", NONE, "null"),
+    method(
+        "setDanmakuEnabled",
+        P,
+        "Shows or hides danmaku.",
+        &[arg("enabled", "boolean", false)],
+        "null",
+    ),
+    method(
+        "getDanmakuConfig",
+        P,
+        "Current danmaku layout configuration.",
+        NONE,
+        "{enabled, fontSize, opacity, displayArea, …, shadowStyle}",
+    ),
+    method(
+        "setDanmakuConfig",
+        P,
+        "Updates danmaku layout fields that are present (same keys as getDanmakuConfig, plus customFontFamily, customFontFilePath, blockWordsJson).",
+        NONE,
+        "null",
+    ),
+];
+
+pub(crate) fn json_method_spec(name: &str) -> Option<&'static JsonMethodSpec> {
+    JSON_METHODS.iter().find(|spec| spec.name == name)
+}
+
+fn list_methods_json() -> Value {
+    let methods: Vec<Value> = JSON_METHODS
+        .iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "scope": spec.scope,
+                "summary": spec.summary,
+                "arguments": spec.arguments.iter().map(|argument| json!({
+                    "name": argument.name,
+                    "type": argument.kind,
+                    "required": argument.required,
+                })).collect::<Vec<_>>(),
+                "returns": spec.returns,
+            })
+        })
+        .collect();
+    json!({ "schema": 1, "methods": methods })
 }
 
 #[unsafe(no_mangle)]
@@ -106,7 +549,7 @@ pub unsafe extern "C" fn erika_presenter_poll_event_json(
     }
 }
 
-unsafe fn invoke(
+pub(crate) unsafe fn invoke(
     handle: *mut ErikaPresenterHandle,
     method: &str,
     arguments: &Value,
@@ -271,8 +714,172 @@ unsafe fn invoke(
             )
         }),
         "setDanmakuConfig" => unsafe { set_danmaku_config(handle, args) },
+        "getDiagnosticsSnapshot" => unsafe { diagnostics_snapshot_json(handle) },
+        // The log ring is process-wide; the handle only routes the call.
+        "getLogs" => logs_json(args),
+        "listMethods" => Ok(list_methods_json()),
+        "invokeJson" => {
+            let inner = required_string(args, "method")?;
+            let arguments = match args.get("arguments") {
+                None | Some(Value::Null) => Value::Object(Map::new()),
+                Some(value) => value.clone(),
+            };
+            Ok(unsafe { dispatch_envelope(handle, inner, &arguments) })
+        }
+        "setDebugHudEnabled" => {
+            let enabled =
+                optional_bool(args, "enabled").ok_or_else(|| "enabled is required".to_string())?;
+            status_value(unsafe { erika_presenter_set_debug_hud_enabled(handle, enabled) })
+        }
+        "setOutputHeadroom" => {
+            let headroom = required_f64(args, "headroom")? as f32;
+            let known =
+                optional_bool(args, "known").ok_or_else(|| "known is required".to_string())?;
+            status_value(unsafe { erika_presenter_set_output_headroom(handle, headroom, known) })
+        }
+        "trackSelection" => {
+            let mut selection = ErikaTrackSelection::default();
+            call_status(unsafe { erika_presenter_track_selection(handle, &mut selection) })?;
+            let id = |value: i64| if value < 0 { Value::Null } else { json!(value) };
+            Ok(json!({
+                "video": id(selection.video),
+                "audio": id(selection.audio),
+                "subtitle": id(selection.subtitle),
+            }))
+        }
+        "getDanmakuConfig" => {
+            let mut config = ErikaDanmakuConfig::default();
+            call_status(unsafe { erika_presenter_get_danmaku_config(handle, &mut config) })?;
+            Ok(danmaku_config_json(config))
+        }
+        "setSubtitleFont" => {
+            let family = optional_c_string(args, "fontFamily")?;
+            let file_path = optional_c_string(args, "fontFilePath")?;
+            status_value(unsafe {
+                erika_presenter_set_subtitle_font(
+                    handle,
+                    optional_c_string_ptr(&family),
+                    optional_c_string_ptr(&file_path),
+                )
+            })
+        }
+        "setSubtitleStyle" => unsafe { set_subtitle_style(handle, args) },
         method => Err(format!("unsupported Erika presenter method: {method}")),
     }
+}
+
+fn danmaku_config_json(config: ErikaDanmakuConfig) -> Value {
+    json!({
+        "enabled": config.enabled,
+        "fontSize": config.font_size,
+        "opacity": config.opacity,
+        "displayArea": config.display_area,
+        "scrollDurationSeconds": config.scroll_duration_seconds,
+        "scrollSpeedFactor": config.scroll_speed_factor,
+        "trackGapRatio": config.track_gap_ratio,
+        "outlineWidth": config.outline_width,
+        "shadowOffsetX": config.shadow_offset_x,
+        "shadowOffsetY": config.shadow_offset_y,
+        "mergeDuplicates": config.merge_duplicates,
+        "allowStacking": config.allow_stacking,
+        "allowScrollOverwrite": config.allow_scroll_overwrite,
+        "maxQuantity": config.max_quantity,
+        "maxLinesPerMode": config.max_lines_per_mode,
+        "blockTop": config.block_top,
+        "blockBottom": config.block_bottom,
+        "blockScroll": config.block_scroll,
+        "shadowStyle": config.shadow_style,
+    })
+}
+
+unsafe fn set_subtitle_style(
+    handle: *mut ErikaPresenterHandle,
+    args: &Map<String, Value>,
+) -> Result<Value, String> {
+    let family = optional_c_string(args, "fontFamily")?;
+    let file_path = optional_c_string(args, "fontFilePath")?;
+    let mut style = ErikaSubtitleStyle {
+        font_family: optional_c_string_ptr(&family),
+        font_file_path: optional_c_string_ptr(&file_path),
+        ..ErikaSubtitleStyle::default()
+    };
+    let float = |name: &str, target: &mut f64| {
+        if let Some(value) = args.get(name).and_then(Value::as_f64) {
+            *target = value;
+        }
+    };
+    let int = |name: &str, target: &mut i32| {
+        if let Some(value) = args.get(name).and_then(Value::as_i64) {
+            *target = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        }
+    };
+    update_u32(args, "primaryColorRgba", &mut style.primary_color_rgba);
+    update_u32(args, "outlineColorRgba", &mut style.outline_color_rgba);
+    float("fontSize", &mut style.font_size);
+    float("outlineWidth", &mut style.outline_width);
+    update_bool(args, "bold", &mut style.bold);
+    update_bool(args, "italic", &mut style.italic);
+    update_bool(args, "underline", &mut style.underline);
+    update_bool(args, "strikeOut", &mut style.strike_out);
+    float("spacing", &mut style.spacing);
+    float("scaleXPercent", &mut style.scale_x_percent);
+    float("scaleYPercent", &mut style.scale_y_percent);
+    int("borderStyle", &mut style.border_style);
+    float("shadowDepth", &mut style.shadow_depth);
+    float("blur", &mut style.blur);
+    int("alignment", &mut style.alignment);
+    int("marginLeft", &mut style.margin_left);
+    int("marginRight", &mut style.margin_right);
+    int("marginVertical", &mut style.margin_vertical);
+    update_u32(args, "overrideMask", &mut style.override_mask);
+    status_value(unsafe { erika_presenter_set_subtitle_style(handle, style) })
+}
+
+unsafe fn diagnostics_snapshot_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String> {
+    let mut out = ptr::null_mut();
+    call_status(unsafe {
+        crate::diagnostics::erika_presenter_get_diagnostics_json(handle, &mut out)
+    })?;
+    if out.is_null() {
+        return Err("diagnostics snapshot returned no JSON".to_string());
+    }
+    let text = unsafe { CStr::from_ptr(out) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { erika_string_free(out) };
+    serde_json::from_str(&text).map_err(|error| format!("invalid diagnostics JSON: {error}"))
+}
+
+fn logs_json(args: &Map<String, Value>) -> Result<Value, String> {
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => 200,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| "limit must be a non-negative integer".to_string())?,
+    };
+    let min_level = match args.get("minLevel") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(
+            erika::diagnostics::LogLevel::parse(name)
+                .ok_or_else(|| format!("unsupported minLevel: {name}"))?,
+        ),
+        Some(value) => Some(
+            value
+                .as_i64()
+                .and_then(|raw| i32::try_from(raw).ok())
+                .and_then(erika::diagnostics::LogLevel::from_raw)
+                .ok_or_else(|| format!("unsupported minLevel: {value}"))?,
+        ),
+    };
+    let since_seq = match args.get("sinceSeq") {
+        None | Some(Value::Null) => 0,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| "sinceSeq must be a non-negative integer".to_string())?,
+    };
+    Ok(erika::diagnostics::export_logs(
+        &crate::diagnostics::log_query(limit, min_level, since_seq),
+    ))
 }
 
 unsafe fn set_danmaku_config(
@@ -554,6 +1161,15 @@ fn error_response(error: impl Into<String>) -> Value {
     json!({ "ok": false, "status": ErikaStatus::PlayerError as i32, "error": error.into() })
 }
 
+fn coded_error_response(code: &str, error: impl Into<String>) -> Value {
+    json!({
+        "ok": false,
+        "status": ErikaStatus::PlayerError as i32,
+        "code": code,
+        "error": error.into(),
+    })
+}
+
 fn owned_json(value: Value) -> *mut c_char {
     CString::new(value.to_string())
         .expect("serialized JSON contains no NUL")
@@ -808,6 +1424,169 @@ mod tests {
             unsafe { erika_string_free(response) };
             assert_eq!(value.get("ok"), Some(&Value::Bool(true)));
         }
+
+        unsafe { erika_presenter_destroy(handle) };
+    }
+
+    fn invoke(
+        handle: *mut ErikaPresenterHandle,
+        method: &std::ffi::CStr,
+        arguments: &str,
+    ) -> Value {
+        let arguments = std::ffi::CString::new(arguments).unwrap();
+        let response =
+            unsafe { erika_presenter_invoke_json(handle, method.as_ptr(), arguments.as_ptr()) };
+        assert!(!response.is_null());
+        let value = unsafe { CStr::from_ptr(response) }
+            .to_str()
+            .ok()
+            .and_then(|response| serde_json::from_str(response).ok())
+            .expect("JSON bridge returns valid JSON");
+        unsafe { erika_string_free(response) };
+        value
+    }
+
+    #[test]
+    fn json_bridge_exposes_diagnostics_snapshot_and_logs() {
+        let handle = erika_presenter_create();
+        assert!(!handle.is_null());
+
+        let snapshot = invoke(handle, c"getDiagnosticsSnapshot", "{}");
+        assert_eq!(snapshot["ok"], true);
+        assert_eq!(snapshot["value"]["schema"], 1);
+        assert!(snapshot["value"]["timing"]["scheduler"].is_object());
+
+        let logs = invoke(handle, c"getLogs", r#"{"limit":5,"minLevel":"warn"}"#);
+        assert_eq!(logs["ok"], true);
+        let entries = logs["value"]["entries"].as_array().unwrap();
+        assert!(entries.len() <= 5);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["level"] == "warn" || entry["level"] == "error")
+        );
+        let numeric = invoke(handle, c"getLogs", r#"{"minLevel":4,"sinceSeq":0}"#);
+        assert_eq!(numeric["ok"], true);
+        let defaults = invoke(handle, c"getLogs", "{}");
+        assert_eq!(defaults["ok"], true);
+        assert_eq!(defaults["value"]["schema"], 1);
+
+        let invalid = invoke(handle, c"getLogs", r#"{"minLevel":"loud"}"#);
+        assert_eq!(invalid["ok"], false);
+        assert!(invalid["error"].as_str().unwrap().contains("minLevel"));
+        let negative = invoke(handle, c"getLogs", r#"{"limit":-1}"#);
+        assert_eq!(negative["ok"], false);
+
+        unsafe { erika_presenter_destroy(handle) };
+    }
+
+    #[test]
+    fn dispatch_table_and_match_arms_stay_in_sync() {
+        let source = include_str!("presenter_json.rs");
+        let body_start = source
+            .find("pub(crate) unsafe fn invoke(")
+            .expect("invoke fn");
+        let body = &source[body_start..];
+        let body_end = body
+            .find("method => Err(format!(\"unsupported Erika presenter method")
+            .expect("invoke fallback arm");
+        let mut arms: Vec<&str> = body[..body_end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                let rest = line.strip_prefix('"')?;
+                let (name, tail) = rest.split_once('"')?;
+                tail.trim_start().starts_with("=>").then_some(name)
+            })
+            .collect();
+        arms.sort_unstable();
+        let mut listed: Vec<&str> = JSON_METHODS.iter().map(|spec| spec.name).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            arms, listed,
+            "add new invoke arms to JSON_METHODS (and vice versa)"
+        );
+        let mut unique = listed.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), listed.len(), "duplicate JSON_METHODS entry");
+    }
+
+    #[test]
+    fn global_methods_work_without_a_handle_and_unknown_methods_are_coded() {
+        let listed = invoke(std::ptr::null_mut(), c"listMethods", "{}");
+        assert_eq!(listed["ok"], true);
+        let methods = listed["value"]["methods"].as_array().unwrap();
+        assert_eq!(methods.len(), JSON_METHODS.len());
+        let open = methods
+            .iter()
+            .find(|entry| entry["name"] == "open")
+            .unwrap();
+        assert_eq!(open["scope"], "presenter");
+        assert_eq!(open["arguments"][0]["name"], "uri");
+        assert_eq!(open["arguments"][0]["required"], true);
+
+        let logs = invoke(std::ptr::null_mut(), c"getLogs", r#"{"limit":1}"#);
+        assert_eq!(logs["ok"], true);
+
+        let unknown = invoke(std::ptr::null_mut(), c"warpDrive", "{}");
+        assert_eq!(unknown["ok"], false);
+        assert_eq!(unknown["code"], "unknown_method");
+        assert_eq!(unknown["method"], "warpDrive");
+        assert_eq!(
+            unknown["error"],
+            "unsupported Erika presenter method: warpDrive"
+        );
+
+        let invalid = invoke(std::ptr::null_mut(), c"getLogs", "not json");
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["code"], "invalid_arguments");
+
+        // A presenter method with no handle fails normally (not as unknown).
+        let needs_handle = invoke(std::ptr::null_mut(), c"play", "{}");
+        assert_eq!(needs_handle["ok"], false);
+        assert!(needs_handle.get("code").is_none());
+    }
+
+    #[test]
+    fn pass_through_reaches_hud_tracks_danmaku_and_nested_calls() {
+        let handle = erika_presenter_create();
+        assert!(!handle.is_null());
+
+        let hud = invoke(handle, c"setDebugHudEnabled", r#"{"enabled":true}"#);
+        assert_eq!(hud["ok"], true);
+        assert!(unsafe { &*handle }.presenter.debug_hud_enabled());
+        let selection = invoke(handle, c"trackSelection", "{}");
+        assert_eq!(selection["ok"], true);
+        assert!(selection["value"]["video"].is_null());
+        let config = invoke(handle, c"getDanmakuConfig", "{}");
+        assert_eq!(config["ok"], true);
+        assert!(config["value"]["fontSize"].as_f64().unwrap() > 0.0);
+        let style = invoke(
+            handle,
+            c"setSubtitleStyle",
+            r#"{"fontSize":40,"bold":true}"#,
+        );
+        assert_eq!(style["ok"], true, "{style}");
+        let font = invoke(handle, c"setSubtitleFont", r#"{"fontFamily":"Noto Sans"}"#);
+        assert_eq!(font["ok"], true, "{font}");
+        let headroom = invoke(
+            handle,
+            c"setOutputHeadroom",
+            r#"{"headroom":2.0,"known":true}"#,
+        );
+        assert_eq!(headroom["ok"], true, "{headroom}");
+
+        let nested = invoke(
+            handle,
+            c"invokeJson",
+            r#"{"method":"getDiagnosticsSnapshot","arguments":{}}"#,
+        );
+        assert_eq!(nested["ok"], true);
+        assert_eq!(nested["value"]["ok"], true);
+        assert_eq!(nested["value"]["value"]["schema"], 1);
+        let nested_unknown = invoke(handle, c"invokeJson", r#"{"method":"nope"}"#);
+        assert_eq!(nested_unknown["ok"], true);
+        assert_eq!(nested_unknown["value"]["code"], "unknown_method");
 
         unsafe { erika_presenter_destroy(handle) };
     }

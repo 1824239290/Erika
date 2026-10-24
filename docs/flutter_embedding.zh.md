@@ -215,6 +215,24 @@ HUD 以低频快照显示轨道编码/分辨率/码率/帧率、播放位置与�
 如需自行设计 UI，使用 `getPresenterStats()` 获取最近一次原生显示 tick 的统计快照；它不是
 HUD 的驱动机制，数据新鲜度取决于已挂载 surface 的显示循环。
 
+## 面向宿主与智能体的诊断
+
+三个方法把内核自身的视角交给自动排查（卡顿、花屏、解不了、音画不同步）：
+
+- `getDiagnosticsSnapshot()` 一次返回一个 JSON map（schema 1）：解码器与硬解路径及回退、
+  presenter 计数、输出/HDR、资源、超分、音频、缓冲深度，以及时序——调度器迟到丢帧、
+  呈现节奏与抖动、时钟漂移与纠偏。取不到的值为 `null`。
+- `getLogs({limit, minLevel, sinceSeq})` 读取进程级、已脱敏的日志环形缓冲：liberika 的
+  运维诊断加上 FFmpeg 的警告与错误。
+- `invokeJson(method, [arguments])` 调用原生 JSON 方法表中的任意一项并返回其信封
+  （`{ok, status, value | error, code?}`）；`invokeJson('listMethods')` 列出方法表，内核
+  新增能力无需改 Dart。
+
+字段说明见 [capi_reference.zh.md](capi_reference.zh.md) 的“智能体诊断（JSON）”与
+“JSON 桥”。平台插件或随包原生库缺少该方法时抛出 `UnsupportedError`。本版本状态：
+macOS、iOS、tvOS 以可选方式加载新符号；Linux、鸿蒙、Android 走共享 JSON 方法表；
+Windows 抛出 `UnsupportedError`。
+
 ## Neural Upscaler Status
 
 `setUpscaler` 只是在请求一个模式；kernel 会在后台线程编译，所以宿主应该轮询 `getUpscalerStatus` 来驱动 UI：

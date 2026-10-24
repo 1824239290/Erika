@@ -303,6 +303,30 @@ cumulative for the presenter lifetime. The HUD is excluded from `screenshot()` o
 For a custom UI, use `getPresenterStats()` to retrieve the latest native display-tick snapshot. It
 does not drive the HUD, and its freshness depends on an attached surface and active display loop.
 
+## Diagnostics for Hosts and Agents
+
+Three methods expose the engine's own view for automated troubleshooting
+(stutter, corruption, decode failures, A/V drift):
+
+- `getDiagnosticsSnapshot()` returns one JSON map (schema 1): decoder and
+  hardware path with fallbacks, presenter counters, output/HDR, resources,
+  upscaler, audio, buffer depths, and timing — scheduler late drops,
+  presentation cadence and jitter, clock drift and corrections. Unknown values
+  are `null`.
+- `getLogs({limit, minLevel, sinceSeq})` reads the process-wide, redacted log
+  ring: liberika's operational diagnostics plus FFmpeg warnings and errors.
+- `invokeJson(method, [arguments])` calls any entry of the native JSON method
+  table and returns its envelope (`{ok, status, value | error, code?}`);
+  `invokeJson('listMethods')` lists the table, so new engine capabilities need
+  no Dart change.
+
+Field reference: [capi_reference.md](capi_reference.md), "Agent diagnostics
+(JSON)" and "JSON bridge". When the platform plugin or the bundled native
+library lacks a method, the call throws `UnsupportedError`. Status in this
+release: macOS, iOS and tvOS resolve the new symbols optionally; Linux,
+HarmonyOS and Android route through the shared JSON table; Windows throws
+`UnsupportedError`.
+
 ## Neural Upscaler Status
 
 `setUpscaler` requests a mode; the kernels are compiled on a background thread,

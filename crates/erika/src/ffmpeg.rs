@@ -1875,9 +1875,80 @@ fn align_i32(value: i32, alignment: i32) -> i32 {
 }
 
 fn configure_ffmpeg_debug_logging() {
+    install_ffmpeg_log_capture();
     if std::env::var_os("ERIKA_FFMPEG_DEBUG").is_some() {
         unsafe { sys::av_log_set_level(sys::AV_LOG_DEBUG as c_int) };
     }
+}
+
+type FfmpegLogSink = unsafe extern "C" fn(level: c_int, line: *const c_char);
+
+unsafe extern "C" {
+    fn erika_ffmpeg_install_log_bridge(sink: FfmpegLogSink);
+}
+
+/// Copies FFmpeg warnings and errors into the diagnostics log ring.
+///
+/// `av_log_set_callback` is process-wide, so this runs once for every player.
+/// The C bridge still forwards each message to FFmpeg's default callback,
+/// leaving stderr output unchanged. `ERIKA_FFMPEG_LOG_CAPTURE=0` disables
+/// capture; with a shared system FFmpeg (Linux distro build) capture is opt-in
+/// via `ERIKA_FFMPEG_LOG_CAPTURE=1` because other libraries in the process may
+/// own the callback.
+pub(crate) fn install_ffmpeg_log_capture() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        use crate::trace::{FfmpegLogCapture, set_ffmpeg_log_capture};
+        let requested = std::env::var("ERIKA_FFMPEG_LOG_CAPTURE").ok();
+        let disabled = matches!(
+            requested.as_deref(),
+            Some("0" | "false" | "FALSE" | "off" | "OFF")
+        );
+        let forced = requested.as_deref().is_some_and(|value| {
+            !value.is_empty() && !matches!(value, "0" | "false" | "FALSE" | "off" | "OFF")
+        });
+        if disabled {
+            set_ffmpeg_log_capture(FfmpegLogCapture::Disabled);
+            return;
+        }
+        if cfg!(erika_shared_ffmpeg) && !forced {
+            set_ffmpeg_log_capture(FfmpegLogCapture::SharedLibrary);
+            return;
+        }
+        unsafe { erika_ffmpeg_install_log_bridge(ffmpeg_log_sink) };
+        set_ffmpeg_log_capture(FfmpegLogCapture::Active);
+    });
+}
+
+fn ffmpeg_log_level(level: c_int) -> crate::trace::LogLevel {
+    use crate::trace::LogLevel;
+    if level <= sys::AV_LOG_ERROR as c_int {
+        LogLevel::Error
+    } else if level <= sys::AV_LOG_WARNING as c_int {
+        LogLevel::Warn
+    } else if level <= sys::AV_LOG_INFO as c_int {
+        LogLevel::Info
+    } else if level <= sys::AV_LOG_DEBUG as c_int {
+        LogLevel::Debug
+    } else {
+        LogLevel::Trace
+    }
+}
+
+/// Receives a formatted FFmpeg line from the C bridge. It runs on FFmpeg's
+/// logging thread, so it only borrows the line (no copy unless it is stored or
+/// is not UTF-8) and never blocks on the ring.
+unsafe extern "C" fn ffmpeg_log_sink(level: c_int, line: *const c_char) {
+    if line.is_null() {
+        return;
+    }
+    let bytes = unsafe { CStr::from_ptr(line) }.to_bytes();
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    crate::trace::record_ffmpeg(ffmpeg_log_level(level), text);
 }
 
 /// Registers the process Java VM used by FFmpeg's MediaCodec bridge.
@@ -3933,6 +4004,7 @@ unsafe extern "C" fn custom_avio_seek(opaque: *mut c_void, offset: i64, whence: 
 }
 
 fn open_format_context(uri: &str) -> Result<FormatContext> {
+    install_ffmpeg_log_capture();
     let input = CString::new(uri).map_err(|_| FfmpegError::InteriorNul)?;
     let mut format_context = ptr::null_mut();
     check(
@@ -3950,6 +4022,7 @@ fn open_format_context(uri: &str) -> Result<FormatContext> {
 }
 
 fn open_source_format_context(source: Box<dyn MediaSource>) -> Result<FormatContext> {
+    install_ffmpeg_log_capture();
     let uri = CString::new(source.uri()).map_err(|_| FfmpegError::InteriorNul)?;
     let avio = CustomAvio::new(source)?;
     let format_context = unsafe { sys::avformat_alloc_context() };
@@ -6845,6 +6918,68 @@ mod tests {
         assert!(
             (actual - expected).abs() < 0.0001,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn av_log_bridge_copies_warnings_and_errors_into_the_log_ring() {
+        use crate::trace::{FfmpegLogCapture, LogLevel, LogQuery, export_logs, ffmpeg_log_capture};
+
+        install_ffmpeg_log_capture();
+        if ffmpeg_log_capture() != FfmpegLogCapture::Active {
+            // Disabled via ERIKA_FFMPEG_LOG_CAPTURE=0 or a shared system FFmpeg.
+            return;
+        }
+        let marker = "erika-av-log-bridge-5d1e";
+        let warning = CString::new(format!("{marker} warning %d\n")).unwrap();
+        let error = CString::new(format!("{marker} error %s\n")).unwrap();
+        let info = CString::new(format!("{marker} info\n")).unwrap();
+        let detail = CString::new("detail").unwrap();
+        unsafe {
+            sys::av_log(
+                ptr::null_mut(),
+                sys::AV_LOG_WARNING as c_int,
+                warning.as_ptr(),
+                42 as c_int,
+            );
+            sys::av_log(
+                ptr::null_mut(),
+                sys::AV_LOG_ERROR as c_int,
+                error.as_ptr(),
+                detail.as_ptr(),
+            );
+            sys::av_log(ptr::null_mut(), sys::AV_LOG_INFO as c_int, info.as_ptr());
+        }
+        let exported = export_logs(&LogQuery {
+            limit: 0,
+            min_level: None,
+            since_seq: 0,
+        });
+        let entries: Vec<&serde_json::Value> = exported["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(marker))
+            })
+            .collect();
+        assert_eq!(exported["ffmpegCapture"], "active");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["source"], "ffmpeg");
+        assert_eq!(entries[0]["level"], LogLevel::Warn.as_str());
+        assert_eq!(entries[0]["message"], format!("{marker} warning 42"));
+        assert_eq!(entries[1]["level"], LogLevel::Error.as_str());
+        assert_eq!(entries[1]["message"], format!("{marker} error detail"));
+        assert_eq!(
+            ffmpeg_log_level(sys::AV_LOG_FATAL as c_int),
+            LogLevel::Error
+        );
+        assert_eq!(ffmpeg_log_level(sys::AV_LOG_INFO as c_int), LogLevel::Info);
+        assert_eq!(
+            ffmpeg_log_level(sys::AV_LOG_TRACE as c_int),
+            LogLevel::Trace
         );
     }
 }
