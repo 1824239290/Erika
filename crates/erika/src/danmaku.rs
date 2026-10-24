@@ -1235,6 +1235,8 @@ impl DanmakuFontFace {
     }
 }
 
+// Keep the existing CJK, generic, then database order. Preferring a color
+// emoji face can hide symbols an outline-capable generic font could paint.
 const PREFERRED_FALLBACK_FAMILIES: &[&str] = &[
     "PingFang SC",
     "Hiragino Sans GB",
@@ -1252,11 +1254,6 @@ const PREFERRED_FALLBACK_FAMILIES: &[&str] = &[
     "Arial Unicode MS",
     "Arial Unicode",
     "Segoe UI Symbol",
-    // Platform emoji fonts: resolve emoji during the preferred stage instead
-    // of walking every system face.
-    "Apple Color Emoji",
-    "Segoe UI Emoji",
-    "Noto Color Emoji",
 ];
 
 #[derive(Debug)]
@@ -4426,9 +4423,64 @@ mod tests {
     }
 
     #[test]
-    fn preferred_fallback_families_cover_platform_emoji_fonts() {
+    fn fallback_keeps_visible_generic_glyphs_ahead_of_emoji_fonts() {
+        // Keep cmap coverage and metrics, but remove the outlines. This models
+        // a color font the outline rasterizer cannot paint, without depending
+        // on any platform's installed fonts.
+        let mut blank_data = NIPAPLAY_FALLBACK_FONT.to_vec();
+        let table_count = u16::from_be_bytes(blank_data[4..6].try_into().unwrap()) as usize;
+        let record = (0..table_count)
+            .map(|index| 12 + index * 16)
+            .find(|&record| &blank_data[record..record + 4] == b"glyf")
+            .unwrap();
+        let offset =
+            u32::from_be_bytes(blank_data[record + 8..record + 12].try_into().unwrap()) as usize;
+        let length =
+            u32::from_be_bytes(blank_data[record + 12..record + 16].try_into().unwrap()) as usize;
+        blank_data[offset..offset + length].fill(0);
+
+        let mut template_db = fontdb::Database::new();
+        template_db.load_font_data(NIPAPLAY_FALLBACK_FONT.to_vec());
+        let template = template_db.faces().next().unwrap().clone();
         for family in ["Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"] {
-            assert!(PREFERRED_FALLBACK_FAMILIES.contains(&family));
+            let mut db = fontdb::Database::new();
+            let mut emoji = template.clone();
+            emoji.id = fontdb::ID::dummy();
+            emoji.families = vec![(family.into(), fontdb::Language::English_UnitedStates)];
+            emoji.source = fontdb::Source::Binary(Arc::new(blank_data.clone()));
+            // Put the blank face first in database order too: the generic
+            // fallback must retain its existing priority over it.
+            let emoji_id = db.push_face_info(emoji);
+            let mut generic = template.clone();
+            generic.id = fontdb::ID::dummy();
+            generic.families = vec![(
+                "Regression Sans".into(),
+                fontdb::Language::English_UnitedStates,
+            )];
+            db.push_face_info(generic);
+            db.set_sans_serif_family("Regression Sans");
+            db.set_serif_family("Regression Sans");
+            let mut fallback = SystemFontFallback::with_database(db, 1);
+
+            assert!(fallback.face_covers(emoji_id, 'A'));
+            let blank = fallback.load_face(emoji_id).unwrap();
+            let key = |face: &DanmakuFontFace| GlyphCacheKey::new(face.id, 'A', 32.0, 1.0, false);
+            assert!(
+                rasterize_font_glyph(blank.font.as_ref(), key(&blank))
+                    .fill_alpha
+                    .iter()
+                    .all(|&pixel| pixel == 0),
+                "the competing emoji fixture must be invisible"
+            );
+
+            let selected = fallback.resolve('A').unwrap();
+            assert!(
+                rasterize_font_glyph(selected.font.as_ref(), key(&selected))
+                    .fill_alpha
+                    .iter()
+                    .any(|&pixel| pixel > 0),
+                "{family} must not hide a visible generic fallback glyph"
+            );
         }
     }
 
