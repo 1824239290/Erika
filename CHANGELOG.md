@@ -65,6 +65,34 @@
   single-frame export that returns the picture shown at a media time as RGBA or
   PNG, scaled within optional bounds, from its own demuxer and multi-threaded
   software decoder.
+- Added frame export sessions: `erika_frame_export_session_open`,
+  `erika_frame_export_session_frame` and `erika_frame_export_session_close`
+  open a media once and take pictures from it one after another. A request
+  after the previous one continues decoding from where the decoder stopped
+  when no keyframe lies between (the demuxer's seek index tells), and seeks
+  otherwise. 60 pictures 100 ms apart from a 4096x1744 H.264 file took 23.9 s
+  through one `erika_export_frame` call each (60 opens and seeks) and 1.0 s
+  through a session (one seek, 335 frames decoded). The JSON
+  method table gains `exportFrame` and `exportFrames` (scope `global`); each
+  table entry now says whether it is `blocking` and whether it `writesFiles`.
+- Frame exports tone map HDR sources (PQ, HLG, Dolby Vision) to SDR with the
+  arithmetic the video renderer applies for an SDR display (ITU-R BT.2390 EETF
+  against a 203-nit target, BT.2020 to BT.709 gamut mapping, gamma 2.2) instead
+  of FFmpeg's plain conversion, and set `ERIKA_FRAME_EXPORT_TONE_MAPPED` in
+  `reserved_flags` of the result. Against a screenshot of the player on an SDR
+  display, a 4K HDR10 frame differs by 0.1 to 0.3 of 255 on average (7 to 9
+  before).
+- Software video decoders now use frame and slice threading (FFmpeg picks the
+  count) for playback as well as exports; `ERIKA_VIDEO_DECODE_THREADS=1`
+  restores single-threaded decoding. Forced to software, 4K H.264 at 3x
+  presented 72 fps with no late drops where one thread presented 7 fps and
+  dropped 481 frames in 15 s, and the time from a seek to the first picture
+  fell from 2.8 s to 0.43 s (median). `ERIKA_HWDEC=software` makes software
+  decoding the default on every platform, for measuring it.
+- Fixed `erika_presenter_select_subtitle_track` (and `Player::select_subtitle_track`)
+  failing with `ErikaStatus 3` when asked for no subtitle while no media was
+  open, which is how a host clears the subtitle before opening: it now succeeds
+  and changes nothing.
 
 ## 0.2.1 - 2026-10-02
 

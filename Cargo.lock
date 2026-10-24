@@ -855,6 +855,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "frame_export_bench"
+version = "0.1.8"
+dependencies = [
+ "erika",
+ "png",
+ "serde_json",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2133,6 +2142,15 @@ name = "playback_audio_tick"
 version = "0.1.8"
 dependencies = [
  "erika",
+]
+
+[[package]]
+name = "playback_rate_check"
+version = "0.1.8"
+dependencies = [
+ "crossbeam-channel",
+ "erika",
+ "serde_json",
 ]
 
 [[package]]

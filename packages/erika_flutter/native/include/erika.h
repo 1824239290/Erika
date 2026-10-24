@@ -46,6 +46,8 @@ extern "C" {
 /* Opaque handles. ErikaHandle = pull model, ErikaPresenterHandle = push model. */
 typedef struct ErikaHandle ErikaHandle;
 typedef struct ErikaPresenterHandle ErikaPresenterHandle;
+/* A media kept open for taking many pictures; see erika_frame_export_session_open. */
+typedef struct ErikaFrameExportSession ErikaFrameExportSession;
 
 typedef struct ErikaHttpHeader {
   const char *name;
@@ -104,9 +106,11 @@ typedef struct ErikaGifExportResult {
 /* Headless single-frame export: the picture shown at position_millis (a
  * media time) as RGBA or PNG. max_width/max_height bound the output (0 =
  * unbounded); the display aspect ratio is kept and the picture is never
- * larger than the video. Synchronous; UI integrations must call it from a
- * worker thread. Owns an independent demux/decode pipeline (multi-threaded
- * software decoding) and requires no player or presenter handle. */
+ * larger than the video. HDR sources (PQ, HLG, Dolby Vision) are tone mapped
+ * to SDR the way Erika renders them on an SDR display. Synchronous; UI
+ * integrations must call it from a worker thread. Owns an independent
+ * demux/decode pipeline (multi-threaded software decoding) and requires no
+ * player or presenter handle. */
 typedef enum ErikaFrameExportFormat {
   ErikaFrameExportFormat_Rgba = 0, /* rows of width * 4 bytes, alpha 255 */
   ErikaFrameExportFormat_Png = 1,  /* PNG file bytes, 8-bit RGB */
@@ -127,7 +131,10 @@ typedef struct ErikaFrameExportOptions {
 
 /* data stays owned by liberika until erika_frame_export_result_free. Times
  * are microseconds: timestamp_micros is where the picture is, duration_micros
- * the media duration (0 when the container reports none). */
+ * the media duration (0 when the container reports none). reserved_flags
+ * carries ERIKA_FRAME_EXPORT_TONE_MAPPED when the picture was tone mapped. */
+#define ERIKA_FRAME_EXPORT_TONE_MAPPED 1u
+
 typedef struct ErikaFrameExportResult {
   uint8_t *data;
   uintptr_t data_len;
@@ -141,6 +148,29 @@ typedef struct ErikaFrameExportResult {
   uint32_t reserved_flags;
   uint64_t reserved[2];
 } ErikaFrameExportResult;
+
+/* Frame export session: the media is opened once and pictures are taken from
+ * it one after another. A request after the previous one continues decoding
+ * from where the decoder stopped when no keyframe lies between, and seeks
+ * otherwise (backwards included), so requests in ascending time order are the
+ * cheapest. Results are the same as erika_export_frame's. */
+typedef struct ErikaFrameExportSessionOptions {
+  const char *input_uri;
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t http_read_ahead_bytes;
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportSessionOptions;
+
+typedef struct ErikaFrameExportRequest {
+  uint64_t position_millis;
+  uint32_t max_width;
+  uint32_t max_height;
+  int32_t format; /* ErikaFrameExportFormat */
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportRequest;
 
 typedef enum ErikaStatus {
   ErikaStatus_Ok = 0,
@@ -521,6 +551,18 @@ ErikaStatus erika_export_frame(
     const ErikaFrameExportOptions *options,
     ErikaFrameExportResult *out_result);
 void erika_frame_export_result_free(ErikaFrameExportResult *result);
+/* Synchronous: opening reads the container header and each frame call decodes
+ * on the calling thread. Calls on one session are serialised; the session is
+ * released with erika_frame_export_session_close (NULL is accepted), and no
+ * call on it may be running or follow. *out_session is NULL after a failure. */
+ErikaStatus erika_frame_export_session_open(
+    const ErikaFrameExportSessionOptions *options,
+    ErikaFrameExportSession **out_session);
+ErikaStatus erika_frame_export_session_frame(
+    ErikaFrameExportSession *session,
+    const ErikaFrameExportRequest *request,
+    ErikaFrameExportResult *out_result);
+void erika_frame_export_session_close(ErikaFrameExportSession *session);
 
 /* Playback control. uri is a local path or HTTP(S) URL; times are microseconds.
  * open() synchronously probes streams and transitions to Ready. */

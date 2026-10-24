@@ -1,4 +1,5 @@
 use std::ffi::{CStr, CString, c_char};
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use serde_json::{Map, Value, json};
@@ -104,6 +105,23 @@ pub(crate) struct JsonMethodSpec {
     pub summary: &'static str,
     pub arguments: &'static [JsonArgSpec],
     pub returns: &'static str,
+    /// The call returns when the work is done, on the calling thread, and the
+    /// work grows with its input (media length, file size).
+    pub blocking: bool,
+    /// The call creates files on disk; the result lists their paths.
+    pub writes_files: bool,
+}
+
+impl JsonMethodSpec {
+    const fn blocking(mut self) -> Self {
+        self.blocking = true;
+        self
+    }
+
+    const fn writes_files(mut self) -> Self {
+        self.writes_files = true;
+        self
+    }
 }
 
 const fn arg(name: &'static str, kind: &'static str, required: bool) -> JsonArgSpec {
@@ -127,6 +145,8 @@ const fn method(
         summary,
         arguments,
         returns,
+        blocking: false,
+        writes_files: false,
     }
 }
 
@@ -290,10 +310,10 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
     method(
         "addExternalSubtitle",
         P,
-        "Adds an external subtitle file or URL.",
+        "Adds an external subtitle file or URL; the file is read and parsed before the call returns.",
         &[arg("uri", "string", true)],
         "trackId (integer)",
-    ),
+    ).blocking(),
     method(
         "removeSubtitleTrack",
         P,
@@ -371,39 +391,39 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
     method(
         "loadDanmakuFile",
         P,
-        "Replaces danmaku with one Bilibili XML file or URL.",
+        "Replaces danmaku with one Bilibili XML file or URL; the file is read and parsed before the call returns.",
         &[arg("uri", "string", true)],
         "null",
-    ),
+    ).blocking(),
     method(
         "loadDanmakuJson",
         P,
-        "Replaces danmaku with inline JSON.",
+        "Replaces danmaku with inline JSON; the JSON is parsed before the call returns.",
         &[arg("json", "string", true)],
         "null",
-    ),
+    ).blocking(),
     method(
         "addDanmakuTrackFile",
         P,
-        "Adds a named danmaku track from a file or URL.",
+        "Adds a named danmaku track from a file or URL; the file is read and parsed before the call returns.",
         &[
             arg("uri", "string", true),
             arg("name", "string", false),
             arg("offsetMicros", "integer", false),
         ],
         "trackId (integer)",
-    ),
+    ).blocking(),
     method(
         "addDanmakuTrackJson",
         P,
-        "Adds a named danmaku track from inline JSON.",
+        "Adds a named danmaku track from inline JSON; the JSON is parsed before the call returns.",
         &[
             arg("json", "string", true),
             arg("name", "string", false),
             arg("offsetMicros", "integer", false),
         ],
         "trackId (integer)",
-    ),
+    ).blocking(),
     method(
         "removeDanmakuTrack",
         P,
@@ -467,6 +487,44 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
         NONE,
         "null",
     ),
+    method(
+        "exportFrame",
+        G,
+        "Decodes the picture shown at one media time with its own demuxer and decoder (no player involved), scales it keeping the display aspect ratio without enlarging, and tone maps HDR sources to SDR. With outputPath the PNG or RGBA bytes are written there; without it they are returned base64 encoded.",
+        &[
+            arg("uri", "string", true),
+            arg("positionMillis", "integer", true),
+            arg("width", "integer", false),
+            arg("height", "integer", false),
+            arg("format", "string", false),
+            arg("outputPath", "string", false),
+            arg("overwrite", "boolean", false),
+            arg("httpHeaders", "object", false),
+            arg("httpReadAheadBytes", "integer", false),
+        ],
+        "{width, height, format, timestampMicros, durationMicros, sourceWidth, sourceHeight, toneMapped, bytes, path?|dataBase64?}",
+    )
+    .blocking()
+    .writes_files(),
+    method(
+        "exportFrames",
+        G,
+        "Takes the pictures shown at several media times from one opened media: one demuxer and one decoder, times in ascending order are decoded on without seeking again. Each picture is written to outputDir as frame_<positionMillis>ms.png (or .rgba); a time that cannot be exported is reported in its entry and the others continue. Sizing, format and tone mapping are as in exportFrame.",
+        &[
+            arg("uri", "string", true),
+            arg("positionsMillis", "array", true),
+            arg("outputDir", "string", true),
+            arg("width", "integer", false),
+            arg("height", "integer", false),
+            arg("format", "string", false),
+            arg("overwrite", "boolean", false),
+            arg("httpHeaders", "object", false),
+            arg("httpReadAheadBytes", "integer", false),
+        ],
+        "{durationMicros, sourceWidth, sourceHeight, seeks, decodedFrames, frames:[{positionMillis, path?, bytes?, width?, height?, timestampMicros?, toneMapped?, error?}]}",
+    )
+    .blocking()
+    .writes_files(),
 ];
 
 pub(crate) fn json_method_spec(name: &str) -> Option<&'static JsonMethodSpec> {
@@ -487,10 +545,19 @@ fn list_methods_json() -> Value {
                     "required": argument.required,
                 })).collect::<Vec<_>>(),
                 "returns": spec.returns,
+                "blocking": spec.blocking,
+                "writesFiles": spec.writes_files,
             })
         })
         .collect();
-    json!({ "schema": 1, "methods": methods })
+    json!({
+        "schema": 1,
+        "fields": {
+            "blocking": "true: the call returns when the work is done, on the calling thread, and the work grows with its input (media length, file size).",
+            "writesFiles": "true: the call creates files on disk; the result lists their paths.",
+        },
+        "methods": methods,
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -718,6 +785,8 @@ pub(crate) unsafe fn invoke(
         // The log ring is process-wide; the handle only routes the call.
         "getLogs" => logs_json(args),
         "listMethods" => Ok(list_methods_json()),
+        "exportFrame" => frame_export_json(args),
+        "exportFrames" => frames_export_json(args),
         "invokeJson" => {
             let inner = required_string(args, "method")?;
             let arguments = match args.get("arguments") {
@@ -1056,6 +1125,208 @@ impl HttpHeaders {
             _strings: strings,
             headers,
         })
+    }
+}
+
+/// Arguments shared by `exportFrame` and `exportFrames`.
+struct FrameExportArgs {
+    request: MediaRequest,
+    max_width: u32,
+    max_height: u32,
+    format: FrameExportFormat,
+    overwrite: bool,
+}
+
+impl FrameExportArgs {
+    fn from_json(args: &Map<String, Value>) -> Result<Self, String> {
+        let uri = required_string(args, "uri")?;
+        if uri.is_empty() {
+            return Err("uri must not be empty".to_string());
+        }
+        let mut headers = Vec::new();
+        if let Some(value) = args.get("httpHeaders").filter(|value| !value.is_null()) {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "httpHeaders must be a JSON object".to_string())?;
+            for (name, value) in object {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| format!("HTTP header {name} must be a string"))?;
+                if let Some(error) = http_header_error(name, value) {
+                    return Err(error);
+                }
+                headers.push((name.clone(), value.to_string()));
+            }
+        }
+        let request = MediaRequest::new(uri)
+            .with_http_headers(headers)
+            .map_http_read_ahead_bytes(Some(optional_open_byte_count(args, "httpReadAheadBytes")?));
+        let dimension = |name: &str| -> Result<u32, String> {
+            u32::try_from(optional_open_byte_count(args, name)?)
+                .map_err(|_| format!("{name} is out of range"))
+        };
+        let format = match args.get("format").and_then(Value::as_str) {
+            None | Some("png") => FrameExportFormat::Png,
+            Some("rgba") => FrameExportFormat::Rgba,
+            Some(other) => return Err(format!("format must be \"png\" or \"rgba\", not {other}")),
+        };
+        Ok(Self {
+            request,
+            max_width: dimension("width")?,
+            max_height: dimension("height")?,
+            format,
+            overwrite: optional_bool(args, "overwrite").unwrap_or(false),
+        })
+    }
+
+    fn extension(&self) -> &'static str {
+        match self.format {
+            FrameExportFormat::Png => "png",
+            FrameExportFormat::Rgba => "rgba",
+        }
+    }
+
+    fn format_name(&self) -> &'static str {
+        self.extension()
+    }
+}
+
+/// Writes `bytes` to `path` through a temporary sibling, so a reader never
+/// sees half a file. Without `overwrite` an existing file is an error.
+fn write_export_file(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), String> {
+    if !overwrite && path.exists() {
+        return Err(format!("{} exists", path.display()));
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.{}.part", std::process::id()));
+    std::fs::write(&temporary, bytes)
+        .and_then(|()| std::fs::rename(&temporary, path))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("cannot write {}: {error}", path.display())
+        })
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let value = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(TABLE[(value >> 18) as usize & 63] as char);
+        out.push(TABLE[(value >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(value >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[value as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn frame_export_json(args: &Map<String, Value>) -> Result<Value, String> {
+    let export = FrameExportArgs::from_json(args)?;
+    let position = Duration::from_millis(required_u64(args, "positionMillis")?);
+    let output_path = optional_path(args, "outputPath")?;
+    let frame = erika::export::export_frame(&FrameExportOptions {
+        input: export.request.clone(),
+        position,
+        max_width: export.max_width,
+        max_height: export.max_height,
+        format: export.format,
+    })
+    .map_err(|error| error.to_string())?;
+    let mut value = json!({
+        "width": frame.width,
+        "height": frame.height,
+        "format": export.format_name(),
+        "timestampMicros": micros(frame.timestamp),
+        "durationMicros": frame.duration.map_or(0, micros),
+        "sourceWidth": frame.source_width,
+        "sourceHeight": frame.source_height,
+        "toneMapped": frame.tone_mapped,
+        "bytes": frame.data.len(),
+    });
+    match output_path {
+        Some(path) => {
+            write_export_file(&path, &frame.data, export.overwrite)?;
+            value["path"] = Value::String(path.to_string_lossy().into_owned());
+        }
+        None => value["dataBase64"] = Value::String(base64_encode(&frame.data)),
+    }
+    Ok(value)
+}
+
+fn frames_export_json(args: &Map<String, Value>) -> Result<Value, String> {
+    let export = FrameExportArgs::from_json(args)?;
+    let positions = required_u64_array(args, "positionsMillis")?;
+    if positions.is_empty() {
+        return Err("positionsMillis must not be empty".to_string());
+    }
+    let directory = optional_path(args, "outputDir")?
+        .ok_or_else(|| "outputDir must be a non-empty path".to_string())?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let mut session = erika::export::FrameExportSession::open(&export.request)
+        .map_err(|error| error.to_string())?;
+    let mut frames = Vec::with_capacity(positions.len());
+    for millis in positions {
+        let outcome = session
+            .frame_at(&erika::export::FrameRequest {
+                position: Duration::from_millis(millis),
+                max_width: export.max_width,
+                max_height: export.max_height,
+                format: export.format,
+            })
+            .map_err(|error| error.to_string())
+            .and_then(|frame| {
+                let path = directory.join(format!("frame_{millis}ms.{}", export.extension()));
+                write_export_file(&path, &frame.data, export.overwrite)?;
+                Ok((frame, path))
+            });
+        frames.push(match outcome {
+            Ok((frame, path)) => json!({
+                "positionMillis": millis,
+                "path": path.to_string_lossy(),
+                "bytes": frame.data.len(),
+                "width": frame.width,
+                "height": frame.height,
+                "timestampMicros": micros(frame.timestamp),
+                "toneMapped": frame.tone_mapped,
+            }),
+            Err(error) => json!({ "positionMillis": millis, "error": error }),
+        });
+    }
+    let stats = session.stats();
+    let (source_width, source_height) = session.video_size();
+    Ok(json!({
+        "durationMicros": session.duration().map_or(0, micros),
+        "sourceWidth": source_width,
+        "sourceHeight": source_height,
+        "seeks": stats.seeks,
+        "decodedFrames": stats.decoded_frames,
+        "frames": frames,
+    }))
+}
+
+fn optional_path(args: &Map<String, Value>, name: &str) -> Result<Option<PathBuf>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path)) if !path.trim().is_empty() => Ok(Some(PathBuf::from(path))),
+        Some(_) => Err(format!("{name} must be a non-empty path")),
     }
 }
 
@@ -1545,6 +1816,137 @@ mod tests {
         let needs_handle = invoke(std::ptr::null_mut(), c"play", "{}");
         assert_eq!(needs_handle["ok"], false);
         assert!(needs_handle.get("code").is_none());
+    }
+
+    fn fixture_path() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../erika/testdata/playback/playback-fixture.mkv")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn list_methods_states_which_methods_block_and_which_write_files() {
+        let listed = invoke(std::ptr::null_mut(), c"listMethods", "{}");
+        let methods = listed["value"]["methods"].as_array().unwrap();
+        let flags = |name: &str| {
+            let entry = methods.iter().find(|entry| entry["name"] == name).unwrap();
+            (
+                entry["blocking"].as_bool().unwrap(),
+                entry["writesFiles"].as_bool().unwrap(),
+            )
+        };
+        assert_eq!(flags("exportFrame"), (true, true));
+        assert_eq!(flags("exportFrames"), (true, true));
+        assert_eq!(flags("addExternalSubtitle"), (true, false));
+        assert_eq!(flags("play"), (false, false));
+        assert_eq!(flags("getLogs"), (false, false));
+        assert!(listed["value"]["fields"]["blocking"].is_string());
+        let export = methods
+            .iter()
+            .find(|entry| entry["name"] == "exportFrame")
+            .unwrap();
+        assert_eq!(export["scope"], "global");
+    }
+
+    #[test]
+    fn export_frame_methods_work_without_a_handle() {
+        let directory =
+            std::env::temp_dir().join(format!("erika-json-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let uri = fixture_path();
+
+        let inline = invoke(
+            std::ptr::null_mut(),
+            c"exportFrame",
+            &json!({"uri": uri, "positionMillis": 1000, "width": 64}).to_string(),
+        );
+        assert_eq!(inline["ok"], true, "{inline}");
+        assert_eq!(inline["value"]["format"], "png");
+        assert_eq!(inline["value"]["toneMapped"], false);
+        assert_eq!(inline["value"]["durationMicros"], 8_000_000);
+        assert!(
+            inline["value"]["dataBase64"]
+                .as_str()
+                .unwrap()
+                .starts_with("iVBORw0KGgo")
+        );
+
+        let path = directory.join("one.png");
+        let args = json!({
+            "uri": uri, "positionMillis": 1000, "width": 64, "outputPath": path,
+        })
+        .to_string();
+        std::fs::create_dir_all(&directory).unwrap();
+        let written = invoke(std::ptr::null_mut(), c"exportFrame", &args);
+        assert_eq!(written["ok"], true, "{written}");
+        assert_eq!(written["value"]["path"], path.to_string_lossy().as_ref());
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(written["value"].get("dataBase64").is_none());
+        let again = invoke(std::ptr::null_mut(), c"exportFrame", &args);
+        assert_eq!(again["ok"], false);
+        assert!(again["error"].as_str().unwrap().contains("exists"));
+
+        let batch = invoke(
+            std::ptr::null_mut(),
+            c"exportFrames",
+            &json!({
+                "uri": uri, "positionsMillis": [200, 400, 9000, 600], "width": 64,
+                "outputDir": directory.join("batch"), "format": "rgba",
+            })
+            .to_string(),
+        );
+        assert_eq!(batch["ok"], true, "{batch}");
+        let frames = batch["value"]["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 4);
+        assert!(
+            frames[2]["error"]
+                .as_str()
+                .unwrap()
+                .contains("not before the end")
+        );
+        for index in [0, 1, 3] {
+            let bytes = std::fs::read(frames[index]["path"].as_str().unwrap()).unwrap();
+            assert_eq!(bytes.len(), 64 * 36 * 4);
+            assert_eq!(frames[index]["bytes"], bytes.len());
+        }
+        assert_eq!(batch["value"]["seeks"], 1);
+
+        for (method, args) in [
+            (
+                "exportFrame",
+                json!({"uri": uri, "positionMillis": 0, "format": "gif"}),
+            ),
+            ("exportFrame", json!({"uri": "", "positionMillis": 0})),
+            (
+                "exportFrames",
+                json!({"uri": uri, "positionsMillis": [], "outputDir": "x"}),
+            ),
+            ("exportFrames", json!({"uri": uri, "positionsMillis": [1]})),
+        ] {
+            let response = invoke(
+                std::ptr::null_mut(),
+                std::ffi::CString::new(method).unwrap().as_c_str(),
+                &args.to_string(),
+            );
+            assert_eq!(response["ok"], false, "{method} {args}");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(plain.as_bytes()), encoded);
+        }
     }
 
     #[test]

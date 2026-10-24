@@ -15,6 +15,18 @@
   the FFI platforms).
 - Large JSON documents from `getLogs()`, `getDiagnosticsSnapshot()` and
   `invokeJson()` are decoded on a background isolate.
+- On macOS and iOS `getLogs()`, `getDiagnosticsSnapshot()` and `invokeJson()`
+  run on a background queue and answer on the main thread; while one of them
+  runs inside the player the plugin's main-thread timers skip a tick instead of
+  waiting for the player's lock, and methods with scope `global` run without it.
+- Added `ErikaFrameExportSession` and `ErikaPlayer.exportFrames()`: the media is
+  opened once and many pictures are taken from it (a native worker queue on
+  macOS, a background isolate per session on the FFI platforms).
+  `ErikaExportedFrame.toneMapped` says whether an HDR source was tone mapped to
+  SDR. `ERIKA_FLUTTER_LIBRARY` points the FFI exports at a library under test.
+- The iOS and tvOS podspecs force-link the export, diagnostics and JSON
+  functions so a static link keeps them for the plugin's and Dart's lookups in
+  the running executable.
 - The macOS build phase checks that an `ERIKA_MACOS_CAPI_DYLIB` override has
   every architecture being built and says which library it bundles.
 

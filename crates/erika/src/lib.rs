@@ -14,6 +14,8 @@ pub mod diagnostics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod export;
 #[cfg(not(target_arch = "wasm32"))]
+mod export_color;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ffmpeg;
 pub mod font;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]

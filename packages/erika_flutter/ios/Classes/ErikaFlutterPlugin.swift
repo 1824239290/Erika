@@ -593,6 +593,8 @@ private final class ErikaNativeLibrary {
   let getDiagnosticsJson: GetDiagnosticsJsonFn?
   let logReadJson: LogReadJsonFn?
   let invokeJson: InvokeJsonFn?
+  private let globalJsonMethodsLock = NSLock()
+  private var globalJsonMethods: Set<String>?
 
   private let libraryHandle: UnsafeMutableRawPointer
   let path: String
@@ -741,6 +743,32 @@ private final class ErikaNativeLibrary {
     return String(validatingUTF8: pointer)
   }
 
+  /// Whether a JSON table method takes no presenter (scope `global`), read
+  /// once from the table itself so the plugin keeps no copy of it. Such a
+  /// method is called with a NULL handle and without the player's native
+  /// call lock: a long export must not hold up rendering.
+  func isGlobalJsonMethod(_ method: String) -> Bool {
+    globalJsonMethodsLock.lock()
+    defer { globalJsonMethodsLock.unlock() }
+    if globalJsonMethods == nil {
+      var global: Set<String> = ["listMethods", "getLogs"]
+      if let invokeJson,
+         let response = "listMethods".withCString({ name in
+           "{}".withCString { invokeJson(nil, name, $0) }
+         }),
+         let json = takeJsonString(response),
+         let envelope = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+         let value = envelope["value"] as? [String: Any],
+         let methods = value["methods"] as? [[String: Any]] {
+        global = Set(methods.compactMap { entry in
+          entry["scope"] as? String == "global" ? entry["name"] as? String : nil
+        })
+      }
+      globalJsonMethods = global
+    }
+    return globalJsonMethods?.contains(method) ?? false
+  }
+
   func readLogsJson(limit: UInt32, minLevel: Int32, sinceSeq: UInt64) throws -> String {
     guard let logReadJson else {
       throw ErikaPluginError.diagnosticsUnsupported("erika_log_read_json")
@@ -772,6 +800,10 @@ private final class ErikaPlayerHost {
   private let library: ErikaNativeLibrary
   private let handle: UnsafeMutableRawPointer
   private let renderQueue: DispatchQueue
+  /// Diagnostics and JSON pass-through calls run here, never on the main
+  /// thread: they can take as long as the work they ask for (a subtitle file
+  /// parsed, a frame export decoded).
+  let jsonQueue: DispatchQueue
   private let nativeCallLock = NSRecursiveLock()
   private let tickMailbox = ErikaTickMailbox()
   private weak var attachedView: ErikaMetalSurfaceView?
@@ -812,6 +844,10 @@ private final class ErikaPlayerHost {
       label: "dev.aimesoft.erika.render.ios.\(id)",
       qos: .userInteractive
     )
+    jsonQueue = DispatchQueue(
+      label: "dev.aimesoft.erika.json.ios.\(id)",
+      qos: .userInitiated
+    )
     presenterConfig = config
     guard let handle = library.createPresenter(config: config) else {
       throw ErikaPluginError.presenterCreateFailed
@@ -834,6 +870,17 @@ private final class ErikaPlayerHost {
 
   private func withNativeCall<T>(_ operation: () throws -> T) rethrows -> T {
     nativeCallLock.lock()
+    defer { nativeCallLock.unlock() }
+    return try operation()
+  }
+
+  /// Like [withNativeCall], but gives up (nil) when a call on another queue
+  /// holds the lock, instead of making the calling thread wait for it. The
+  /// timers that run on the main thread use this: a long call (a big
+  /// subtitle file parsed) must not freeze the app's interface, and what
+  /// those timers do is repeated at the next tick anyway.
+  private func tryWithNativeCall<T>(_ operation: () throws -> T) rethrows -> T? {
+    guard nativeCallLock.try() else { return nil }
     defer { nativeCallLock.unlock() }
     return try operation()
   }
@@ -1216,13 +1263,18 @@ private final class ErikaPlayerHost {
     guard let invoke = library.invokeJson else {
       throw ErikaPluginError.diagnosticsUnsupported("erika_presenter_invoke_json")
     }
-    let response = withNativeCall {
+    let call = { (target: UnsafeMutableRawPointer?) in
       method.withCString { methodPointer in
         argumentsJson.withCString { argumentsPointer in
-          invoke(handle, methodPointer, argumentsPointer)
+          invoke(target, methodPointer, argumentsPointer)
         }
       }
     }
+    // Methods that need no presenter run without the native call lock, so a
+    // long one does not hold up the calls rendering makes under it.
+    let response = library.isGlobalJsonMethod(method)
+      ? call(nil)
+      : withNativeCall { call(handle) }
     guard let json = library.takeJsonString(response) else {
       throw ErikaPluginError.diagnosticsFailed("erika_presenter_invoke_json returned no JSON")
     }
@@ -1247,9 +1299,10 @@ private final class ErikaPlayerHost {
   }
 
   func presenterStats() -> [String: Any] {
-    nativeCallLock.lock()
-    defer { nativeCallLock.unlock() }
-    return latestPresenterStats.toFlutterMap()
+    // The last stats the render tick stored; while another queue is inside a
+    // long call the previous copy is returned instead of waiting for it.
+    tryWithNativeCall { latestPresenterStats.toFlutterMap() }
+      ?? latestPresenterStats.toFlutterMap()
   }
 
   func addExternalSubtitle(uri: String) throws -> Int64 {
@@ -1640,7 +1693,9 @@ private final class ErikaPlayerHost {
   }
 
   func pollEvents(sendEvent: (([String: Any]) -> Void)?) {
-    withNativeCall {
+    // Skipped while another queue is inside a long call on this player; the
+    // events wait in the engine and the next poll takes them.
+    _ = tryWithNativeCall {
       while true {
         var event = ErikaEventC()
         let status = withUnsafeMutablePointer(to: &event) { pointer in
@@ -2147,6 +2202,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   private var players: [Int64: ErikaPlayerHost] = [:]
   private var views: [Int64: WeakErikaVideoPlatformViewBox] = [:]
   private var nextPlayerId: Int64 = 1
+  private let logQueue = DispatchQueue(label: "dev.aimesoft.erika.logs", qos: .utility)
   private var pollTimer: Timer?
   private var activePlayerId: Int64?
   private var interruptedPlayerId: Int64?
@@ -2362,7 +2418,10 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         result(try playerHost(from: args).resourceStatus())
       case "getDiagnosticsSnapshot":
         let args = try dictionaryArgs(call.arguments)
-        result(try playerHost(from: args).diagnosticsSnapshotJson())
+        let host = try playerHost(from: args)
+        respondOffMain(queue: host.jsonQueue, keeping: host, result: result) {
+          try host.diagnosticsSnapshotJson()
+        }
       case "invokeJson":
         let args = try dictionaryArgs(call.arguments)
         guard let method = args["method"] as? String, !method.isEmpty else {
@@ -2381,14 +2440,27 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
           throw ErikaPluginError.invalidArguments("arguments must be JSON-compatible.")
         }
         let data = try JSONSerialization.data(withJSONObject: arguments)
-        result(try playerHost(from: args).invokeJson(
-          method: method,
-          argumentsJson: String(decoding: data, as: UTF8.self)
-        ))
+        let argumentsJson = String(decoding: data, as: UTF8.self)
+        let host = try playerHost(from: args)
+        respondOffMain(queue: host.jsonQueue, keeping: host, result: result) {
+          try host.invokeJson(method: method, argumentsJson: argumentsJson)
+        }
       case "getLogs":
         // The log ring is process-wide; playerId is accepted but not needed.
         let args = try dictionaryArgs(call.arguments)
-        result(try readLogsJson(arguments: args))
+        let limit = try diagnosticsCount(args["limit"], name: "limit", defaultValue: 200)
+        let sinceSeq = try diagnosticsCount(args["sinceSeq"], name: "sinceSeq", defaultValue: 0)
+        let minLevel = try diagnosticsLogLevel(args["minLevel"])
+        respondOffMain(queue: logQueue, keeping: nil, result: result) {
+          guard let library = ErikaNativeLibrary.shared else {
+            throw ErikaPluginError.libraryNotFound([])
+          }
+          return try library.readLogsJson(
+            limit: UInt32(min(limit, UInt64(UInt32.max))),
+            minLevel: minLevel,
+            sinceSeq: sinceSeq
+          )
+        }
       case "getPresenterStats":
         let args = try dictionaryArgs(call.arguments)
         result(try playerHost(from: args).presenterStats())
@@ -3288,17 +3360,28 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     return value
   }
 
-  private func readLogsJson(arguments args: [String: Any]) throws -> String {
-    guard let library = ErikaNativeLibrary.shared else {
-      throw ErikaPluginError.libraryNotFound([])
+  /// Runs `work` on `queue`, then answers on the main thread, which is where
+  /// Flutter wants results. `keeping` stays referenced until the answer, so
+  /// the last reference to a player never drops on a background queue (its
+  /// teardown touches the display link).
+  private func respondOffMain<T>(
+    queue: DispatchQueue,
+    keeping owner: AnyObject?,
+    result: @escaping FlutterResult,
+    work: @escaping () throws -> T
+  ) {
+    queue.async {
+      let outcome = Result { try work() }
+      DispatchQueue.main.async {
+        withExtendedLifetime(owner) {}
+        switch outcome {
+        case .success(let value):
+          result(value)
+        case .failure(let error):
+          result(self.flutterError(error))
+        }
+      }
     }
-    let limit = try diagnosticsCount(args["limit"], name: "limit", defaultValue: 200)
-    let sinceSeq = try diagnosticsCount(args["sinceSeq"], name: "sinceSeq", defaultValue: 0)
-    return try library.readLogsJson(
-      limit: UInt32(min(limit, UInt64(UInt32.max))),
-      minLevel: try diagnosticsLogLevel(args["minLevel"]),
-      sinceSeq: sinceSeq
-    )
   }
 
   private func diagnosticsCount(_ value: Any?, name: String, defaultValue: UInt64) throws -> UInt64 {

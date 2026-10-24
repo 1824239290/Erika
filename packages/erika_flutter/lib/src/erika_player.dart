@@ -114,6 +114,7 @@ class ErikaExportedFrame {
     required this.sourceWidth,
     required this.sourceHeight,
     this.duration,
+    this.toneMapped = false,
   });
 
   final int width;
@@ -132,6 +133,10 @@ class ErikaExportedFrame {
   /// The media's duration, when its container reports one.
   final Duration? duration;
 
+  /// The source is HDR (PQ, HLG or Dolby Vision) and the picture was tone
+  /// mapped to SDR the way Erika renders it on an SDR display.
+  final bool toneMapped;
+
   factory ErikaExportedFrame.fromMap(Map<dynamic, dynamic> map) {
     final format = (map['format'] as num?)?.toInt() ?? 1;
     final durationMicros = (map['durationMicros'] as num?)?.toInt() ?? 0;
@@ -149,7 +154,138 @@ class ErikaExportedFrame {
       sourceWidth: (map['sourceWidth'] as num?)?.toInt() ?? 0,
       sourceHeight: (map['sourceHeight'] as num?)?.toInt() ?? 0,
       duration: durationMicros > 0 ? Duration(microseconds: durationMicros) : null,
+      toneMapped: map['toneMapped'] == true,
     );
+  }
+}
+
+/// A media kept open for taking many pictures with [ErikaPlayer.exportFrame]'s
+/// semantics: one demuxer and one decoder serve every request, and a request
+/// after the previous one continues decoding where it stopped instead of
+/// opening and seeking again. Requests in ascending time order are the
+/// cheapest; any order works. Calls on one session run one after another, off
+/// the UI thread. [close] releases the media; a session that is not closed
+/// keeps its decoder.
+final class ErikaFrameExportSession {
+  ErikaFrameExportSession._(this.uri, this._sessionId, this._native);
+
+  /// The media the session was opened on.
+  final String uri;
+  final int? _sessionId;
+  final NativeFrameExportSession? _native;
+  bool _closed = false;
+
+  /// Opens [uri] (a local path or HTTP(S) URL). Throws [StateError] with
+  /// liberika's message when the media cannot be read or has no video, and
+  /// [UnsupportedError] where the bundled native library or platform has no
+  /// frame export session.
+  static Future<ErikaFrameExportSession> open(
+    String uri, {
+    Map<String, String> httpHeaders = const <String, String>{},
+    int httpReadAheadBytes = 0,
+  }) async {
+    if (uri.trim().isEmpty) {
+      throw ArgumentError.value(uri, 'uri', 'must not be empty');
+    }
+    if (httpReadAheadBytes < 0) {
+      throw ArgumentError.value(
+        httpReadAheadBytes,
+        'httpReadAheadBytes',
+        'must not be negative',
+      );
+    }
+    final arguments = <String, Object?>{
+      'uri': uri,
+      if (httpHeaders.isNotEmpty) 'httpHeaders': httpHeaders,
+      if (httpReadAheadBytes > 0) 'httpReadAheadBytes': httpReadAheadBytes,
+    };
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.macOS) {
+      final id = await _channelFrameExport<int>('openFrameExportSession', arguments);
+      if (id == null) {
+        throw StateError('Erika frame export session returned no id.');
+      }
+      return ErikaFrameExportSession._(uri, id, null);
+    }
+    return ErikaFrameExportSession._(
+      uri,
+      null,
+      await NativeFrameExportSession.open(arguments),
+    );
+  }
+
+  /// The picture shown at [position]; bounds and format as in
+  /// [ErikaPlayer.exportFrame].
+  Future<ErikaExportedFrame> frameAt(
+    Duration position, {
+    int width = 0,
+    int height = 0,
+    ErikaFrameFormat format = ErikaFrameFormat.png,
+  }) async {
+    if (_closed) {
+      throw StateError('The frame export session is closed.');
+    }
+    _validateFrameArguments(position, width, height);
+    final arguments = <String, Object?>{
+      'positionMillis': position.inMilliseconds,
+      'width': width,
+      'height': height,
+      'format': format.nativeValue,
+    };
+    final sessionId = _sessionId;
+    final Map<dynamic, dynamic>? result = sessionId != null
+        ? await _channelFrameExport<Map<dynamic, dynamic>>(
+            'exportSessionFrame',
+            <String, Object?>{'sessionId': sessionId, ...arguments},
+          )
+        : await _native!.frame(arguments);
+    if (result == null) {
+      throw StateError('Erika frame export returned no result.');
+    }
+    return ErikaExportedFrame.fromMap(result);
+  }
+
+  /// Releases the media. Further [frameAt] calls throw [StateError].
+  Future<void> close() async {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    final sessionId = _sessionId;
+    if (sessionId != null) {
+      await _channelFrameExport<void>(
+        'closeFrameExportSession',
+        <String, Object?>{'sessionId': sessionId},
+      );
+    } else {
+      await _native!.close();
+    }
+  }
+}
+
+void _validateFrameArguments(Duration position, int width, int height) {
+  if (position.isNegative) {
+    throw ArgumentError.value(position, 'position', 'must not be negative');
+  }
+  if (width < 0 || height < 0 || width > 16384 || height > 16384) {
+    throw ArgumentError('width and height must be in 0..=16384.');
+  }
+}
+
+/// One frame export call over the macOS plugin channel, with the plugin's
+/// error codes mapped to Dart errors.
+Future<T?> _channelFrameExport<T>(
+  String method,
+  Map<String, Object?> arguments,
+) async {
+  try {
+    return await ErikaPlayer._channel.invokeMethod<T>(method, arguments);
+  } on MissingPluginException {
+    throw UnsupportedError('Erika frame export is not available here.');
+  } on PlatformException catch (error) {
+    if (error.code == 'ERIKA_UNSUPPORTED') {
+      throw UnsupportedError(error.message ?? 'Erika frame export is unsupported.');
+    }
+    throw StateError(error.message ?? error.code);
   }
 }
 
@@ -1640,12 +1776,7 @@ class ErikaPlayer {
     if (uri.trim().isEmpty) {
       throw ArgumentError.value(uri, 'uri', 'must not be empty');
     }
-    if (position.isNegative) {
-      throw ArgumentError.value(position, 'position', 'must not be negative');
-    }
-    if (width < 0 || height < 0 || width > 16384 || height > 16384) {
-      throw ArgumentError('width and height must be in 0..=16384.');
-    }
+    _validateFrameArguments(position, width, height);
     if (httpReadAheadBytes < 0) {
       throw ArgumentError.value(
         httpReadAheadBytes,
@@ -1662,28 +1793,50 @@ class ErikaPlayer {
       if (httpHeaders.isNotEmpty) 'httpHeaders': httpHeaders,
       if (httpReadAheadBytes > 0) 'httpReadAheadBytes': httpReadAheadBytes,
     };
-    final Map<dynamic, dynamic>? result;
-    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.macOS) {
-      try {
-        result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
-          'exportFrame',
-          arguments,
-        );
-      } on MissingPluginException {
-        throw UnsupportedError('Erika frame export is not available here.');
-      } on PlatformException catch (error) {
-        if (error.code == 'ERIKA_UNSUPPORTED') {
-          throw UnsupportedError(error.message ?? 'Erika frame export is unsupported.');
-        }
-        throw StateError(error.message ?? error.code);
-      }
-    } else {
-      result = await exportFrameNative(arguments);
-    }
+    final Map<dynamic, dynamic>? result =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.macOS
+            ? await _channelFrameExport<Map<dynamic, dynamic>>(
+                'exportFrame',
+                arguments,
+              )
+            : await exportFrameNative(arguments);
     if (result == null) {
       throw StateError('Erika frame export returned no result.');
     }
     return ErikaExportedFrame.fromMap(result);
+  }
+
+  /// The pictures shown at [positions] of [uri], in the order given, from one
+  /// [ErikaFrameExportSession]: the media is opened once. The first position
+  /// that cannot be exported throws, as [exportFrame] would.
+  static Future<List<ErikaExportedFrame>> exportFrames(
+    String uri, {
+    required Iterable<Duration> positions,
+    int width = 0,
+    int height = 0,
+    ErikaFrameFormat format = ErikaFrameFormat.png,
+    Map<String, String> httpHeaders = const <String, String>{},
+    int httpReadAheadBytes = 0,
+  }) async {
+    final session = await ErikaFrameExportSession.open(
+      uri,
+      httpHeaders: httpHeaders,
+      httpReadAheadBytes: httpReadAheadBytes,
+    );
+    try {
+      final frames = <ErikaExportedFrame>[];
+      for (final position in positions) {
+        frames.add(await session.frameAt(
+          position,
+          width: width,
+          height: height,
+          format: format,
+        ));
+      }
+      return frames;
+    } finally {
+      await session.close();
+    }
   }
 
   Future<int> addExternalSubtitle(String uri) async {

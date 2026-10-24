@@ -1479,6 +1479,10 @@ impl PresenterRuntime {
         if !self.player.tracks().is_empty() && self.player.track_selection().subtitle == track_id {
             return Ok(());
         }
+        if track_id.is_none() && !self.player.has_open_media() {
+            // Nothing is open, so no subtitle is shown: nothing to quiesce.
+            return self.player.select_subtitle_track(None);
+        }
         let quiesced = self.quiesce_frame_output("select_subtitle_track")?;
         let result = self.player.select_subtitle_track(track_id);
         let rate_result = self.commit_pending_playback_rate_now();

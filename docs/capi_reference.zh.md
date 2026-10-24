@@ -97,11 +97,42 @@ if (erika_export_frame(&options, &result) == ErikaStatus_Ok) {
 `max_height` 限定画面尺寸（0 表示该边不限）：保持显示宽高比，且不会大于视频本身，两者都为 0
 时返回视频原尺寸。`ErikaFrameExportFormat_Rgba` 返回每行恰好 `width * 4` 字节、alpha 为 255
 的像素；`ErikaFrameExportFormat_Png` 返回 8 位 RGB 的 PNG 文件。色彩转换按帧的色彩空间与范围；
-未标注的 YUV 源在高清及以上按 BT.709、其余按 BT.601。HDR 源不做色调映射。结果给出画面所在时间
+未标注的 YUV 源在高清及以上按 BT.709、其余按 BT.601。HDR 源（PQ、HLG、杜比视界）会按 Erika 渲染器在 SDR 显示器上使用的
+运算做色调映射到 SDR（ITU-R BT.2390 EETF，目标 203 nit，BT.2020 到 BT.709 的色域映射，gamma 2.2），
+并在 `result.reserved_flags` 置位 `ERIKA_FRAME_EXPORT_TONE_MAPPED`；SDR 源仍用普通色彩转换。结果给出画面所在时间
 （`timestamp_micros`）、解码后的视频尺寸与媒体时长（未知为 0）。位置不早于已知时长时返回
 `ErikaStatus_PlayerError`。HTTP 输入可使用与 `ErikaOpenOptions` 相同的请求头和 read-ahead
 覆盖参数。`data` 归 liberika 所有，直到调用 `erika_frame_export_result_free`；该函数会清空结果，
 可重复调用。
+
+### 连续取多帧
+
+`erika_export_frame` 每取一张都要重新打开媒体并 seek。要从同一媒体取多张时，只打开一次
+`ErikaFrameExportSession`，再逐张向它索取；demuxer 与解码器保持打开。
+
+```c
+ErikaFrameExportSessionOptions open = { .input_uri = "/path/input.mkv" };
+ErikaFrameExportSession *session = NULL;
+if (erika_frame_export_session_open(&open, &session) == ErikaStatus_Ok) {
+    for (uint64_t ms = 60000; ms < 66000; ms += 100) {
+        ErikaFrameExportRequest request = {
+            .position_millis = ms, .max_width = 640, .max_height = 640,
+            .format = ErikaFrameExportFormat_Png,
+        };
+        ErikaFrameExportResult result = {0};
+        if (erika_frame_export_session_frame(session, &request, &result) == ErikaStatus_Ok) {
+            erika_frame_export_result_free(&result);
+        }
+    }
+    erika_frame_export_session_close(session);
+}
+```
+
+若上一次解码位置到本次请求之间没有关键帧（demuxer 的 seek 索引可以判断；没有索引时，请求在
+两秒内或最长关键帧间隔的一半以内），就接着解码；否则 seek 到请求之前的关键帧。请求可以任意顺序，
+时间递增最省。结果、尺寸、格式与色调映射同 `erika_export_frame`。某次请求失败后会话仍可使用。
+同一会话上的调用相互串行，所有调用都是同步的。`erika_frame_export_session_close` 接受 `NULL`；
+关闭时不得有调用在执行，之后也不得再调用。
 
 ## 约定
 
@@ -660,11 +691,15 @@ char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 
 `erika_presenter_invoke_json` 同时是进入内核的通用透传通道：
 
-- `listMethods` 返回分派表本身——`{schema: 1, methods: [{name, scope, summary,
-  arguments: [{name, type, required}], returns}]}`——宿主（或其后的智能体）无需改代码
+- `listMethods` 返回分派表本身——`{schema: 1, fields, methods: [{name, scope, summary,
+  arguments: [{name, type, required}], returns, blocking, writesFiles}]}`——宿主（或其后的智能体）无需改代码
   就能发现并转发能力。登记一项能力 = 在 `invoke` 加一个 `match` 分支，并在
   `JSON_METHODS` 加一项；两者不一致时单元测试会失败。
-- `scope` 为 `global` 的方法（`listMethods`、`getLogs`）接受 `NULL` 句柄。
+- 每一项还带 `blocking`（调用在调用线程上做完才返回，耗时随输入增长：媒体长度、文件大小）和
+  `writesFiles`（调用会在磁盘上创建文件，结果列出路径）；顶层 `fields` 写明这两个字段。
+  `exportFrame`、`exportFrames` 用上面的单帧导出从媒体取画面：给出 `outputPath` / `outputDir` 时写
+  PNG 或 RGBA 文件并返回路径，`exportFrame` 不给 `outputPath` 时返回 base64 编码的字节。
+- `scope` 为 `global` 的方法（`listMethods`、`getLogs`、`exportFrame`、`exportFrames`）接受 `NULL` 句柄。
 - `invokeJson`（`{method, arguments}`）调用表中另一方法，并把它的完整信封作为
   `value` 返回。会在原生侧拆信封的平台插件（Linux、鸿蒙、Android）用它原样转发 Dart
   的 `ErikaPlayer.invokeJson`。
