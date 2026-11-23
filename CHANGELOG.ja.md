@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.3.9 - 2026-11-24
+
+### 再生
+
+- PCM フレームの再生時間に合わせて音声ポンプを調整し、TrueHD などの短い音声フレームがディスプレイ駆動のプレゼンターで不足する問題を修正しました（[上流 issue #276](https://github.com/AimesSoft/liberika/issues/276)）。
+
 ## 0.3.8 - 2026-11-20
 
 ### Windows

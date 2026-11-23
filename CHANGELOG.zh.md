@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.3.9 - 2026-11-24
+
+### 播放
+
+- 按 PCM 帧的播放时长调度音频泵，避免 TrueHD 等短音频帧在显示器驱动的呈现循环中供给不足（[上游 issue #276](https://github.com/AimesSoft/liberika/issues/276)）。
+
 ## 0.3.8 - 2026-11-20
 
 ### Windows
