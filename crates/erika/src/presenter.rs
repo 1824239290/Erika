@@ -72,11 +72,13 @@ use crate::{PlayerError, Result};
 
 const AUDIO_START_BUFFER: Duration = Duration::from_millis(250);
 const AUDIO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
-// The first tick has no previous timestamp from which to measure its audio
-// allowance. Seed it with one 60 Hz display interval; subsequent ticks earn
-// credit from their actual spacing.
-const AUDIO_PUMP_DEFAULT_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+// Until the output clock starts, playback has no audio reference and can only
+// decode a short lead ahead of wall time. Seed the first tick with enough
+// allowance to fill the start buffer; subsequent ticks earn credit from their
+// actual spacing.
 const AUDIO_PUMP_MAX_CREDIT: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const AUDIO_PUMP_DEFAULT_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 const PLAYBACK_RATE_EPSILON: f64 = 0.001;
 const VIDEO_PUMP_FRAME_LIMIT: usize = 8;
 const VIDEO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
@@ -3923,17 +3925,18 @@ impl PresenterRuntime {
     }
 
     fn earn_audio_pump_credit(&mut self, now: Instant) {
-        let interval = self
-            .last_audio_pump_at
-            .replace(now)
-            .map_or(AUDIO_PUMP_DEFAULT_INTERVAL, |previous| {
-                now.saturating_duration_since(previous)
-            });
-        (self.audio_pump_credit, self.audio_pump_debt) = audio_pump_credit_after_interval(
-            self.audio_pump_credit,
-            self.audio_pump_debt,
-            interval,
-        );
+        let previous = self.last_audio_pump_at.replace(now);
+        if let Some(previous) = previous {
+            (self.audio_pump_credit, self.audio_pump_debt) = audio_pump_credit_after_interval(
+                self.audio_pump_credit,
+                self.audio_pump_debt,
+                now.saturating_duration_since(previous),
+            );
+        } else {
+            // Bootstrap only once so the presenter can reach
+            // AUDIO_START_BUFFER before it has an audio clock to follow.
+            self.audio_pump_credit = self.audio_pump_credit.max(AUDIO_PUMP_MAX_CREDIT);
+        }
     }
 
     fn report_audio_clock_snapshot(&mut self) {
@@ -6531,6 +6534,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         );
         assert_eq!(credit, AUDIO_PUMP_MAX_CREDIT);
         assert_eq!(debt, Duration::ZERO);
+    }
+
+    #[test]
+    fn audio_pump_initial_credit_can_fill_the_start_buffer() {
+        let frame = crate::ffmpeg::PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+            pts: None,
+            frames: 40,
+            samples: vec![0.0; 80],
+        };
+        let mut credit = AUDIO_PUMP_MAX_CREDIT;
+        let mut queued_frames = 0usize;
+        while let Some(debt) =
+            consume_audio_pump_credit(&mut credit, audio_frame_playback_duration(&frame, 1.0))
+        {
+            assert_eq!(debt, Duration::ZERO);
+            queued_frames += frame.frames;
+        }
+
+        let queued = Duration::from_secs_f64(queued_frames as f64 / 48_000.0);
+        assert!(queued >= AUDIO_START_BUFFER);
+        assert!(queued <= AUDIO_PUMP_MAX_CREDIT);
     }
 
     #[test]
