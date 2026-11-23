@@ -71,13 +71,12 @@ use crate::windows::wasapi::{WasapiAudioOutput, WasapiAudioOutputConfig};
 use crate::{PlayerError, Result};
 
 const AUDIO_START_BUFFER: Duration = Duration::from_millis(250);
-const AUDIO_PUMP_FRAME_LIMIT: usize = 16;
 const AUDIO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
-// The audio transform currently runs on the display-driven presenter path.
-// Keep a rate-change refill bounded to one normal audio-pump slice so it
-// cannot consume an entire render frame while SoundTouch is warming up.
-const AUDIO_FAST_RATE_PUMP_FRAME_LIMIT: usize = 24;
-const AUDIO_FAST_RATE_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
+// The first tick has no previous timestamp from which to measure its audio
+// allowance. Seed it with one 60 Hz display interval; subsequent ticks earn
+// credit from their actual spacing.
+const AUDIO_PUMP_DEFAULT_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+const AUDIO_PUMP_MAX_CREDIT: Duration = Duration::from_millis(250);
 const PLAYBACK_RATE_EPSILON: f64 = 0.001;
 const VIDEO_PUMP_FRAME_LIMIT: usize = 8;
 const VIDEO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
@@ -340,6 +339,10 @@ pub struct PresenterRuntime {
     audio_output: Box<dyn AudioOutputBackend>,
     audio_configured: bool,
     audio_started: bool,
+    pending_audio_frame: Option<PlayerAudioFrame>,
+    audio_pump_credit: Duration,
+    audio_pump_debt: Duration,
+    last_audio_pump_at: Option<Instant>,
     last_audio_clock_report: Option<AudioClockReportState>,
     last_audio_runtime_stats: AudioOutputRuntimeStats,
     playback_rate: f64,
@@ -847,6 +850,10 @@ impl PresenterRuntime {
             audio_output: build_audio_output(config.audio),
             audio_configured: false,
             audio_started: false,
+            pending_audio_frame: None,
+            audio_pump_credit: Duration::ZERO,
+            audio_pump_debt: Duration::ZERO,
+            last_audio_pump_at: None,
             last_audio_clock_report: None,
             last_audio_runtime_stats: AudioOutputRuntimeStats::default(),
             playback_rate: 1.0,
@@ -3870,25 +3877,43 @@ impl PresenterRuntime {
 
     fn pump_audio(&mut self) {
         let started = Instant::now();
-        let mut pumped = 0usize;
-        let (frame_limit, time_budget) = self.audio_pump_limits();
+        self.earn_audio_pump_credit(started);
+        let time_budget = AUDIO_PUMP_TIME_BUDGET;
+        let rate = self
+            .pending_playback_rate
+            .map_or(self.playback_rate, |pending| pending.rate);
         loop {
-            if pumped >= frame_limit || started.elapsed() >= time_budget {
+            if started.elapsed() >= time_budget {
                 break;
             }
             if !self.audio_output.can_accept_audio_frame() {
                 break;
             }
-            match self.audio_frames.try_recv() {
-                Ok(frame) => {
-                    if frame.generation != self.player.playback_generation() {
-                        continue;
-                    }
-                    self.push_audio(frame);
-                    pumped += 1;
+            let frame = match self.pending_audio_frame.take() {
+                Some(frame) => frame,
+                None => match self.audio_frames.try_recv() {
+                    Ok(frame) => frame,
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                },
+            };
+            if frame.generation != self.player.playback_generation() {
+                continue;
+            }
+            let frame_duration = audio_frame_playback_duration(&frame.frame, rate);
+            let debt = match consume_audio_pump_credit(&mut self.audio_pump_credit, frame_duration)
+            {
+                Some(debt) => debt,
+                None => {
+                    // Keep a frame that does not fit this tick's allowance.
+                    // Once the allowance reaches its cap, the credit helper
+                    // admits an oversized frame and carries its excess as debt.
+                    self.pending_audio_frame = Some(frame);
+                    break;
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            };
+            if self.push_audio(frame) {
+                self.audio_pump_debt = self.audio_pump_debt.saturating_add(debt);
             }
         }
         self.ensure_audio_started();
@@ -3897,11 +3922,18 @@ impl PresenterRuntime {
         }
     }
 
-    fn audio_pump_limits(&self) -> (usize, Duration) {
-        let rate = self
-            .pending_playback_rate
-            .map_or(self.playback_rate, |pending| pending.rate);
-        audio_pump_limits_for_rate(rate)
+    fn earn_audio_pump_credit(&mut self, now: Instant) {
+        let interval = self
+            .last_audio_pump_at
+            .replace(now)
+            .map_or(AUDIO_PUMP_DEFAULT_INTERVAL, |previous| {
+                now.saturating_duration_since(previous)
+            });
+        (self.audio_pump_credit, self.audio_pump_debt) = audio_pump_credit_after_interval(
+            self.audio_pump_credit,
+            self.audio_pump_debt,
+            interval,
+        );
     }
 
     fn report_audio_clock_snapshot(&mut self) {
@@ -3959,7 +3991,7 @@ impl PresenterRuntime {
         should_report
     }
 
-    fn push_audio(&mut self, frame: PlayerAudioFrame) {
+    fn push_audio(&mut self, frame: PlayerAudioFrame) -> bool {
         if !self.audio_configured {
             self.player.invalidate_audio_clock();
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
@@ -3968,7 +4000,7 @@ impl PresenterRuntime {
                     trace::LogLevel::Warn,
                     format!("Erika presenter audio configure failed: {error}"),
                 );
-                return;
+                return false;
             }
             self.audio_configured = true;
             self.last_audio_clock_report = None;
@@ -3981,11 +4013,12 @@ impl PresenterRuntime {
                     trace::LogLevel::Warn,
                     format!("Erika presenter audio push failed: {error}"),
                 );
-                return;
+                return false;
             }
         }
 
         self.ensure_audio_started();
+        true
     }
 
     fn ensure_audio_started(&mut self) {
@@ -4020,6 +4053,7 @@ impl PresenterRuntime {
     }
 
     fn reset_audio_output(&mut self) {
+        self.reset_audio_pump_state();
         self.player.invalidate_audio_clock();
         if let Err(error) = self.audio_output.stop() {
             self.stats.audio_failures += 1;
@@ -4079,8 +4113,16 @@ impl PresenterRuntime {
 
     fn drain_pending_player_frames(&mut self) {
         self.drain_pending_video_frames();
+        self.reset_audio_pump_state();
         while self.audio_frames.try_recv().is_ok() {}
         while self.subtitle_frames.try_recv().is_ok() {}
+    }
+
+    fn reset_audio_pump_state(&mut self) {
+        self.pending_audio_frame = None;
+        self.audio_pump_credit = Duration::ZERO;
+        self.audio_pump_debt = Duration::ZERO;
+        self.last_audio_pump_at = None;
     }
 
     fn drain_pending_video_frames(&mut self) {
@@ -4119,15 +4161,42 @@ fn audio_transition_bridge(
         .filter(|duration| !duration.is_zero())
 }
 
-fn audio_pump_limits_for_rate(rate: f64) -> (usize, Duration) {
-    if (rate - 1.0).abs() > PLAYBACK_RATE_EPSILON {
-        (
-            AUDIO_FAST_RATE_PUMP_FRAME_LIMIT,
-            AUDIO_FAST_RATE_PUMP_TIME_BUDGET,
-        )
-    } else {
-        (AUDIO_PUMP_FRAME_LIMIT, AUDIO_PUMP_TIME_BUDGET)
+fn audio_pump_credit_after_interval(
+    credit: Duration,
+    debt: Duration,
+    interval: Duration,
+) -> (Duration, Duration) {
+    let paid_debt = debt.min(interval);
+    let remaining_interval = interval.saturating_sub(paid_debt);
+    (
+        credit
+            .saturating_add(remaining_interval)
+            .min(AUDIO_PUMP_MAX_CREDIT),
+        debt.saturating_sub(paid_debt),
+    )
+}
+
+fn audio_frame_playback_duration(frame: &crate::ffmpeg::PcmAudioFrame, rate: f64) -> Duration {
+    if frame.format.sample_rate == 0 {
+        return Duration::ZERO;
     }
+    // Keep the pacing estimate aligned with the audio processors, which clamp
+    // SoundTouch playback rates to this supported range.
+    let rate = normalize_playback_rate(rate).clamp(0.25, 16.0);
+    Duration::from_secs_f64(frame.frames as f64 / frame.format.sample_rate as f64 / rate)
+}
+
+fn consume_audio_pump_credit(credit: &mut Duration, frame_duration: Duration) -> Option<Duration> {
+    if frame_duration <= *credit {
+        *credit = credit.saturating_sub(frame_duration);
+        return Some(Duration::ZERO);
+    }
+    if *credit == AUDIO_PUMP_MAX_CREDIT {
+        let debt = frame_duration.saturating_sub(*credit);
+        *credit = Duration::ZERO;
+        return Some(debt);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -6404,18 +6473,112 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     #[test]
-    fn playback_rate_uses_fast_audio_pump_limits() {
+    fn audio_pump_duration_credit_matches_source_demand_at_display_rates() {
+        for (refresh_rate, playback_rate, pcm_frames, expected_frames) in [
+            (60, 1.0, 40, 1_200),
+            (60, 2.0, 40, 2_400),
+            (80, 1.0, 40, 1_200),
+            (120, 1.0, 40, 1_200),
+            (120, 2.0, 40, 2_400),
+            (60, 1.0, 1_024, 47),
+            (60, 2.0, 1_024, 94),
+            (120, 2.0, 1_024, 94),
+        ] {
+            let interval = Duration::from_secs_f64(1.0 / f64::from(refresh_rate));
+            let frame = crate::ffmpeg::PcmAudioFrame {
+                format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+                pts: None,
+                frames: pcm_frames,
+                samples: vec![0.0; pcm_frames * 2],
+            };
+            let frame_duration = audio_frame_playback_duration(&frame, playback_rate);
+            let mut credit = Duration::ZERO;
+            let mut debt = Duration::ZERO;
+            let mut pumped_frames: usize = 0;
+
+            for _ in 0..refresh_rate {
+                (credit, debt) = audio_pump_credit_after_interval(credit, debt, interval);
+                while consume_audio_pump_credit(&mut credit, frame_duration).is_some() {
+                    pumped_frames += 1;
+                }
+            }
+
+            assert!(
+                pumped_frames.abs_diff(expected_frames) <= 1,
+                "{refresh_rate} Hz at {playback_rate}x pumped {pumped_frames} PCM frames, expected about {expected_frames}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_pump_duration_credit_is_bounded_after_a_stall() {
+        let (credit, debt) = audio_pump_credit_after_interval(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(5),
+        );
+        assert_eq!(credit, AUDIO_PUMP_MAX_CREDIT);
+        assert_eq!(debt, Duration::ZERO);
+
+        let (credit, debt) = audio_pump_credit_after_interval(credit, debt, Duration::from_secs(1));
+        assert_eq!(credit, AUDIO_PUMP_MAX_CREDIT);
+        assert_eq!(debt, Duration::ZERO);
+
+        let (credit, debt) = audio_pump_credit_after_interval(
+            Duration::ZERO,
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+        );
+        assert_eq!(credit, AUDIO_PUMP_MAX_CREDIT);
+        assert_eq!(debt, Duration::ZERO);
+    }
+
+    #[test]
+    fn audio_frame_pump_duration_uses_supported_rate_bounds() {
+        let frame = crate::ffmpeg::PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+            pts: None,
+            frames: 48_000,
+            samples: vec![0.0; 96_000],
+        };
+
         assert_eq!(
-            audio_pump_limits_for_rate(1.0),
-            (AUDIO_PUMP_FRAME_LIMIT, AUDIO_PUMP_TIME_BUDGET)
+            audio_frame_playback_duration(&frame, f64::MIN_POSITIVE),
+            Duration::from_secs(4)
         );
         assert_eq!(
-            audio_pump_limits_for_rate(2.0),
-            (
-                AUDIO_FAST_RATE_PUMP_FRAME_LIMIT,
-                AUDIO_FAST_RATE_PUMP_TIME_BUDGET
-            )
+            audio_frame_playback_duration(&frame, 64.0),
+            Duration::from_secs_f64(1.0 / 16.0)
         );
+    }
+
+    #[test]
+    fn audio_pump_admits_oversized_frame_and_pays_excess_credit_as_debt() {
+        let frame = crate::ffmpeg::PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+            pts: None,
+            frames: 16_000,
+            samples: vec![0.0; 32_000],
+        };
+        let frame_duration = audio_frame_playback_duration(&frame, 1.0);
+        let mut credit = Duration::ZERO;
+        let mut debt = Duration::ZERO;
+
+        for _ in 0..15 {
+            (credit, debt) =
+                audio_pump_credit_after_interval(credit, debt, AUDIO_PUMP_DEFAULT_INTERVAL);
+        }
+        assert_eq!(credit, AUDIO_PUMP_MAX_CREDIT);
+        debt = consume_audio_pump_credit(&mut credit, frame_duration).unwrap();
+        assert_eq!(debt, frame_duration - AUDIO_PUMP_MAX_CREDIT);
+        assert_eq!(credit, Duration::ZERO);
+
+        for _ in 0..5 {
+            (credit, debt) =
+                audio_pump_credit_after_interval(credit, debt, AUDIO_PUMP_DEFAULT_INTERVAL);
+        }
+        assert_eq!(debt, Duration::ZERO);
+        assert!(credit < Duration::from_nanos(10));
     }
 
     #[test]

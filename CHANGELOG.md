@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.3.9 - 2026-11-24
+
+### Playback
+
+- Pace decoded PCM frames by playback duration so short-frame audio such as TrueHD does not underrun in display-driven presenters ([upstream issue #276](https://github.com/AimesSoft/liberika/issues/276)).
+
 ## 0.3.8 - 2026-11-20
 
 ### Windows
