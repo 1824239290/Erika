@@ -4,11 +4,11 @@
 
 ## Unreleased
 
-## 0.3.9 - 2026-11-24
+## 0.3.8+audio-fix - 2026-11-24
 
 ### 播放
 
-- 按 PCM 帧的播放时长调度音频泵，避免 TrueHD 等短音频帧在显示器驱动的呈现循环中供给不足（[上游 issue #276](https://github.com/AimesSoft/liberika/issues/276)）。
+- 将呈现循环音频泵与 worker 音频预填充改为按 PCM 播放时长而非原始帧数限流，避免 TrueHD 等短音频帧供给不足，同时保留起播缓冲、网络缓冲恢复和倍速切换所需的突发补水裕度（[上游 issue #276](https://github.com/AimesSoft/liberika/issues/276)）。
 
 ## 0.3.8 - 2026-11-20
 

@@ -4,11 +4,11 @@
 
 ## Unreleased
 
-## 0.3.9 - 2026-11-24
+## 0.3.8+audio-fix - 2026-11-24
 
 ### Playback
 
-- Pace decoded PCM frames by playback duration so short-frame audio such as TrueHD does not underrun in display-driven presenters ([upstream issue #276](https://github.com/AimesSoft/liberika/issues/276)).
+- Bound presenter audio pumping and worker audio prefill by decoded PCM playback duration instead of raw frame count so short-frame audio such as TrueHD does not underrun while preserving burst headroom for startup, buffering recovery, and playback-rate changes ([upstream issue #276](https://github.com/AimesSoft/liberika/issues/276)).
 
 ## 0.3.8 - 2026-11-20
 
